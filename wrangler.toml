@@ -18,8 +18,8 @@ crons = ["0 */6 * * *"]
 [vars]
 # 自动 DNS 同步 —— 留空则不启用
 CF_ZONE_ID        = "9aaafd1409adada280a4a6138cad50e4"    # 域名所在 Zone ID（CF 域名概览右栏复制）
-CF_RECORD_NAME    = "cfip.leilaomi.cc.cd"    # 例如 cf.example.com
-CF_DNS_BY_CARRIER = "0"   # "1" 启用按运营商分别同步 (ct./cu./cm.)
+CF_RECORD_NAME    = "cf.leilaomi.cc.cd"    # 例如 cf.example.com
+CF_DNS_BY_CARRIER = "1"   # "1" 启用按运营商分别同步 (ct./cu./cm.)
 DNS_TOP_N         = "10"
 
 # 敏感变量请用 secret 命令注入：
