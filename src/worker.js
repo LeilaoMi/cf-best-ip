@@ -84,11 +84,12 @@ const SOURCES = [
   { name: "countrymerge/all",           url: "https://countrymerge.pages.dev/all.txt",        type: "text" },
   // wtf-359 已并入 countrymerge，下行保留注释仅作历史记录
 
-  // ===== v2.2 IPDB by 030101.xyz：高质量数据源（@xinyitang3/cfnb 也推荐） =====
-  // bestcf: 优选官方 CF IPv4，30 分钟更新；bestproxy: 优选反代 IP（非 CF）30 分钟更新；proxy-api: 反代 IP 池 10 分钟更新
-  { name: "IPDB/bestcf",       url: "https://ipdb.api.030101.xyz/?type=bestcf",            type: "text" },
-  { name: "IPDB/bestproxy",    url: "https://ipdb.api.030101.xyz/?type=bestproxy",         type: "text" },
-  { name: "IPDB/proxy-api",    url: "https://ipdb.api.030101.xyz/?type=proxy",             type: "text" },
+  // ===== v2.2 IPDB by ymyuuu/030101.xyz：用 GitHub raw 镜像绕开 CF 出站黑名单 =====
+  // 030101.xyz 的 API 把 Cloudflare 数据中心 IP 段拉黑了，从 Worker 直接调会 403。
+  // 但同作者把数据自动同步到了 github.com/ymyuuu/IPDB 仓库，raw 链路畅通。
+  { name: "IPDB/bestcf",       url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/bestcf.txt",                        type: "text" },
+  { name: "IPDB/bestproxy",    url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/BestProxy/bestproxy%26country.txt", type: "text" },
+  // 注：IPDB/proxy（上面已配置 proxy.txt）已对应 030101.xyz?type=proxy，不再重复配置
 ];
 
 // 常见 colo → 国家映射（cdn-cgi/trace 也能直接给国家，但缓存一份方便筛选）
@@ -967,7 +968,7 @@ async function notify(env, payload) {
 // ============================================================
 // 9. 筛选 / 输出格式
 // ============================================================
-function applyFilter(ips, params, requesterColo) {
+function applyFilter(ips, params, requesterColo, cfg) {
   const country = (params.get("country") || "").toUpperCase();
   const colo = (params.get("colo") || "").toUpperCase();
   const carrier = (params.get("carrier") || "").toUpperCase();
@@ -978,6 +979,16 @@ function applyFilter(ips, params, requesterColo) {
   let top = Number(params.get("top") || params.get("limit") || 20);
   if (!Number.isFinite(top) || top < 1) top = 20;
   if (top > 200) top = 200;
+
+  // 分国家 top-N 模式（来自 cfnb）：?perCountry=1 或 cfg.perCountryMode
+  const perCountryQuery = params.get("perCountry");
+  const perCountryEnabled = perCountryQuery
+    ? ["1", "true", "yes"].includes(perCountryQuery.toLowerCase())
+    : !!(cfg && cfg.perCountryMode);
+  const perCountryN = Math.max(
+    1,
+    Number(params.get("perCountryN")) || (cfg && cfg.perCountryTopN) || 1,
+  );
 
   let out = ips.slice();
   if (country) {
@@ -1012,6 +1023,28 @@ function applyFilter(ips, params, requesterColo) {
   } else {
     out.sort((a, b) => (a.delay || 9999) - (b.delay || 9999));
   }
+
+  // 分国家模式：每国最多取 perCountryN 个，再按国家总量降序铺开
+  if (perCountryEnabled) {
+    const byC = new Map();
+    for (const x of out) {
+      const k = x.country || "??";
+      if (!byC.has(k)) byC.set(k, []);
+      byC.get(k).push(x);
+    }
+    const countries = [...byC.entries()].sort((a, b) => b[1].length - a[1].length);
+    const merged = [];
+    let depth = 0;
+    while (merged.length < top && depth < perCountryN) {
+      for (const [, arr] of countries) {
+        if (arr[depth]) merged.push(arr[depth]);
+        if (merged.length >= top) break;
+      }
+      depth++;
+    }
+    return merged;
+  }
+
   return out.slice(0, top);
 }
 
@@ -1072,6 +1105,7 @@ async function handle(request, env, ctx) {
   const params = url.searchParams;
   const data = await getLatest(env);
   const ips = data.ips || [];
+  const cfg = await getConfig(env);
   const requesterColo = request.cf?.colo;
   const visitor = getVisitor(request);
   if (env.CF_RECORD_NAME && env.CF_RECORD_NAME.includes(".")) {
@@ -1085,26 +1119,25 @@ async function handle(request, env, ctx) {
   // ---- 订阅 ----
   if (path === "/sub" || path === "/sub.txt" || path === "/api/ips.txt" || path === "/ips.txt") {
     if (!checkSubToken(request, env)) return text("Forbidden", { status: 403 });
-    const filtered = applyFilter(ips, params, requesterColo);
+    const filtered = applyFilter(ips, params, requesterColo, cfg);
     return text(fmtSub(filtered, params.get("comment") !== "0"));
   }
   if (path === "/api/preferred-ips") {
     if (!checkSubToken(request, env)) return text("Forbidden", { status: 403 });
-    return text(fmtEDT(applyFilter(ips, params, requesterColo)));
+    return text(fmtEDT(applyFilter(ips, params, requesterColo, cfg)));
   }
   if (path === "/api/v2ray") {
     if (!checkSubToken(request, env)) return text("Forbidden", { status: 403 });
-    return text(fmtV2ray(applyFilter(ips, params, requesterColo)));
+    return text(fmtV2ray(applyFilter(ips, params, requesterColo, cfg)));
   }
   if (path === "/api/clash") {
     if (!checkSubToken(request, env)) return text("Forbidden", { status: 403 });
-    return new Response(fmtClash(applyFilter(ips, params, requesterColo)), { headers: { "content-type": "text/yaml; charset=utf-8" } });
+    return new Response(fmtClash(applyFilter(ips, params, requesterColo, cfg)), { headers: { "content-type": "text/yaml; charset=utf-8" } });
   }
 
   // ---- 真订阅：V2RayN/Shadowrocket 用的 vless:// 列表（base64） ----
   if (path === "/sub/vless" || path === "/api/sub/vless") {
     if (!checkSubToken(request, env)) return text("Forbidden", { status: 403 });
-    const cfg = await getConfig(env);
     const tpl = cfg.vlessTemplate || "";
     if (!tpl.startsWith("vless://")) {
       return text(
@@ -1114,7 +1147,7 @@ async function handle(request, env, ctx) {
         { status: 412 }
       );
     }
-    const list = applyFilter(ips, params, requesterColo);
+    const list = applyFilter(ips, params, requesterColo, cfg);
     // 解析模板：vless://<uuid>@<host>:<port>?<query>#<remark>
     const tplMatch = tpl.match(/^vless:\/\/([^@]+)@([^:/?#]+)(?::(\d+))?(\?[^#]*)?(?:#(.*))?$/);
     if (!tplMatch) return text("vless 模板格式错误", { status: 400 });
@@ -1134,7 +1167,7 @@ async function handle(request, env, ctx) {
 
   // ---- JSON 列表 ----
   if (path === "/api/ips") {
-    const filtered = applyFilter(ips, params, requesterColo);
+    const filtered = applyFilter(ips, params, requesterColo, cfg);
     return json({ ok: true, total: ips.length, returned: filtered.length, updatedAt: data.updatedAt, ips: filtered });
   }
 
