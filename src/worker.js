@@ -471,7 +471,17 @@ async function setManual(env, list) { await kvSet(env, "ips:manual", list); }
 // ============================================================
 async function fetchSource(src) {
   try {
-    const r = await withTimeout(fetch(src.url, { cf: { cacheTtl: 300 } }), 8000);
+    const r = await withTimeout(
+      fetch(src.url, {
+        cf: { cacheTtl: 300 },
+        headers: {
+          "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+          "accept": "text/plain,text/html,application/json,*/*;q=0.8",
+          "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        },
+      }),
+      8000,
+    );
     if (!r.ok) return { name: src.name, ips: [], error: `HTTP ${r.status}` };
     const body = await r.text();
     const ips = [];
