@@ -39,7 +39,7 @@ import { connect } from "cloudflare:sockets";
 // ============================================================
 // 1. 常量 / 数据源 / 字典
 // ============================================================
-const VERSION = "2.1.0";
+const VERSION = "2.5.0";
 
 // ===== v2.3: Cloudflare 公开 IPv4 anycast CIDR (官方 ips-v4) =====
 // 用 IP 段精确判定 cf-native vs cf-proxy,不再依赖 source 元数据
@@ -119,8 +119,6 @@ const DEFAULT_CFG = {
   // 分国家 TopN 模式（off = 全局 TopN）
   perCountryMode: false,
   perCountryTopN: 1,
-  // WxPusher 微信通知（用 env.WXPUSHER_TOKEN / WXPUSHER_UIDS）
-  wxpusherApi: "https://wxpusher.zjiecode.com/api/send/message",
 };
 
 const SOURCES = [
@@ -472,29 +470,6 @@ async function applyRiskFilter(ips, cfg, cap = 60) {
   }, 8);
   return scored.filter(r => r.passes).map(r => r.item).concat(tail);
 }
-
-/**
- * WxPusher 微信通知（cfnb 风格），需要 env.WXPUSHER_TOKEN + env.WXPUSHER_UIDS（逗号分隔）
- */
-async function notifyWxPusher(env, content, summary, cfg) {
-  if (!env.WXPUSHER_TOKEN || !env.WXPUSHER_UIDS) return;
-  const uids = String(env.WXPUSHER_UIDS).split(/[,\s]+/).filter(Boolean);
-  if (!uids.length) return;
-  try {
-    await withTimeout(fetch(cfg.wxpusherApi || "https://wxpusher.zjiecode.com/api/send/message", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        appToken: env.WXPUSHER_TOKEN,
-        content,
-        summary: (summary || "cf-best-ip 通知").slice(0, 100),
-        contentType: 1,
-        uids,
-      }),
-    }), 5000);
-  } catch {}
-}
-
 // ============================================================
 // 3. KV 封装
 // ============================================================
@@ -846,14 +821,6 @@ async function runFullTest(env, ctx, opts = {}) {
   }
   // 9. Webhook
   ctx.waitUntil(notify(env, payload).catch(() => {}));
-  // 9b. v2.1 cfnb：WxPusher 微信通知
-  ctx.waitUntil(notifyWxPusher(
-    env,
-    `节点池更新完成 共 ${alive.length} 个 · 耗时 ${payload.elapsedMs}ms · 数据源 ${agg.stats.filter(s=>!s.error&&s.count>0).length}/${agg.stats.length} 健康` +
-    (availabilityStats.skipped ? "" : ` · 可用性 ${availabilityStats.ok}/${availabilityStats.total}`),
-    `cf-best-ip · ${alive.length} 个节点`,
-    cfg
-  ).catch(() => {}));
   return payload;
 }
 
@@ -1617,7 +1584,7 @@ function renderHome(data, visitor) {
   const proxyCount = ips.filter(x => x.category === "cf-proxy").length;
 
   const fmtDelay = (x) => x.delay != null ? `${x.delay}ms` : "—";
-  const fmtSpeed = (x) => x.mbps != null ? `${x.mbps} MB/s` : "—";
+  const fmtSpeed = (x) => x.mbps != null ? `${x.mbps}M` : "—";
   const fmtColo = (x) => x.colo || x.node || "—";
 
   const renderRow = (x, i) => `<tr>
@@ -1627,8 +1594,7 @@ function renderHome(data, visitor) {
     <td class="cell-loss">${x.loss != null ? (x.loss * 100).toFixed(0) + "%" : "—"}</td>
     <td class="cell-delay">${fmtDelay(x)}</td>
     <td class="cell-speed">${fmtSpeed(x)}</td>
-    <td class="cell-colo"><span class="flagcc">${flagOf(x.country)} ${x.country || "—"}</span></td>
-    <td><button class="copybtn" data-copy="${x.ip}">复制</button></td>
+    <td><button class="copybtn" data-copy="${x.ip}">📋</button></td>
   </tr>`;
 
   const renderTable = (rows) => rows.length
@@ -1637,8 +1603,7 @@ function renderHome(data, visitor) {
         <th class="cell-loss">丢包</th>
         <th class="cell-delay">延迟</th>
         <th class="cell-speed">速度</th>
-        <th class="cell-colo">国家</th>
-        <th>操作</th>
+        <th>复制</th>
       </tr></thead><tbody>${rows.map(renderRow).join("")}</tbody></table>`
     : `<div class="empty">⏳ 该分类暂无数据，等待下次刷新…</div>`;
 
@@ -1702,18 +1667,25 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
   .iptbl th,.iptbl td{padding:8px 5px}
   .iptbl .num{width:26px}
   .iptbl .ip{font-size:12px}
-  /* 移动端隐藏次要列：丢包、速度、国家 */
-  .cell-loss,.cell-speed,.cell-colo{display:none}
+  /* 移动端紧凑展示：所有列都显示，padding/字号缩小 */
+  .iptbl th,.iptbl td{padding:7px 3px;font-size:11px}
+  .cell-loss{text-align:center;min-width:30px}
+  .cell-delay{min-width:46px}
+  .cell-speed{min-width:42px;color:var(--ct)}
+  .badge{padding:2px 6px;font-size:10px}
+  .iptbl .ip{font-size:11px}
   .tabs{margin-bottom:10px}
   .tab{padding:7px 11px;font-size:12px}
   .copybtn{padding:3px 7px;font-size:10px}
   .subcard{padding:11px}
 }
 /* 极小屏：< 360px */
-@media (max-width: 360px) {
+@media (max-width: 380px) {
   .hero h1{font-size:18px}
   .iptbl .num{display:none}
-  .iptbl th,.iptbl td{padding:7px 4px}
+  .iptbl th:first-child{display:none}
+  .iptbl th,.iptbl td{padding:6px 2px;font-size:10.5px}
+  .iptbl .ip{font-size:10.5px}
 }
 </style>
 
