@@ -305,34 +305,48 @@ async function runFullTest(env, ctx, opts = {}) {
 
   // 1. 拉源
   const agg = await aggregateSources();
-  // 加入手动添加的 IP
   const manual = await getManual(env);
-  for (const m of manual) agg.ips.push({ ...m, sources: ["manual"] });
+  for (const m of manual) agg.ips.push({ ...m, sources: ["manual"], _manual: true });
 
-  // 2. 并发 TCP ping
+  // 2. 标记 / 测速
+  //    注意：Cloudflare Workers 禁止 connect() 到自家 IP，
+  //    所以对来源于公开池的 CF IP，我们直接信任源数据（它们都已被
+  //    第三方测速站点预筛选），跳过 TCP ping；只对手动添加的非 CF IP
+  //    实际跑 ping。
   const probed = await pMap(agg.ips, async (item) => {
     const port = item.port || 443;
-    const r = await tcpPingN(item.ip, port, 2, cfg.probeTimeoutMs);
-    return { ...item, port, delay: r.avg, loss: r.loss };
+    if (item._manual) {
+      const r = await tcpPingN(item.ip, port, 2, cfg.probeTimeoutMs);
+      return { ...item, port, delay: r.avg, loss: r.loss, tested: r.avg != null };
+    }
+    return { ...item, port, delay: null, loss: 0, tested: false };
   }, cfg.probeConcurrency);
 
-  // 3. 过滤可用
-  let alive = probed.filter(x => x.delay != null && x.loss < 0.5);
-  alive.sort((a, b) => a.delay - b.delay);
+  // 3. 过滤：手动添加的要测速通过；池子里的全保留
+  let alive = probed.filter(x => x._manual ? (x.delay != null && x.loss < 0.5) : true);
+  // 排序：tested + delay 小的优先；其余按来源数量降序
+  alive.sort((a, b) => {
+    if (a.tested && b.tested) return a.delay - b.delay;
+    if (a.tested) return -1;
+    if (b.tested) return 1;
+    return (b.sources?.length || 0) - (a.sources?.length || 0);
+  });
 
-  // 4. 给 Top N 探 colo / country
-  const topForColo = alive.slice(0, Math.min(40, alive.length));
+  // 4. 给前若干个尝试探 colo / country（best-effort，资源不够就跳过）
+  const topForColo = alive.slice(0, Math.min(20, alive.length));
   await pMap(topForColo, async (item) => {
-    const info = await detectColo(item.ip, item.port, cfg.probeTimeoutMs + 1000);
-    Object.assign(item, info);
-  }, 10);
+    try {
+      const info = await detectColo(item.ip, item.port, 2500);
+      if (info && info.colo) Object.assign(item, info);
+    } catch {}
+  }, 8);
 
-  // 5. 应用国家黑名单
+  // 5. 应用国家黑名单（只对已知 country 的过滤）
   if (cfg.countryBlocklist && cfg.countryBlocklist.length) {
     alive = alive.filter(x => !x.country || !cfg.countryBlocklist.includes(x.country));
   }
 
-  // 6. 抽样带宽测速
+  // 6. 抽样带宽测速（best-effort，失败也不影响主流程）
   const bwTargets = alive.slice(0, cfg.bandwidthSampleSize);
   await pMap(bwTargets, async (item) => {
     const mbps = await probeBandwidth(item.ip, cfg.bandwidthBytes, 6000);
