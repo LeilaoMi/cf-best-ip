@@ -780,6 +780,8 @@ async function runFullTest(env, ctx, opts = {}) {
       const r = await tcpPingN(item.ip, port, 2, cfg.probeTimeoutMs);
       return { ...item, port, delay: r.avg, loss: r.loss, tested: r.avg != null };
     }
+    // 已有预测速数据（如 hostmonit）则保留;否则填空
+    if (item.tested) return { ...item, port };
     return { ...item, port, delay: null, loss: 0, tested: false };
   }, cfg.probeConcurrency);
 
