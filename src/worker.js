@@ -1552,66 +1552,138 @@ function renderHome(data, visitor) {
   const ips = data.ips || [];
   const updated = data.updatedAt ? new Date(data.updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "（未运行）";
   const total = ips.length;
-  const byCarrier = ips.reduce((m, x) => { const c = x.carrier || "CF"; m[c] = (m[c] || 0) + 1; return m; }, {});
-  const carriersHtml = ["CT", "CU", "CM", "CF"].map(c => {
-    const n = byCarrier[c] || 0;
-    const recommend = visitor.carrier === c;
-    return `<a class="tag ${c.toLowerCase()}" href="/test?carrier=${c}" style="font-size:13px;padding:6px 12px${recommend ? ";box-shadow:0 0 0 2px var(--acc)" : ""}">${carrierName(c)} <b style="margin-left:4px">${n}</b></a>`;
-  }).join(" ");
+  const root = visitor.root || "";
 
-  // 推荐订阅链接：基于访问者
-  const subBase = "/sub";
-  const subPaths = visitor.carrier
-    ? [{ name: `${carrierName(visitor.carrier)}优选`, path: `${subBase}?carrier=${visitor.carrier}&top=10` }]
-    : [];
-  subPaths.push(
-    { name: "智能就近", path: `${subBase}?smart=1&top=10` },
-    { name: "全部 Top 20", path: `${subBase}?top=20` },
-    { name: "海外低延迟", path: `${subBase}?country=HK,JP,SG,US&top=10` },
-  );
-  const subLinks = subPaths.map(s =>
-    `<div class="node" style="grid-template-columns:1fr auto"><div><div style="font-weight:600">${s.name}</div><div class="mut" style="font-size:11px;margin-top:2px"><code>${s.path}</code></div></div><button class="copybtn" data-copy="${s.path}">复制</button></div>`
-  ).join("");
+  const flag = (cc) => cc && cc.length === 2 ? String.fromCodePoint(...cc.toUpperCase().split('').map(c => 0x1F1E6 + c.charCodeAt(0) - 65)) : "🌐";
 
-  return layout("cf-best-ip · 优选 IP 服务", `
-${renderVisitorBanner(visitor)}
+  const ct    = ips.filter(x => x.carrier === "CT").slice(0, 30);
+  const cu    = ips.filter(x => x.carrier === "CU").slice(0, 30);
+  const cm    = ips.filter(x => x.carrier === "CM").slice(0, 30);
+  const proxy = ips.filter(x => x.category === "cf-proxy").slice(0, 30);
+  const allTop = ips.filter(x => x.category !== "cf-proxy").slice(0, 60);
 
-<div class="card">
-  <h2>节点池状态</h2>
-  <div class="row" style="gap:14px;font-size:13px">
-    <div>📦 总节点 <b style="font-size:18px;color:var(--acc)">${total}</b></div>
-    <div>⏰ 更新于 ${updated}</div>
+  const subdomains = root ? {
+    cf:    `cf.${root}`,
+    cm:    `cm.${root}`,
+    ct:    `ct.${root}`,
+    cu:    `cu.${root}`,
+    proxy: `proxy.${root}`,
+  } : null;
+
+  const renderRows = (list, defaultLine) => list.length ? list.map((x, i) => {
+    const line = x.category === "cf-proxy" ? "反代" : (CARRIER_LABEL[x.carrier] || defaultLine);
+    const lineColor = { "电信":"#7ee787", "联通":"#a78bfa", "移动":"#79b8ff", "反代":"#f0a83b", "CF":"#f9826c", "通用":"#f9826c" }[line] || "#888";
+    const port = x.port && x.port !== 443 ? `:${x.port}` : "";
+    return `<tr><td class="num">${i+1}</td><td><span class="line-badge" style="background:${lineColor}22;color:${lineColor};border:1px solid ${lineColor}55">${line}</span></td><td class="ip-cell"><code>${x.ip}${port}</code></td><td>${flag(x.country)} <span class="mut" style="font-size:11px">${x.country||"-"}</span></td><td><button class="copybtn" data-copy="${x.ip}">复制</button></td></tr>`;
+  }).join("") : `<tr><td colspan="5" class="mut" style="text-align:center;padding:24px;font-size:12px">该分类暂无 IP · 等 Cron 下次抓取 或 在 /admin 手动添加</td></tr>`;
+
+  const tabs = [
+    { id: "all",   label: `全部 CF`, count: allTop.length, rows: renderRows(allTop, "CF") },
+    { id: "ct",    label: `电信`,     count: ct.length,     rows: renderRows(ct, "电信") },
+    { id: "cu",    label: `联通`,     count: cu.length,     rows: renderRows(cu, "联通") },
+    { id: "cm",    label: `移动`,     count: cm.length,     rows: renderRows(cm, "移动") },
+    { id: "proxy", label: `反代`,     count: proxy.length,  rows: renderRows(proxy, "反代") },
+  ];
+  const tabBar = tabs.map((t, i) => `<button class="tab ${i===0?'active':''}" data-tab="${t.id}">${t.label}<span class="tab-n">${t.count}</span></button>`).join("");
+  const panes  = tabs.map((t, i) => `<div class="pane" id="pane-${t.id}" style="display:${i===0?'block':'none'}"><table class="iptbl"><thead><tr><th>#</th><th>线路</th><th>优选 IP</th><th>国家</th><th>操作</th></tr></thead><tbody>${t.rows}</tbody></table></div>`).join("");
+
+  const subBlock = subdomains ? `
+<div class="subdomains">
+  <h3 style="font-size:13px;margin:18px 0 10px;color:var(--mut);font-weight:500">📡 域名直接解析（已自动同步至 Cloudflare DNS）</h3>
+  <div class="sub-grid">
+    ${[
+      { key:"cf",    label:"CF 主站", desc:"Cloudflare 自家 IP",       color:"#f9826c" },
+      { key:"ct",    label:"电信",     desc:"电信优化",                color:"#7ee787" },
+      { key:"cu",    label:"联通",     desc:"联通优化",                color:"#a78bfa" },
+      { key:"cm",    label:"移动",     desc:"移动优化",                color:"#79b8ff" },
+      { key:"proxy", label:"反代",     desc:"反代 IP（非 CF）",          color:"#f0a83b" },
+    ].map(s => `<div class="sub-card" style="border-left:3px solid ${s.color}"><div class="sub-label" style="color:${s.color}">${s.label}</div><code class="sub-host" data-copy="${subdomains[s.key]}">${subdomains[s.key]}</code><div class="mut" style="font-size:10px;margin-top:2px">${s.desc}</div></div>`).join("")}
   </div>
-  <div style="margin-top:12px;display:flex;gap:6px;flex-wrap:wrap">${carriersHtml}</div>
+</div>` : "";
+
+  return layout("CloudFlare 优选 IP", `
+<style>
+.hero{margin:-2px -16px 16px;padding:34px 16px 24px;background:linear-gradient(135deg,#0d1421 0%,#1a1f2e 60%,#0d1421 100%);border-bottom:1px solid var(--bd);text-align:center}
+.hero h1{font-size:30px;margin:0 0 6px;letter-spacing:.02em;background:linear-gradient(90deg,#f9826c,#79b8ff);-webkit-background-clip:text;background-clip:text;color:transparent;font-weight:700}
+.hero .sub{color:var(--mut);font-size:13px;margin-bottom:14px}
+.hero .stats{display:flex;gap:6px 18px;justify-content:center;flex-wrap:wrap;font-size:12px;color:var(--mut)}
+.hero .stats b{color:var(--fg);font-weight:600}
+.tabs{display:flex;gap:4px;margin-bottom:14px;border-bottom:1px solid var(--bd);overflow-x:auto;-webkit-overflow-scrolling:touch}
+.tab{background:transparent;border:0;color:var(--mut);padding:10px 14px;font-size:13px;cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap;display:inline-flex;align-items:center;gap:6px;font-weight:500}
+.tab:hover{color:var(--fg)}
+.tab.active{color:var(--fg);border-bottom-color:var(--acc)}
+.tab-n{background:#21262d;color:var(--mut);padding:1px 7px;border-radius:10px;font-size:11px;font-weight:500;min-width:22px;text-align:center}
+.tab.active .tab-n{background:rgba(249,130,108,.2);color:var(--acc)}
+.pane{background:#0a0d12;border:1px solid var(--bd);border-radius:8px;overflow:hidden}
+.iptbl{width:100%;border-collapse:collapse;font-size:13px}
+.iptbl thead{background:#0d1117}
+.iptbl th{padding:10px 12px;text-align:left;color:var(--mut);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--bd)}
+.iptbl td{padding:8px 12px;border-bottom:1px solid #1a1f26}
+.iptbl tr:last-child td{border-bottom:0}
+.iptbl tr:hover{background:rgba(249,130,108,.04)}
+.iptbl .num{color:var(--mut);font-size:11px;width:40px}
+.iptbl .ip-cell code{font-family:ui-monospace,Menlo,monospace;font-size:13px;color:var(--fg);background:transparent;padding:0}
+.line-badge{font-size:11px;padding:2px 8px;border-radius:4px;font-weight:600;display:inline-block;min-width:36px;text-align:center}
+.copybtn{background:#21262d;border:1px solid var(--bd);color:var(--fg);border-radius:5px;padding:4px 10px;font-size:11px;cursor:pointer}
+.copybtn:hover{background:#30363d;border-color:var(--acc)}
+.copybtn.copied{background:rgba(126,231,135,.15);border-color:#7ee787;color:#7ee787}
+.sub-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}
+.sub-card{padding:10px 12px;background:#0d1117;border:1px solid var(--bd);border-radius:6px;cursor:pointer}
+.sub-card:hover{background:#161b22}
+.sub-label{font-size:12px;font-weight:600;margin-bottom:3px}
+.sub-host{font-family:ui-monospace,monospace;font-size:12px;color:var(--fg);display:block;word-break:break-all}
+.refresh-bar{display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--mut);margin-bottom:10px}
+.refresh-bar button{background:transparent;border:1px solid var(--bd);color:var(--mut);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px}
+.refresh-bar button:hover{color:var(--fg);border-color:var(--acc)}
+@media (max-width:720px){.hero h1{font-size:22px}.iptbl th:nth-child(5),.iptbl td:nth-child(5){display:none}.iptbl .num{display:none}.iptbl th:first-child,.iptbl td:first-child{display:none}}
+</style>
+
+<div class="hero">
+  <h1>☁️ CloudFlare 优选 IP</h1>
+  <div class="sub">电信、联通、移动优质 Cloudflare 节点 IP + 反代 IP · 每 6 小时自动更新</div>
+  <div class="stats">
+    <span>📦 总节点 <b>${total.toLocaleString()}</b></span>
+    <span>🌐 CF 自家 <b>${(ips.length - ips.filter(x => x.category === 'cf-proxy').length).toLocaleString()}</b></span>
+    <span>🔁 反代 <b>${ips.filter(x => x.category === 'cf-proxy').length.toLocaleString()}</b></span>
+    <span>⏰ 更新 <b>${updated}</b></span>
+  </div>
 </div>
 
-<div class="card">
-  <h2>快捷订阅</h2>
-  <div class="nodes">${subLinks}</div>
-  <p class="mut" style="font-size:11px;margin-top:10px">点"复制"获取相对路径，需自行拼上完整域名。橘色框是基于你当前 IP 推荐的方案。</p>
+<div class="refresh-bar">
+  <span>显示每个分类的 top 30 · 点击 IP 复制 · <a href="/test" style="color:var(--acc)">节点浏览</a> · <a href="/admin" style="color:var(--mut)">管理</a> · <a href="https://github.com/LeilaoMi/cf-best-ip" target="_blank" style="color:var(--mut)">GitHub</a></span>
+  <button id="reloadBtn">↻ 刷新数据</button>
 </div>
 
-<div class="card">
-  <h2>所有 API 接口</h2>
-  <div style="font-size:12px;line-height:2">
-    <div><code>/sub</code> · <code>/sub?carrier=CT&top=10</code> · <code>/sub?country=HK,JP</code> · <code>/sub?smart=1</code> — 纯文本订阅</div>
-    <div><code>/api/ips</code> — JSON，支持所有筛选参数</div>
-    <div><code>/api/preferred-ips</code> — EdgeTunnel 兼容</div>
-    <div><code>/api/v2ray</code> — V2Ray base64</div>
-    <div><code>/api/clash</code> — Clash YAML</div>
-    <div><code>/api/stats</code> — 分布统计 · <code>/api/history?days=7</code></div>
-  </div>
-  <p class="mut" style="font-size:11px;margin-top:10px">参数：<code>country</code> / <code>colo</code> / <code>carrier</code>(CT/CU/CM) / <code>port</code> / <code>maxDelay</code> / <code>top</code> / <code>exclude</code> / <code>smart=1</code>，可任意组合</p>
+<div class="tabs">${tabBar}</div>
+${panes}
+${subBlock}
+
+<div class="mut" style="text-align:center;font-size:11px;margin-top:18px;padding:12px 0">
+  API:<code>/api/ips?carrier=CT&top=10</code> · <code>/sub?carrier=CM</code> · 完整接口见 <a href="/admin" style="color:var(--acc)">/admin</a>
 </div>
 
 <script>
-const origin = location.origin;
-document.querySelectorAll('[data-copy]').forEach(b => b.onclick = async () => {
-  const url = origin + b.dataset.copy;
-  try { await navigator.clipboard.writeText(url); const o = b.textContent; b.textContent = '✓ 已复制'; setTimeout(() => b.textContent = o, 1500); }
-  catch (e) { prompt('复制此链接', url); }
-});
-</script>`);
+  document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.pane').forEach(p => p.style.display = 'none');
+    t.classList.add('active');
+    document.getElementById('pane-' + t.dataset.tab).style.display = 'block';
+  }));
+  document.body.addEventListener('click', async (e) => {
+    const el = e.target.closest('[data-copy]');
+    if (!el) return;
+    const val = el.dataset.copy;
+    try { await navigator.clipboard.writeText(val); }
+    catch { prompt('复制此内容', val); return; }
+    el.classList.add('copied');
+    const orig = el.textContent;
+    if (el.tagName === 'BUTTON') { el.textContent = '✓'; }
+    setTimeout(() => { el.classList.remove('copied'); if (el.tagName === 'BUTTON') el.textContent = orig; }, 1200);
+  });
+  setTimeout(() => location.reload(), 60000);
+  document.getElementById('reloadBtn').onclick = () => location.reload();
+</script>
+`);
 }
 
 function renderTest(visitor) {
