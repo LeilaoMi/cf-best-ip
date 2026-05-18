@@ -41,6 +41,58 @@ import { connect } from "cloudflare:sockets";
 // ============================================================
 const VERSION = "2.1.0";
 
+// ===== v2.3: Cloudflare 公开 IPv4 anycast CIDR (官方 ips-v4) =====
+// 用 IP 段精确判定 cf-native vs cf-proxy,不再依赖 source 元数据
+// 来源: https://www.cloudflare.com/ips-v4
+const CF_IPV4_CIDRS = [
+  "173.245.48.0/20",
+  "103.21.244.0/22",
+  "103.22.200.0/22",
+  "103.31.4.0/22",
+  "141.101.64.0/18",
+  "108.162.192.0/18",
+  "190.93.240.0/20",
+  "188.114.96.0/20",
+  "197.234.240.0/22",
+  "198.41.128.0/17",
+  "162.158.0.0/15",
+  "104.16.0.0/13",
+  "104.24.0.0/14",
+  "172.64.0.0/13",
+  "131.0.72.0/22",
+];
+
+// 预编译为 [network, mask] 整数对，方便 O(1) 段查
+const CF_RANGES = CF_IPV4_CIDRS.map(c => {
+  const [base, bits] = c.split("/");
+  const m = base.split(".").map(Number);
+  const baseInt = ((m[0] << 24) | (m[1] << 16) | (m[2] << 8) | m[3]) >>> 0;
+  const bitsN = +bits;
+  const mask = bitsN === 0 ? 0 : (0xffffffff << (32 - bitsN)) >>> 0;
+  return [baseInt & mask, mask];
+});
+
+function ipToInt(ip) {
+  const m = String(ip).split(".");
+  if (m.length !== 4) return null;
+  let v = 0;
+  for (let i = 0; i < 4; i++) {
+    const n = +m[i];
+    if (!Number.isInteger(n) || n < 0 || n > 255) return null;
+    v = ((v << 8) | n) >>> 0;
+  }
+  return v;
+}
+
+function isCfNativeIp(ip) {
+  const v = ipToInt(ip);
+  if (v == null) return false;
+  for (const [net, mask] of CF_RANGES) {
+    if ((v & mask) === net) return true;
+  }
+  return false;
+}
+
 const DEFAULT_CFG = {
   topN: 30,
   probeTimeoutMs: 3000,
@@ -543,19 +595,11 @@ async function aggregateSources() {
     stats.push({ name: r.name, count: r.ips.length, error: r.error });
     all.push(...r.ips);
   }
-  // 合并去重，按 ip:port 维度。多源合并时 cf-native 优先级高于 cf-proxy
+  // 合并去重，按 ip:port 维度
   const uniq = uniqBy(all, x => `${x.ip}:${x.port}`);
-  // uniqBy 只合并 sources，没合并 category，这里补一遍
-  const bySrcCategory = new Map();
-  for (const x of all) {
-    const k = `${x.ip}:${x.port}`;
-    const cur = bySrcCategory.get(k);
-    if (!cur || (cur === "cf-proxy" && x.category === "cf-native")) {
-      bySrcCategory.set(k, x.category || "cf-native");
-    }
-  }
+  // v2.3: 用 IP 段精确重写 category，不再相信 source 元数据
   for (const x of uniq) {
-    x.category = bySrcCategory.get(`${x.ip}:${x.port}`) || "cf-native";
+    x.category = isCfNativeIp(x.ip) ? "cf-native" : "cf-proxy";
   }
   return { ips: uniq, stats };
 }
