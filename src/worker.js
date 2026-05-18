@@ -559,7 +559,10 @@ async function fetchSource(src) {
             ip: x.ip,
             port: 443,
             carrier: line,
-            country: "CN",
+            // hostmonit 的 IP 是 CF anycast，真实地理位置在 US/HK 等,
+            // line:CT/CU/CM 只表示"最优运营商路由"，不是 IP 所在国。
+            // 设 country:null 让 enrichGeo 查真实国家，避免被默认 CN blocklist 误杀。
+            country: null,
             delay: x.latency,
             loss: x.loss,
             mbps: x.speed,
