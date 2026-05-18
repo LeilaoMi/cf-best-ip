@@ -345,7 +345,7 @@ async function enrichGeo(ips) {
     const batch = ips.slice(i, i + batchSize);
     try {
       const r = await withTimeout(
-        fetch("http://ip-api.com/batch?fields=status,countryCode,city,regionName,as,isp,query", {
+        fetch("http://ip-api.com/batch?fields=status,country,countryCode,city,regionName,as,isp,query", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(batch.map(x => ({ query: x.ip }))),
@@ -360,6 +360,7 @@ async function enrichGeo(ips) {
         const hit = byIp.get(item.ip);
         if (hit && hit.status === "success") {
           item.country = hit.countryCode || item.country;
+          item.countryName = hit.country || item.countryName;
           item.region = hit.regionName || item.region;
           item.city = hit.city || item.city;
           item.asn = hit.as || item.asn;
@@ -426,7 +427,7 @@ async function runFullTest(env, ctx, opts = {}) {
   //    }, 5);
 
   const enriched = await enrichGeo(alive);
-  alive = enriched;
+  alive = enriched.filter(x => x.country);
 
   // 7. 持久化
   const payload = {
@@ -638,7 +639,7 @@ async function handle(request, env, ctx) {
   }
 
   // ---- 订阅 ----
-  if (path === "/sub" || path === "/sub.txt") {
+  if (path === "/sub" || path === "/sub.txt" || path === "/api/ips.txt" || path === "/ips.txt") {
     if (!checkSubToken(request, env)) return text("Forbidden", { status: 403 });
     const filtered = applyFilter(ips, params, requesterColo);
     return text(fmtSub(filtered, params.get("comment") !== "0"));
@@ -1041,16 +1042,17 @@ ${renderVisitorBanner(visitor)}
 </div>
 
 <div class="card">
-  <h2>测速说明</h2>
-  <p class="mut" style="font-size:12px;line-height:1.7;margin:0">
-    ⚠️ <b>Cloudflare Workers 平台禁止从 Worker 直接连接 Cloudflare 自家 IP</b>，
-    所以在网页上"测速"对 CF IP 永远会失败 — 这是平台限制，不是 bug。<br/>
-    上方节点列表来自 <b>7 个公开数据源</b>，这些源由各位社区维护者从中国大陆三网真实测速得来。
-    要测你本机到这些 IP 的真实延迟，请：<br/>
-    1. 在上方按你的运营商筛选 → 复制订阅<br/>
-    2. 把订阅地址扔给客户端（V2RayN / Clash / NekoBox 等），客户端会做真实测速并自动切到最快的<br/>
-    3. 或下载 <a href="https://github.com/XIU2/CloudflareSpeedTest/releases" target="_blank" rel="noreferrer">CloudflareSpeedTest</a> 命令行版做硬核测速
+  <h2>🚀 本地实测（在你当前网络测真实延迟）</h2>
+  <p class="mut" style="font-size:12px;line-height:1.6;margin:0 0 10px">
+    Worker 内部测不了 CF 节点延迟（平台限制），<b>但浏览器可以！</b>下面会测试你 4 个运营商子域的优选节点套（这些都是你自己的域，SSL 证书合法）。<br/>
+    <b style="color:var(--warn)">最准的玩法：在手机/电脑上关闭代理后再点开始实测</b>——代表你本地网络到云服务器的真实路径。
   </p>
+  <div class="row" style="margin-bottom:8px">
+    <input id="customHost" placeholder="可选：自定义域名一起测（如 yourdomain.com）" style="flex:1;min-width:160px"/>
+    <button class="btn sm" id="btnLocal">开始实测</button>
+    <span class="mut" id="localStatus" style="font-size:11px"></span>
+  </div>
+  <div id="localRes" style="font-size:12px;line-height:1.8" class="mut">点"开始实测"后出现结果</div>
 </div>
 
 <script>
@@ -1133,6 +1135,68 @@ $('#btnDownload').onclick = async () => {
 $('#btnRefresh').onclick = load;
 
 load();
+
+// ===== 本地实测：浏览器在用户当前网络下，对 cf./ct./cu./cm. 4 个子域做真实延迟测试 =====
+function _defaultProbeHosts() {
+  const h = location.hostname;
+  const parts = h.split('.');
+  if (parts.length < 2) return [];
+  const root = parts.slice(1).join('.');
+  return [
+    { tag: '通用 cf.', host: 'cf.' + root },
+    { tag: '电信 ct.', host: 'ct.' + root },
+    { tag: '联通 cu.', host: 'cu.' + root },
+    { tag: '移动 cm.', host: 'cm.' + root },
+  ];
+}
+async function _probeOne(host, n = 5, timeoutMs = 4000) {
+  const samples = [];
+  for (let i = 0; i < n; i++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    const t0 = performance.now();
+    try {
+      await fetch('https://' + host + '/cdn-cgi/trace?_=' + Math.random(), { cache: 'no-store', signal: ctrl.signal, mode: 'no-cors' });
+      samples.push(performance.now() - t0);
+    } catch (e) {
+      samples.push(null);
+    }
+    clearTimeout(timer);
+  }
+  const ok = samples.filter(x => x != null);
+  return {
+    host,
+    samples,
+    min: ok.length ? Math.round(Math.min(...ok)) : null,
+    avg: ok.length ? Math.round(ok.reduce((a, b) => a + b, 0) / ok.length) : null,
+    loss: 1 - ok.length / n,
+  };
+}
+const _btnLocal = document.getElementById('btnLocal');
+if (_btnLocal) {
+  _btnLocal.onclick = async () => {
+    _btnLocal.disabled = true;
+    const st = document.getElementById('localStatus');
+    const res = document.getElementById('localRes');
+    res.innerHTML = '<div class="mut">⏳ 并发测试中（每个域 5 次握手）…</div>';
+    const targets = _defaultProbeHosts();
+    const custom = (document.getElementById('customHost').value || '').trim();
+    if (custom) targets.push({ tag: '自定义', host: custom });
+    st.textContent = '测试 ' + targets.length + ' 个域…';
+    const results = await Promise.all(targets.map(t => _probeOne(t.host).then(r => ({ ...t, ...r }))));
+    results.sort((a, b) => (a.avg == null ? 99999 : a.avg) - (b.avg == null ? 99999 : b.avg));
+    res.innerHTML = results.map(r => {
+      const c = r.avg == null ? '#8b949e' : (r.avg < 80 ? '#7ee787' : r.avg < 200 ? '#d8af3c' : '#ff7b72');
+      const lossPct = Math.round(r.loss * 100);
+      const sign = r.avg == null ? '✗ 不通' : ('✓ 平均 ' + r.avg + 'ms · 最低 ' + r.min + 'ms');
+      const tail = lossPct > 0 ? ' · 丢包 ' + lossPct + '%' : '';
+      return '<div style="display:flex;justify-content:space-between;gap:8px;padding:7px 0;border-bottom:1px solid #21262d"><span><b>' + r.tag + '</b> ' + r.host + '</span><b style="color:' + c + ';white-space:nowrap">' + sign + tail + '</b></div>';
+    }).join('');
+    const best = results.find(r => r.avg != null);
+    st.textContent = best ? '✅ 你这网络下最快: ' + best.host + ' (' + best.avg + 'ms) → VLESS 用这个域' : '⚠️ 全部不通，可能在墙后或正在用代理';
+    _btnLocal.disabled = false;
+  };
+}
 </script>`);
 }
 
