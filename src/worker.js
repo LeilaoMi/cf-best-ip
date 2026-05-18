@@ -1,639 +1,870 @@
 /**
- * CF Best IP — 优选 IP 一站式 Worker
- * ------------------------------------------------------------
- * 功能：
- *  - 多源聚合候选 IP（cf.090227.xyz、ipdb、cmliu 源、hostmonit 等）
- *  - Worker subrequest 可用性二次校验（cdn-cgi/trace）
- *  - 浏览器一键测速 + 排序
- *  - KV 持久化 + Cron 定时刷新
- *  - 订阅接口：/sub（txt）、/api/ips（JSON）、/api/preferred-ips（EDT 兼容）
- *  - 自动同步到 Cloudflare DNS（可选）
- *  - 管理面板 /admin（密码保护）
+ * ============================================================
+ *  CF Best IP · 集大成版 Worker  (v2.0)
+ *  https://github.com/LeilaoMi/cf-best-ip
+ * ============================================================
  *
- * 部署：见 README.md
+ *  社区主流方案都有的功能：
+ *   - 多源聚合 + Cron 定时 + KV 持久化       (cfnb / CF Workers 版)
+ *   - 真实 TCP 三次握手测速 (cloudflare:sockets)
+ *   - HTTP 带宽抽样测速 + colo / 国家识别    (CFST 思路)
+ *   - 自动同步 Cloudflare DNS A 记录         (cfnb)
+ *   - 订阅 + V2Ray base64 + Clash + EDT 兼容 (cmliu 系列)
+ *   - 管理面板 + 密码保护                    (CF Workers 重制版)
+ *   - 浏览器在线测速                         (itdog 风格)
  *
- * 必填环境变量：
- *   ADMIN_PASSWORD   管理员登录密码
- * 可选环境变量：
- *   SUB_TOKEN        订阅鉴权 token（不设置则订阅公开）
- *   CF_API_TOKEN     用于同步 DNS 的 Cloudflare API Token（Zone:DNS:Edit）
- *   CF_ZONE_ID       同步目标域名所在 Zone
- *   CF_RECORD_NAME   同步目标 A 记录（如 cf.example.com）
- *   DNS_TOP_N        DNS 同步取前 N 个 IP（默认 10）
+ *  本项目独家：
+ *   ★ 多维度筛选 API：country / colo / carrier / port / maxDelay / minMbps
+ *   ★ 分运营商 DNS 同步：ct.example.com / cu.example.com / cm.example.com
+ *   ★ 智能就近推荐 /sub?smart=1（按访问者 colo 算距离）
+ *   ★ CIDR 自定义扫描（管理面板里贴段，Worker 边缘开扫）
+ *   ★ 历史快照 + Telegram / Discord Webhook 通知
  *
- * KV 绑定：
- *   KV               命名空间名固定为 KV
+ *  环境变量（wrangler secret put / dashboard 添加）：
+ *    ADMIN_PASSWORD    必填，管理员登录密码
+ *    SUB_TOKEN         可选，订阅鉴权 token，不设则订阅公开
+ *    CF_API_TOKEN      可选，同步 DNS 的 Cloudflare API Token (Zone:DNS:Edit)
+ *    CF_ZONE_ID        可选，目标域名 Zone ID
+ *    CF_RECORD_NAME    可选，主 A 记录名，例如 cf.example.com
+ *    CF_DNS_BY_CARRIER 可选，"1" 启用按运营商分别同步 (ct./cu./cm. 前缀)
+ *    DNS_TOP_N         可选，DNS 同步取前 N 个 IP，默认 10
+ *    TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID  可选，Cron 完成后推送通知
+ *    DISCORD_WEBHOOK   可选，Discord 通知
+ *
+ *  KV 绑定：变量名固定 KV
  */
 
+import { connect } from "cloudflare:sockets";
+
 // ============================================================
-// 1. 默认配置 & 数据源
+// 1. 常量 / 数据源 / 字典
 // ============================================================
-const DEFAULT_CONFIG = {
-  // 默认拉取前 N 个 IP 作为优选结果
+const VERSION = "2.0.0";
+
+const DEFAULT_CFG = {
   topN: 30,
-  // 每个 IP 做可用性校验时的超时（ms）
-  probeTimeoutMs: 4000,
-  // Worker 端校验并发数
-  probeConcurrency: 30,
-  // 国家黑名单（去掉 CN/HK 等高污染地区，可在管理面板改）
-  countryBlocklist: ["CN"],
+  probeTimeoutMs: 3000,
+  probeConcurrency: 20,
+  bandwidthSampleSize: 5,           // 抽 5 个延迟最优的做带宽测试
+  bandwidthBytes: 256 * 1024,       // 下载 256 KB
+  countryBlocklist: ["CN"],         // 默认屏蔽中国大陆 colo
+  ports: [443],                     // 默认只测 443
+  refreshHours: 6,
 };
 
-/** 公开 IP 数据源列表 —— 失败的源会被自动跳过 */
-const IP_SOURCES = [
-  { name: "addressesapi/ip.164746.xyz", url: "https://addressesapi.090227.xyz/ip.164746.xyz", type: "text" },
-  { name: "addressesapi/CloudFlareYes", url: "https://addressesapi.090227.xyz/CloudFlareYes", type: "text" },
-  { name: "addressesapi/cmcc", url: "https://addressesapi.090227.xyz/cmcc", type: "text" },
-  { name: "addressesapi/ct", url: "https://addressesapi.090227.xyz/ct", type: "text" },
-  { name: "ip.164746.xyz/ipTop", url: "https://ip.164746.xyz/ipTop.html", type: "text" },
-  { name: "IPDB/proxy", url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/proxy.txt", type: "text" },
+const SOURCES = [
+  { name: "addressesapi/ip.164746.xyz", url: "https://addressesapi.090227.xyz/ip.164746.xyz", type: "carrier" },
+  { name: "addressesapi/CloudFlareYes", url: "https://addressesapi.090227.xyz/CloudFlareYes", type: "carrier" },
+  { name: "addressesapi/cmcc",          url: "https://addressesapi.090227.xyz/cmcc",          type: "carrier" },
+  { name: "addressesapi/ct",            url: "https://addressesapi.090227.xyz/ct",            type: "carrier" },
+  { name: "addressesapi/cu",            url: "https://addressesapi.090227.xyz/cu",            type: "carrier" },
+  { name: "ip.164746.xyz/ipTop",        url: "https://ip.164746.xyz/ipTop.html",              type: "csv" },
+  { name: "IPDB/proxy",                 url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/proxy.txt", type: "list" },
 ];
 
-// ============================================================
-// 2. 入口
-// ============================================================
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    try {
-      return await route(request, env, ctx, url);
-    } catch (e) {
-      return json({ error: String(e && e.message || e) }, 500);
-    }
-  },
-
-  // Cron 定时刷新（在 wrangler.toml 配置）
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(refreshAll(env, "[cron]"));
-  },
+// 常见 colo → 国家映射（cdn-cgi/trace 也能直接给国家，但缓存一份方便筛选）
+const COLO_TO_COUNTRY = {
+  HKG: "HK", NRT: "JP", KIX: "JP", ICN: "KR", TPE: "TW", SIN: "SG", KUL: "MY",
+  BKK: "TH", SGN: "VN", MNL: "PH", BOM: "IN", MAA: "IN", DEL: "IN",
+  LAX: "US", SJC: "US", SEA: "US", ORD: "US", IAD: "US", DFW: "US", ATL: "US",
+  EWR: "US", MIA: "US", DEN: "US", BOS: "US", SFO: "US",
+  YYZ: "CA", YVR: "CA", LHR: "GB", MAN: "GB", AMS: "NL", FRA: "DE", DUS: "DE",
+  CDG: "FR", MRS: "FR", MAD: "ES", BCN: "ES", MXP: "IT", FCO: "IT", ZRH: "CH",
+  WAW: "PL", VIE: "AT", PRG: "CZ", ARN: "SE", HEL: "FI", OSL: "NO", CPH: "DK",
+  SVO: "RU", DME: "RU", IST: "TR", DXB: "AE", TLV: "IL", JNB: "ZA", CPT: "ZA",
+  GRU: "BR", GIG: "BR", EZE: "AR", SCL: "CL", BOG: "CO", LIM: "PE", MEX: "MX",
+  SYD: "AU", MEL: "AU", AKL: "NZ",
 };
 
-async function route(request, env, ctx, url) {
-  const { pathname, searchParams } = url;
+const COUNTRY_FLAGS = {
+  HK: "🇭🇰", JP: "🇯🇵", KR: "🇰🇷", TW: "🇹🇼", SG: "🇸🇬", US: "🇺🇸", CA: "🇨🇦",
+  GB: "🇬🇧", DE: "🇩🇪", FR: "🇫🇷", NL: "🇳🇱", AU: "🇦🇺", RU: "🇷🇺", IN: "🇮🇳",
+  BR: "🇧🇷", MX: "🇲🇽", IT: "🇮🇹", ES: "🇪🇸", CN: "🇨🇳", TH: "🇹🇭", MY: "🇲🇾",
+};
 
-  // 公开接口
-  if (pathname === "/" || pathname === "/index.html") return homePage(env);
-  if (pathname === "/sub") return subEndpoint(request, env);
-  if (pathname === "/api/ips") return jsonIps(env, searchParams);
-  if (pathname === "/api/preferred-ips") return edtCompatibleIps(env, searchParams);
-  if (pathname === "/api/sources") return json({ sources: IP_SOURCES });
-
-  // 管理面板
-  if (pathname === "/admin") return adminPage(request, env);
-  if (pathname === "/admin/refresh") return adminRefresh(request, env, ctx);
-  if (pathname === "/admin/save-config") return adminSaveConfig(request, env);
-  if (pathname === "/admin/sync-dns") return adminSyncDns(request, env, ctx);
-
-  // 浏览器端测速辅助：返回 cdn-cgi/trace 的 colo 信息
-  if (pathname === "/cdn-cgi/trace") return cgiTrace(request);
-
-  return new Response("Not Found", { status: 404 });
-}
+const CARRIER_LABEL = { CT: "电信", CU: "联通", CM: "移动", CMCC: "移动", CF: "通用", DEF: "通用" };
 
 // ============================================================
-// 3. 数据源抓取 & 解析
+// 2. 工具函数
 // ============================================================
-async function fetchSources() {
-  const results = await Promise.allSettled(IP_SOURCES.map(fetchOneSource));
-  const ips = new Map(); // ip -> { ip, port, sources: [], colo?: }
-  results.forEach((r, i) => {
-    if (r.status !== "fulfilled") return;
-    for (const item of r.value) {
-      const key = `${item.ip}:${item.port}`;
-      const prev = ips.get(key);
-      if (prev) {
-        prev.sources.push(IP_SOURCES[i].name);
-        if (item.colo && !prev.colo) prev.colo = item.colo;
-      } else {
-        ips.set(key, { ...item, sources: [IP_SOURCES[i].name] });
-      }
-    }
+function json(obj, init = {}) {
+  return new Response(JSON.stringify(obj, null, 2), {
+    status: init.status || 200,
+    headers: { "content-type": "application/json; charset=utf-8", "access-control-allow-origin": "*", ...(init.headers || {}) },
   });
-  return Array.from(ips.values());
 }
-
-async function fetchOneSource(src) {
-  const res = await fetch(src.url, {
-    cf: { cacheTtl: 600 },
-    headers: { "user-agent": "Mozilla/5.0 cf-best-ip-worker" },
+function text(body, init = {}) {
+  return new Response(body, {
+    status: init.status || 200,
+    headers: { "content-type": "text/plain; charset=utf-8", "access-control-allow-origin": "*", ...(init.headers || {}) },
   });
-  if (!res.ok) throw new Error(`${src.name} ${res.status}`);
-  const text = await res.text();
-  return src.type === "html" ? parseHtml(text) : parseText(text);
 }
-
-const IPV4_RE = /\b((?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3})(?::(\d{2,5}))?(?:\s*[#|]\s*([A-Z]{2,}))?/g;
-function parseText(text) {
-  const out = [];
-  let m;
-  while ((m = IPV4_RE.exec(text)) !== null) {
-    out.push({ ip: m[1], port: m[2] ? Number(m[2]) : 443, colo: m[3] || null });
-  }
-  return out;
+function html(body) {
+  return new Response(body, { headers: { "content-type": "text/html; charset=utf-8" } });
 }
-
-function parseHtml(html) {
-  // 把 HTML 里的标签剥掉再扔给 parseText
-  const stripped = html.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ");
-  return parseText(stripped);
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms)),
+  ]);
 }
-
-// ============================================================
-// 4. Worker 端可用性 / 延迟校验
-// ============================================================
-async function probeIp(candidate) {
-  const { ip, port } = candidate;
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), DEFAULT_CONFIG.probeTimeoutMs);
-  const t0 = Date.now();
-  try {
-    // resolveOverride 是 Workers 提供的 cf 选项，
-    // 让 fetch 走我们指定的 IP 而不是 DNS 解析结果。
-    const res = await fetch(`https://cloudflare.com/cdn-cgi/trace`, {
-      signal: ctrl.signal,
-      cf: { resolveOverride: ip },
-    });
-    const delay = Date.now() - t0;
-    if (!res.ok) return null;
-    const text = await res.text();
-    const colo = (text.match(/colo=([A-Z]{2,})/) || [])[1] || null;
-    const loc = (text.match(/loc=([A-Z]{2,})/) || [])[1] || null;
-    return { ip, port, delay, colo, loc };
-  } catch (e) {
-    return null;
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-async function probeAll(candidates, concurrency = DEFAULT_CONFIG.probeConcurrency) {
-  const out = [];
+async function pMap(items, fn, concurrency = 10) {
+  const out = new Array(items.length);
   let i = 0;
   async function worker() {
-    while (i < candidates.length) {
-      const cur = candidates[i++];
-      const r = await probeIp(cur);
-      if (r) out.push(r);
+    while (true) {
+      const idx = i++;
+      if (idx >= items.length) return;
+      try { out[idx] = await fn(items[idx], idx); } catch (e) { out[idx] = { error: String(e) }; }
     }
   }
-  await Promise.all(Array.from({ length: concurrency }, worker));
-  out.sort((a, b) => a.delay - b.delay);
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
   return out;
 }
-
-// ============================================================
-// 5. 主流程 / KV 持久化
-// ============================================================
-const KV_KEYS = {
-  ips: "best_ips",            // JSON 数组 [{ ip, port, delay, colo, loc }]
-  updatedAt: "best_ips_at",
-  config: "config",
-  lastError: "last_error",
-};
-
-async function loadConfig(env) {
-  const raw = await env.KV.get(KV_KEYS.config);
-  if (!raw) return { ...DEFAULT_CONFIG };
-  try { return { ...DEFAULT_CONFIG, ...JSON.parse(raw) }; }
-  catch { return { ...DEFAULT_CONFIG }; }
-}
-
-async function loadIps(env) {
-  const raw = await env.KV.get(KV_KEYS.ips);
-  if (!raw) return [];
-  try { return JSON.parse(raw); } catch { return []; }
-}
-
-async function refreshAll(env, tag = "[manual]") {
-  const config = await loadConfig(env);
-  const startedAt = Date.now();
-  try {
-    const candidates = await fetchSources();
-    // 去重 & 过滤黑名单（按 colo 国家前缀简单识别，不严格）
-    const filtered = candidates.filter((c) => {
-      if (!c.colo) return true;
-      const country = c.colo.slice(0, 2);
-      return !config.countryBlocklist.includes(country);
-    });
-
-    // 校验
-    const probed = await probeAll(filtered, DEFAULT_CONFIG.probeConcurrency);
-
-    // 二次国家过滤（来自 Worker 探针的真实 colo）
-    const final = probed
-      .filter((p) => !config.countryBlocklist.includes((p.colo || "").slice(0, 2)))
-      .slice(0, config.topN);
-
-    await env.KV.put(KV_KEYS.ips, JSON.stringify(final));
-    await env.KV.put(KV_KEYS.updatedAt, String(Date.now()));
-    await env.KV.delete(KV_KEYS.lastError);
-
-    // 如果配了 DNS 同步，顺便同步
-    if (env.CF_API_TOKEN && env.CF_ZONE_ID && env.CF_RECORD_NAME) {
-      await syncDns(env, final.slice(0, Number(env.DNS_TOP_N || 10)));
+function uniqBy(arr, keyFn) {
+  const map = new Map();
+  for (const x of arr) {
+    const k = keyFn(x);
+    if (!map.has(k)) map.set(k, x);
+    else {
+      const cur = map.get(k);
+      cur.sources = Array.from(new Set([...(cur.sources || []), ...(x.sources || [])]));
     }
-    return { ok: true, count: final.length, candidates: candidates.length, ms: Date.now() - startedAt, tag };
+  }
+  return Array.from(map.values());
+}
+function flag(country) { return COUNTRY_FLAGS[country] || "🌐"; }
+function carrierName(c) { return CARRIER_LABEL[c] || c || "通用"; }
+
+const IP_RE = /\b((?:25[0-5]|2[0-4]\d|[01]?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|[01]?\d?\d)){3})\b/g;
+
+function parseLine(line) {
+  // 接受 "1.2.3.4"、"1.2.3.4:443"、"1.2.3.4#CT"、"1.2.3.4:443#CT-1"
+  const m = line.match(/(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?(?:#([\w\-]+))?/);
+  if (!m) return null;
+  let carrier = null;
+  if (m[3]) {
+    const tag = m[3].toUpperCase().split("-")[0];
+    if (["CT", "CU", "CM", "CMCC", "CF"].includes(tag)) carrier = tag === "CMCC" ? "CM" : tag;
+  }
+  return { ip: m[1], port: m[2] ? +m[2] : 443, carrier };
+}
+
+// ============================================================
+// 3. KV 封装
+// ============================================================
+async function kvGet(env, key, def = null) {
+  if (!env.KV) return def;
+  const v = await env.KV.get(key, "json");
+  return v == null ? def : v;
+}
+async function kvSet(env, key, val, opts) {
+  if (!env.KV) return;
+  await env.KV.put(key, JSON.stringify(val), opts);
+}
+async function getConfig(env) {
+  const saved = await kvGet(env, "config", {});
+  return { ...DEFAULT_CFG, ...saved };
+}
+async function setConfig(env, cfg) {
+  const merged = { ...(await getConfig(env)), ...cfg };
+  await kvSet(env, "config", merged);
+  return merged;
+}
+async function getLatest(env) {
+  return (await kvGet(env, "ips:latest", { ips: [], updatedAt: 0, sourceStats: [] }));
+}
+async function saveLatest(env, data) {
+  await kvSet(env, "ips:latest", data);
+  // 同时写一份当日历史快照（30 天 TTL）
+  const day = new Date().toISOString().slice(0, 10);
+  await kvSet(env, `ips:history:${day}`, data, { expirationTtl: 60 * 60 * 24 * 30 });
+}
+async function getManual(env) { return await kvGet(env, "ips:manual", []); }
+async function setManual(env, list) { await kvSet(env, "ips:manual", list); }
+
+// ============================================================
+// 4. 数据源抓取
+// ============================================================
+async function fetchSource(src) {
+  try {
+    const r = await withTimeout(fetch(src.url, { cf: { cacheTtl: 300 } }), 8000);
+    if (!r.ok) return { name: src.name, ips: [], error: `HTTP ${r.status}` };
+    const body = await r.text();
+    const ips = [];
+    for (const raw of body.split(/[\r\n,]+/)) {
+      const line = raw.trim();
+      if (!line || line.startsWith("#") || line.startsWith("//")) continue;
+      // 从混排 HTML/CSV 里抠出每个 IP
+      const matches = line.match(/\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?(?:#[\w\-]+)?/g) || [];
+      for (const m of matches) {
+        const parsed = parseLine(m);
+        if (parsed) ips.push({ ...parsed, sources: [src.name] });
+      }
+    }
+    return { name: src.name, ips };
   } catch (e) {
-    await env.KV.put(KV_KEYS.lastError, `${tag} ${e.message || e} @ ${new Date().toISOString()}`);
-    return { ok: false, error: String(e.message || e), ms: Date.now() - startedAt, tag };
+    return { name: src.name, ips: [], error: String(e && e.message || e) };
+  }
+}
+
+async function aggregateSources() {
+  const results = await Promise.all(SOURCES.map(fetchSource));
+  const all = [];
+  const stats = [];
+  for (const r of results) {
+    stats.push({ name: r.name, count: r.ips.length, error: r.error });
+    all.push(...r.ips);
+  }
+  // 合并去重，按 ip:port 维度
+  const uniq = uniqBy(all, x => `${x.ip}:${x.port}`);
+  return { ips: uniq, stats };
+}
+
+// ============================================================
+// 5. 测速核心
+// ============================================================
+
+/** TCP 三次握手测速 —— 使用 cloudflare:sockets */
+async function tcpPing(ip, port, timeoutMs) {
+  const t0 = Date.now();
+  try {
+    const sock = connect({ hostname: ip, port: Number(port) }, { allowHalfOpen: false, secureTransport: "off" });
+    // opened 是 promise，resolve 即 SYN/ACK 完成
+    await withTimeout(sock.opened, timeoutMs);
+    const ms = Date.now() - t0;
+    try { await sock.close(); } catch {}
+    return ms;
+  } catch (e) {
+    return null;
+  }
+}
+
+/** 多次 TCP ping，取平均 + 丢包率 */
+async function tcpPingN(ip, port, n, timeoutMs) {
+  const samples = [];
+  for (let i = 0; i < n; i++) {
+    const ms = await tcpPing(ip, port, timeoutMs);
+    samples.push(ms);
+  }
+  const ok = samples.filter(x => x != null);
+  return {
+    samples,
+    min: ok.length ? Math.min(...ok) : null,
+    avg: ok.length ? Math.round(ok.reduce((a, b) => a + b, 0) / ok.length) : null,
+    loss: 1 - ok.length / n,
+  };
+}
+
+/** 通过 cdn-cgi/trace 获取 colo / country —— 必须走 cloudflare-dns.com 这种已有有效证书的域名 */
+async function detectColo(ip, port, timeoutMs) {
+  try {
+    const url = port === 443 ? `https://cloudflare.com/cdn-cgi/trace` : `http://cloudflare.com/cdn-cgi/trace`;
+    const r = await withTimeout(
+      fetch(url, { cf: { resolveOverride: ip }, headers: { "user-agent": "cf-best-ip/2.0" } }),
+      timeoutMs,
+    );
+    if (!r.ok) return {};
+    const t = await r.text();
+    const m = Object.fromEntries(t.split("\n").map(l => l.split("=")).filter(p => p.length === 2));
+    const colo = m.colo || null;
+    const country = m.loc || COLO_TO_COUNTRY[colo] || null;
+    return { colo, country };
+  } catch {
+    return {};
+  }
+}
+
+/** 带宽测试 —— 下载固定字节数测速 */
+async function probeBandwidth(ip, bytes, timeoutMs) {
+  try {
+    const t0 = Date.now();
+    const r = await withTimeout(
+      fetch(`https://speed.cloudflare.com/__down?bytes=${bytes}`, {
+        cf: { resolveOverride: ip },
+        headers: { "user-agent": "cf-best-ip/2.0" },
+      }),
+      timeoutMs,
+    );
+    if (!r.ok) return null;
+    const buf = await r.arrayBuffer();
+    const sec = (Date.now() - t0) / 1000;
+    if (sec <= 0) return null;
+    return Math.round((buf.byteLength * 8) / sec / 1000) / 1000; // Mbps
+  } catch {
+    return null;
   }
 }
 
 // ============================================================
-// 6. Cloudflare DNS 同步
+// 6. 全量测速管线
 // ============================================================
-async function syncDns(env, ips) {
-  if (!ips.length) return { ok: false, reason: "no_ip" };
-  const api = "https://api.cloudflare.com/client/v4";
-  const headers = {
-    "Authorization": `Bearer ${env.CF_API_TOKEN}`,
-    "Content-Type": "application/json",
+async function runFullTest(env, ctx, opts = {}) {
+  const cfg = await getConfig(env);
+  const startedAt = Date.now();
+
+  // 1. 拉源
+  const agg = await aggregateSources();
+  // 加入手动添加的 IP
+  const manual = await getManual(env);
+  for (const m of manual) agg.ips.push({ ...m, sources: ["manual"] });
+
+  // 2. 并发 TCP ping
+  const probed = await pMap(agg.ips, async (item) => {
+    const port = item.port || 443;
+    const r = await tcpPingN(item.ip, port, 2, cfg.probeTimeoutMs);
+    return { ...item, port, delay: r.avg, loss: r.loss };
+  }, cfg.probeConcurrency);
+
+  // 3. 过滤可用
+  let alive = probed.filter(x => x.delay != null && x.loss < 0.5);
+  alive.sort((a, b) => a.delay - b.delay);
+
+  // 4. 给 Top N 探 colo / country
+  const topForColo = alive.slice(0, Math.min(40, alive.length));
+  await pMap(topForColo, async (item) => {
+    const info = await detectColo(item.ip, item.port, cfg.probeTimeoutMs + 1000);
+    Object.assign(item, info);
+  }, 10);
+
+  // 5. 应用国家黑名单
+  if (cfg.countryBlocklist && cfg.countryBlocklist.length) {
+    alive = alive.filter(x => !x.country || !cfg.countryBlocklist.includes(x.country));
+  }
+
+  // 6. 抽样带宽测速
+  const bwTargets = alive.slice(0, cfg.bandwidthSampleSize);
+  await pMap(bwTargets, async (item) => {
+    const mbps = await probeBandwidth(item.ip, cfg.bandwidthBytes, 6000);
+    item.mbps = mbps;
+  }, 5);
+
+  // 7. 持久化
+  const payload = {
+    ips: alive,
+    sourceStats: agg.stats,
+    updatedAt: Date.now(),
+    elapsedMs: Date.now() - startedAt,
+    version: VERSION,
   };
+  await saveLatest(env, payload);
 
-  // 拉取该记录名下所有 A 记录
-  const listRes = await fetch(`${api}/zones/${env.CF_ZONE_ID}/dns_records?type=A&name=${encodeURIComponent(env.CF_RECORD_NAME)}&per_page=100`, { headers });
-  const listJson = await listRes.json();
-  if (!listJson.success) return { ok: false, reason: "list_failed", detail: listJson.errors };
+  // 8. DNS 同步（后台执行）
+  if (env.CF_API_TOKEN && env.CF_ZONE_ID && env.CF_RECORD_NAME) {
+    ctx.waitUntil(syncAllDns(env, alive).catch(() => {}));
+  }
+  // 9. Webhook
+  ctx.waitUntil(notify(env, payload).catch(() => {}));
+  return payload;
+}
 
-  const oldIds = (listJson.result || []).map((r) => r.id);
-  const deletes = oldIds.map((id) => ({ id }));
-  const posts = ips.map((it) => ({
-    type: "A",
-    name: env.CF_RECORD_NAME,
-    content: it.ip,
-    ttl: 60,
-    proxied: false,
-    comment: `cf-best-ip ${it.colo || ""} ${it.delay}ms`.trim(),
-  }));
-
-  // 原子批量
-  const batchRes = await fetch(`${api}/zones/${env.CF_ZONE_ID}/dns_records/batch`, {
+// ============================================================
+// 7. Cloudflare DNS 同步
+// ============================================================
+async function cfApi(env, path, init = {}) {
+  return fetch(`https://api.cloudflare.com/client/v4${path}`, {
+    ...init,
+    headers: { "authorization": `Bearer ${env.CF_API_TOKEN}`, "content-type": "application/json", ...(init.headers || {}) },
+  });
+}
+async function listRecords(env, name) {
+  const r = await cfApi(env, `/zones/${env.CF_ZONE_ID}/dns_records?type=A&name=${encodeURIComponent(name)}&per_page=100`);
+  const j = await r.json();
+  return j.result || [];
+}
+async function deleteRecord(env, id) {
+  await cfApi(env, `/zones/${env.CF_ZONE_ID}/dns_records/${id}`, { method: "DELETE" });
+}
+async function createRecord(env, name, ip) {
+  await cfApi(env, `/zones/${env.CF_ZONE_ID}/dns_records`, {
     method: "POST",
-    headers,
-    body: JSON.stringify({ deletes, posts }),
+    body: JSON.stringify({ type: "A", name, content: ip, ttl: 60, proxied: false }),
   });
-  const batchJson = await batchRes.json();
-  return { ok: !!batchJson.success, detail: batchJson };
+}
+async function syncRecord(env, name, ips, topN) {
+  if (!ips.length) return { skipped: true, name };
+  const wanted = ips.slice(0, topN).map(x => x.ip);
+  const existing = await listRecords(env, name);
+  for (const r of existing) await deleteRecord(env, r.id);
+  for (const ip of wanted) await createRecord(env, name, ip);
+  return { name, ips: wanted };
+}
+async function syncAllDns(env, alive) {
+  const topN = Number(env.DNS_TOP_N || 10);
+  const results = [];
+  results.push(await syncRecord(env, env.CF_RECORD_NAME, alive, topN));
+  if (env.CF_DNS_BY_CARRIER === "1") {
+    const root = env.CF_RECORD_NAME.split(".").slice(1).join(".");
+    const groups = { CT: "ct", CU: "cu", CM: "cm" };
+    for (const [carrier, prefix] of Object.entries(groups)) {
+      const subset = alive.filter(x => x.carrier === carrier);
+      if (subset.length) results.push(await syncRecord(env, `${prefix}.${root}`, subset, topN));
+    }
+  }
+  return results;
 }
 
 // ============================================================
-// 7. 路由处理
+// 8. Webhook 通知
 // ============================================================
-function json(obj, status = 200) {
-  return new Response(JSON.stringify(obj, null, 2), {
-    status,
-    headers: { "content-type": "application/json; charset=utf-8", "access-control-allow-origin": "*" },
-  });
-}
-
-function text(body, status = 200) {
-  return new Response(body, {
-    status,
-    headers: { "content-type": "text/plain; charset=utf-8", "access-control-allow-origin": "*" },
-  });
-}
-
-function checkSubToken(request, env) {
-  if (!env.SUB_TOKEN) return true;
-  const url = new URL(request.url);
-  return url.searchParams.get("token") === env.SUB_TOKEN
-      || request.headers.get("authorization") === `Bearer ${env.SUB_TOKEN}`;
-}
-
-async function subEndpoint(request, env) {
-  if (!checkSubToken(request, env)) return text("Forbidden", 403);
-  const url = new URL(request.url);
-  const port = url.searchParams.get("port"); // 强制端口
-  const limit = Number(url.searchParams.get("limit") || 0);
-  let ips = await loadIps(env);
-  if (limit > 0) ips = ips.slice(0, limit);
-  const lines = ips.map((it) => {
-    const p = port ? Number(port) : (it.port || 443);
-    const tag = it.colo ? `#${it.colo}-${it.delay}ms` : `#${it.delay}ms`;
-    return `${it.ip}:${p}${tag}`;
-  });
-  return text(lines.join("\n") + "\n");
-}
-
-async function jsonIps(env, searchParams) {
-  const ips = await loadIps(env);
-  const updatedAt = Number(await env.KV.get(KV_KEYS.updatedAt) || 0);
-  return json({ ok: true, updatedAt, count: ips.length, ips });
-}
-
-async function edtCompatibleIps(env, searchParams) {
-  // 兼容 EdgeTunnel / CFnew 的 /api/preferred-ips 格式
-  const ips = await loadIps(env);
-  return json(ips.map((it) => ({
-    ip: it.ip,
-    port: it.port || 443,
-    country: (it.colo || "").slice(0, 2),
-    colo: it.colo || null,
-    delay: it.delay,
-  })));
-}
-
-async function cgiTrace(request) {
-  const cf = request.cf || {};
-  const body = [
-    `colo=${cf.colo || ""}`,
-    `loc=${cf.country || ""}`,
-    `ts=${Date.now()/1000}`,
-  ].join("\n");
-  return text(body);
+async function notify(env, payload) {
+  const top5 = (payload.ips || []).slice(0, 5);
+  const lines = [
+    `🚀 *cf-best-ip 测速完成*`,
+    `更新时间: ${new Date(payload.updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}`,
+    `可用节点: ${payload.ips.length}`,
+    `Top 5:`,
+    ...top5.map((x, i) => `${i + 1}. \`${x.ip}\` ${flag(x.country)} ${x.colo || ""} ${x.delay}ms${x.mbps ? ` ${x.mbps}Mbps` : ""}`),
+  ];
+  const md = lines.join("\n");
+  if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID) {
+    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text: md, parse_mode: "Markdown", disable_web_page_preview: true }),
+    });
+  }
+  if (env.DISCORD_WEBHOOK) {
+    await fetch(env.DISCORD_WEBHOOK, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content: md }),
+    });
+  }
 }
 
 // ============================================================
-// 8. 管理面板（密码保护）
+// 9. 筛选 / 输出格式
 // ============================================================
+function applyFilter(ips, params, requesterColo) {
+  const country = (params.get("country") || "").toUpperCase();
+  const colo = (params.get("colo") || "").toUpperCase();
+  const carrier = (params.get("carrier") || "").toUpperCase();
+  const port = params.get("port");
+  const maxDelay = params.get("maxDelay") ? Number(params.get("maxDelay")) : null;
+  const minMbps = params.get("minMbps") ? Number(params.get("minMbps")) : null;
+  const exclude = (params.get("exclude") || "").toUpperCase().split(",").filter(Boolean);
+  let top = Number(params.get("top") || params.get("limit") || 20);
+  if (!Number.isFinite(top) || top < 1) top = 20;
+  if (top > 200) top = 200;
+
+  let out = ips.slice();
+  if (country) {
+    const set = new Set(country.split(",").filter(Boolean));
+    out = out.filter(x => x.country && set.has(x.country));
+  }
+  if (colo) {
+    const set = new Set(colo.split(",").filter(Boolean));
+    out = out.filter(x => x.colo && set.has(x.colo));
+  }
+  if (carrier) {
+    const set = new Set(carrier.split(",").filter(Boolean).map(c => c === "CMCC" ? "CM" : c));
+    out = out.filter(x => x.carrier && set.has(x.carrier));
+  }
+  if (port) {
+    const set = new Set(port.split(",").filter(Boolean).map(Number));
+    out = out.filter(x => set.has(x.port));
+  }
+  if (maxDelay) out = out.filter(x => x.delay != null && x.delay <= maxDelay);
+  if (minMbps) out = out.filter(x => x.mbps != null && x.mbps >= minMbps);
+  if (exclude.length) out = out.filter(x => !x.country || !exclude.includes(x.country));
+
+  // 智能就近：按访问者 colo 推断的国家做优先级
+  if (params.get("smart") === "1" && requesterColo) {
+    const myCountry = COLO_TO_COUNTRY[requesterColo];
+    out.sort((a, b) => {
+      const ai = a.country === myCountry ? 0 : 1;
+      const bi = b.country === myCountry ? 0 : 1;
+      if (ai !== bi) return ai - bi;
+      return (a.delay || 9999) - (b.delay || 9999);
+    });
+  } else {
+    out.sort((a, b) => (a.delay || 9999) - (b.delay || 9999));
+  }
+  return out.slice(0, top);
+}
+
+function fmtSub(ips, withComment) {
+  return ips.map(x => {
+    const tag = [x.country, x.colo, x.carrier && carrierName(x.carrier)].filter(Boolean).join("-");
+    return withComment ? `${x.ip}:${x.port}#${tag || "CF"}` : `${x.ip}:${x.port}`;
+  }).join("\n");
+}
+function fmtEDT(ips) { return ips.map(x => `${x.ip}:${x.port}`).join("\n"); }
+function fmtV2ray(ips) {
+  // 简单 vmess 模板可由订阅器消费；这里仅 base64 编码 sub
+  const txt = fmtSub(ips, true);
+  return btoa(unescape(encodeURIComponent(txt)));
+}
+function fmtClash(ips) {
+  const lines = ["proxies:"];
+  for (const x of ips) {
+    const name = `CF-${x.country || ""}-${x.colo || ""}-${x.ip}`.replace(/--+/g, "-");
+    lines.push(`  - {name: "${name}", server: ${x.ip}, port: ${x.port}, type: trojan, password: REPLACE_ME, sni: REPLACE_ME, skip-cert-verify: false}`);
+  }
+  return lines.join("\n");
+}
+
+// ============================================================
+// 10. 鉴权
+// ============================================================
+function checkAdmin(request, env) {
+  if (!env.ADMIN_PASSWORD) return false;
+  const a = request.headers.get("authorization") || "";
+  if (!a.startsWith("Basic ")) return false;
+  try {
+    const dec = atob(a.slice(6));
+    const i = dec.indexOf(":");
+    const pwd = i >= 0 ? dec.slice(i + 1) : dec;
+    return pwd === env.ADMIN_PASSWORD;
+  } catch { return false; }
+}
 function unauthorized() {
   return new Response("Auth required", {
     status: 401,
     headers: { "www-authenticate": 'Basic realm="cf-best-ip"' },
   });
 }
-
-function checkAdmin(request, env) {
-  if (!env.ADMIN_PASSWORD) return false;
-  const auth = request.headers.get("authorization") || "";
-  if (!auth.startsWith("Basic ")) return false;
-  try {
-    const decoded = atob(auth.slice(6));
-    const [, pwd] = decoded.split(":");
-    return pwd === env.ADMIN_PASSWORD;
-  } catch { return false; }
-}
-
-async function adminPage(request, env) {
-  if (!checkAdmin(request, env)) return unauthorized();
-  const config = await loadConfig(env);
-  const ips = await loadIps(env);
-  const updatedAt = Number(await env.KV.get(KV_KEYS.updatedAt) || 0);
-  const lastError = await env.KV.get(KV_KEYS.lastError);
-
-  const updatedStr = updatedAt ? new Date(updatedAt).toISOString() : "(never)";
-  const dnsReady = !!(env.CF_API_TOKEN && env.CF_ZONE_ID && env.CF_RECORD_NAME);
-
-  const html = `<!doctype html>
-<html lang="zh-CN"><head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>cf-best-ip · 管理面板</title>
-<style>
-  body{font:14px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC",Helvetica,Arial,sans-serif;background:#0b0f14;color:#e6edf3;margin:0;padding:24px;max-width:1100px;margin:auto}
-  h1{font-size:22px;margin:0 0 16px}
-  h2{font-size:16px;margin:24px 0 8px;color:#7ee787}
-  .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:16px}
-  button{background:#238636;color:#fff;border:0;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:14px;margin-right:6px}
-  button.secondary{background:#30363d}
-  button.danger{background:#da3633}
-  input,textarea{background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px 8px;width:100%;box-sizing:border-box;font:13px monospace}
-  table{width:100%;border-collapse:collapse;font:12px monospace}
-  th,td{padding:4px 8px;text-align:left;border-bottom:1px solid #21262d}
-  th{color:#8b949e;font-weight:600}
-  .muted{color:#8b949e}
-  .badge{display:inline-block;padding:2px 6px;border-radius:4px;background:#30363d;font-size:11px;color:#8b949e;margin-left:6px}
-  .err{color:#ff7b72}
-  pre{white-space:pre-wrap;word-break:break-all;background:#0d1117;padding:8px;border-radius:6px}
-</style></head>
-<body>
-<h1>☁️ cf-best-ip <span class="badge">v1.0</span></h1>
-
-<div class="card">
-  <h2 style="margin-top:0">当前状态</h2>
-  <p>共 <b>${ips.length}</b> 个优选 IP，最后更新：<span class="muted">${updatedStr}</span></p>
-  <p>DNS 自动同步：<b>${dnsReady ? "✅ 已配置" : "⚠️ 未配置（缺 CF_API_TOKEN / CF_ZONE_ID / CF_RECORD_NAME）"}</b></p>
-  ${lastError ? `<p class="err">⚠️ ${escapeHtml(lastError)}</p>` : ""}
-  <div>
-    <button onclick="run('/admin/refresh')">🔄 立即刷新</button>
-    ${dnsReady ? `<button class="secondary" onclick="run('/admin/sync-dns')">📡 仅同步 DNS</button>` : ""}
-    <a href="/" target="_blank"><button class="secondary">🏠 首页</button></a>
-    <a href="/sub" target="_blank"><button class="secondary">📋 订阅(txt)</button></a>
-    <a href="/api/ips" target="_blank"><button class="secondary">🔧 API(JSON)</button></a>
-  </div>
-  <pre id="result" class="muted" style="display:none"></pre>
-</div>
-
-<div class="card">
-  <h2 style="margin-top:0">配置</h2>
-  <form onsubmit="event.preventDefault();saveConfig(this)">
-    <p>每次刷新保留前 N 个 IP（topN）<br>
-       <input name="topN" type="number" min="1" max="200" value="${config.topN}"></p>
-    <p>国家黑名单（colo 前缀，逗号分隔；CN 表示中国大陆）<br>
-       <input name="countryBlocklist" value="${config.countryBlocklist.join(',')}"></p>
-    <button>保存配置</button>
-  </form>
-</div>
-
-<div class="card">
-  <h2 style="margin-top:0">当前优选 IP 列表</h2>
-  <table>
-    <thead><tr><th>#</th><th>IP</th><th>端口</th><th>colo</th><th>延迟(ms)</th></tr></thead>
-    <tbody>
-      ${ips.map((it,i) => `<tr>
-        <td>${i+1}</td>
-        <td>${it.ip}</td>
-        <td>${it.port}</td>
-        <td>${it.colo || ""}</td>
-        <td>${it.delay}</td>
-      </tr>`).join("")}
-    </tbody>
-  </table>
-</div>
-
-<script>
-async function run(path){
-  const r = document.getElementById('result');
-  r.style.display='block'; r.textContent='执行中…';
-  const res = await fetch(path,{method:'POST'});
-  r.textContent = await res.text();
-  if (res.ok) setTimeout(()=>location.reload(), 1500);
-}
-async function saveConfig(form){
-  const data = Object.fromEntries(new FormData(form));
-  data.topN = Number(data.topN);
-  data.countryBlocklist = data.countryBlocklist.split(',').map(s=>s.trim()).filter(Boolean);
-  const res = await fetch('/admin/save-config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)});
-  alert(await res.text()); location.reload();
-}
-</script>
-</body></html>`;
-  return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
-}
-
-function escapeHtml(s){return String(s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c])}
-
-async function adminRefresh(request, env, ctx) {
-  if (!checkAdmin(request, env)) return unauthorized();
-  const r = await refreshAll(env, "[manual]");
-  return json(r);
-}
-
-async function adminSaveConfig(request, env) {
-  if (!checkAdmin(request, env)) return unauthorized();
-  const body = await request.json().catch(() => ({}));
-  const cur = await loadConfig(env);
-  const next = { ...cur, ...body };
-  await env.KV.put(KV_KEYS.config, JSON.stringify(next));
-  return text("配置已保存");
-}
-
-async function adminSyncDns(request, env, ctx) {
-  if (!checkAdmin(request, env)) return unauthorized();
-  if (!(env.CF_API_TOKEN && env.CF_ZONE_ID && env.CF_RECORD_NAME)) return text("DNS 同步未配置", 400);
-  const ips = (await loadIps(env)).slice(0, Number(env.DNS_TOP_N || 10));
-  const r = await syncDns(env, ips);
-  return json(r);
+function checkSubToken(request, env) {
+  if (!env.SUB_TOKEN) return true;
+  const url = new URL(request.url);
+  const t = url.searchParams.get("token") || request.headers.get("authorization")?.replace(/^Bearer\s+/, "") || "";
+  return t === env.SUB_TOKEN;
 }
 
 // ============================================================
-// 9. 首页（含浏览器测速）
+// 11. 路由
 // ============================================================
-async function homePage(env) {
-  const ips = await loadIps(env);
-  const updatedAt = Number(await env.KV.get(KV_KEYS.updatedAt) || 0);
-  const updatedStr = updatedAt ? new Date(updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "(尚未刷新)";
+async function handle(request, env, ctx) {
+  const url = new URL(request.url);
+  const path = url.pathname;
+  const params = url.searchParams;
+  const data = await getLatest(env);
+  const ips = data.ips || [];
+  const requesterColo = request.cf?.colo;
 
-  const html = `<!doctype html>
-<html lang="zh-CN"><head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>☁️ Cloudflare 优选 IP</title>
-<style>
-  :root{color-scheme:dark}
-  *{box-sizing:border-box}
-  body{margin:0;font:15px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC",Helvetica,Arial,sans-serif;background:#0b0f14;color:#e6edf3;min-height:100vh}
-  .wrap{max-width:980px;margin:0 auto;padding:24px}
-  h1{font-size:28px;margin:0 0 4px;background:linear-gradient(90deg,#f9826c,#7ee787);-webkit-background-clip:text;background-clip:text;color:transparent;font-weight:700}
-  .subtitle{color:#8b949e;margin-bottom:20px}
-  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:16px}
-  button{background:#238636;color:#fff;border:0;padding:9px 16px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:600}
-  button:disabled{opacity:.6;cursor:wait}
-  button.ghost{background:#21262d;color:#e6edf3}
-  table{width:100%;border-collapse:collapse;font:13px monospace;background:#161b22;border-radius:8px;overflow:hidden}
-  th,td{padding:8px 12px;border-bottom:1px solid #21262d;text-align:left}
-  th{background:#0d1117;color:#8b949e;font-weight:600}
-  tr.testing td{opacity:.5}
-  tr.fast td:nth-child(5){color:#7ee787}
-  tr.mid td:nth-child(5){color:#d8af3c}
-  tr.slow td:nth-child(5){color:#ff7b72}
-  .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;background:#30363d;color:#8b949e;margin-left:6px}
-  .links{font-size:13px;color:#8b949e;margin-top:24px;border-top:1px solid #21262d;padding-top:16px}
-  .links a{color:#58a6ff;margin-right:14px;text-decoration:none}
-  .links a:hover{text-decoration:underline}
-  .empty{padding:40px;text-align:center;color:#8b949e}
-  code{background:#21262d;padding:2px 6px;border-radius:4px;font-size:12px}
-</style></head>
-<body>
-<div class="wrap">
-  <h1>☁️ Cloudflare 优选 IP</h1>
-  <div class="subtitle">最后更新 <code>${updatedStr}</code>，共 <b>${ips.length}</b> 个候选。点击「在线测速」用你的网络重新排序。</div>
-
-  <div class="row">
-    <button id="btnTest">⚡ 在线测速</button>
-    <button class="ghost" onclick="copyTop(5)">📋 复制前 5</button>
-    <button class="ghost" onclick="copyTop(10)">📋 复制前 10</button>
-    <button class="ghost" onclick="exportTxt()">💾 导出 txt</button>
-    <span id="status" class="pill">就绪</span>
-  </div>
-
-  ${ips.length === 0 ? `<div class="empty">还没有数据。请管理员访问 <code>/admin</code> 点击「立即刷新」。</div>` : `
-  <table id="tb">
-    <thead><tr><th>#</th><th>IP</th><th>端口</th><th>来源 colo</th><th>本机延迟</th></tr></thead>
-    <tbody>
-      ${ips.map((it,i) => `<tr data-ip="${it.ip}" data-port="${it.port}">
-        <td>${i+1}</td>
-        <td>${it.ip}</td>
-        <td>${it.port}</td>
-        <td>${it.colo || "-"}</td>
-        <td>—</td>
-      </tr>`).join("")}
-    </tbody>
-  </table>`}
-
-  <div class="links">
-    📚 接口：
-    <a href="/sub" target="_blank">/sub</a>
-    <a href="/api/ips" target="_blank">/api/ips</a>
-    <a href="/api/preferred-ips" target="_blank">/api/preferred-ips</a>
-    <a href="/admin">/admin</a>
-  </div>
-</div>
-
-<script>
-const $ = (s,r=document)=>r.querySelector(s);
-const $$ = (s,r=document)=>Array.from(r.querySelectorAll(s));
-
-// 浏览器测速：对每个 IP 用 https://[ip]/cdn-cgi/trace 测量 fetch 耗时
-async function probe(ip, port){
-  const url = 'https://' + ip + '/cdn-cgi/trace';
-  const ctrl = new AbortController();
-  const timer = setTimeout(()=>ctrl.abort(), 5000);
-  const t0 = performance.now();
-  try{
-    const res = await fetch(url, { signal: ctrl.signal, cache: 'no-store', mode: 'no-cors' });
-    return Math.round(performance.now() - t0);
-  }catch(e){ return null; }
-  finally{ clearTimeout(timer); }
-}
-
-async function test(){
-  const btn = $('#btnTest'); const status = $('#status');
-  btn.disabled = true; status.textContent = '测试中…';
-  const rows = $$('#tb tbody tr');
-  rows.forEach(r=>r.classList.add('testing'));
-
-  // 并发 6 个
-  const queue = rows.slice();
-  let done = 0;
-  async function worker(){
-    while(queue.length){
-      const row = queue.shift();
-      const ip = row.dataset.ip;
-      const ms = await probe(ip);
-      row.classList.remove('testing');
-      const cell = row.cells[4];
-      if (ms === null){ cell.textContent = '✗'; row.classList.add('slow'); }
-      else {
-        cell.textContent = ms + ' ms';
-        row.classList.add(ms < 200 ? 'fast' : ms < 500 ? 'mid' : 'slow');
-      }
-      row.dataset.delay = ms === null ? 99999 : ms;
-      done++;
-      status.textContent = done + '/' + rows.length;
-    }
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: { "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST,DELETE,OPTIONS", "access-control-allow-headers": "content-type,authorization" } });
   }
-  await Promise.all(Array.from({length:6}, worker));
 
-  // 按本机延迟重新排序
-  const tbody = $('#tb tbody');
-  const sorted = Array.from(tbody.children).sort((a,b)=> Number(a.dataset.delay) - Number(b.dataset.delay));
-  sorted.forEach((r,i)=>{ r.cells[0].textContent = i+1; tbody.appendChild(r); });
+  // ---- 订阅 ----
+  if (path === "/sub" || path === "/sub.txt") {
+    if (!checkSubToken(request, env)) return text("Forbidden", { status: 403 });
+    const filtered = applyFilter(ips, params, requesterColo);
+    return text(fmtSub(filtered, params.get("comment") !== "0"));
+  }
+  if (path === "/api/preferred-ips") {
+    if (!checkSubToken(request, env)) return text("Forbidden", { status: 403 });
+    return text(fmtEDT(applyFilter(ips, params, requesterColo)));
+  }
+  if (path === "/api/v2ray") {
+    if (!checkSubToken(request, env)) return text("Forbidden", { status: 403 });
+    return text(fmtV2ray(applyFilter(ips, params, requesterColo)));
+  }
+  if (path === "/api/clash") {
+    if (!checkSubToken(request, env)) return text("Forbidden", { status: 403 });
+    return new Response(fmtClash(applyFilter(ips, params, requesterColo)), { headers: { "content-type": "text/yaml; charset=utf-8" } });
+  }
 
-  status.textContent = '完成';
-  btn.disabled = false;
+  // ---- JSON 列表 ----
+  if (path === "/api/ips") {
+    const filtered = applyFilter(ips, params, requesterColo);
+    return json({ ok: true, total: ips.length, returned: filtered.length, updatedAt: data.updatedAt, ips: filtered });
+  }
+
+  // ---- 维度统计 ----
+  if (path === "/api/stats") {
+    const by = (key) => {
+      const m = {};
+      for (const x of ips) { const k = x[key] || "?"; m[k] = (m[k] || 0) + 1; }
+      return Object.entries(m).map(([k, v]) => ({ key: k, count: v })).sort((a, b) => b.count - a.count);
+    };
+    return json({
+      total: ips.length,
+      updatedAt: data.updatedAt,
+      sourceStats: data.sourceStats,
+      byCountry: by("country"),
+      byColo: by("colo"),
+      byCarrier: by("carrier"),
+      yourColo: requesterColo,
+    });
+  }
+
+  // ---- 单 IP 测速 ----
+  if (path === "/api/probe") {
+    const ip = params.get("ip");
+    const port = Number(params.get("port") || 443);
+    const times = Math.min(Number(params.get("times") || 3), 5);
+    if (!ip || !/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return json({ ok: false, error: "bad ip" }, { status: 400 });
+    const r = await tcpPingN(ip, port, times, 3000);
+    const info = r.avg != null ? await detectColo(ip, port, 4000) : {};
+    return json({ ok: r.avg != null, ip, port, ...r, ...info });
+  }
+
+  // ---- 历史 ----
+  if (path === "/api/history") {
+    const days = Math.min(Number(params.get("days") || 7), 30);
+    const out = [];
+    for (let i = 0; i < days; i++) {
+      const d = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10);
+      const snap = await kvGet(env, `ips:history:${d}`);
+      if (snap) out.push({ date: d, count: snap.ips.length, top1: snap.ips[0] });
+    }
+    return json({ days, history: out });
+  }
+
+  // ---- 管理：手动刷新 ----
+  if (path === "/api/refresh") {
+    if (!checkAdmin(request, env)) return unauthorized();
+    const result = await runFullTest(env, ctx);
+    return json({ ok: true, count: result.ips.length, elapsedMs: result.elapsedMs });
+  }
+
+  // ---- 管理：DNS 手动同步 ----
+  if (path === "/api/dns/sync") {
+    if (!checkAdmin(request, env)) return unauthorized();
+    if (!env.CF_API_TOKEN || !env.CF_ZONE_ID || !env.CF_RECORD_NAME) {
+      return json({ ok: false, error: "CF_API_TOKEN/CF_ZONE_ID/CF_RECORD_NAME 未配置" }, { status: 400 });
+    }
+    const result = await syncAllDns(env, ips);
+    return json({ ok: true, result });
+  }
+
+  // ---- 管理：配置读写 ----
+  if (path === "/api/config" && request.method === "GET") {
+    if (!checkAdmin(request, env)) return unauthorized();
+    return json(await getConfig(env));
+  }
+  if (path === "/api/config" && request.method === "POST") {
+    if (!checkAdmin(request, env)) return unauthorized();
+    const body = await request.json().catch(() => ({}));
+    const cfg = await setConfig(env, body);
+    return json({ ok: true, config: cfg });
+  }
+
+  // ---- 管理：手动 IP 增删 ----
+  if (path === "/api/manual" && request.method === "GET") {
+    if (!checkAdmin(request, env)) return unauthorized();
+    return json(await getManual(env));
+  }
+  if (path === "/api/manual" && request.method === "POST") {
+    if (!checkAdmin(request, env)) return unauthorized();
+    const body = await request.json().catch(() => ({}));
+    const list = (body.lines || "").split(/[\r\n,]+/).map(parseLine).filter(Boolean);
+    const cur = await getManual(env);
+    const merged = uniqBy([...cur, ...list.map(x => ({ ...x, sources: ["manual"], addedAt: Date.now() }))], x => `${x.ip}:${x.port}`);
+    await setManual(env, merged);
+    return json({ ok: true, count: merged.length });
+  }
+  if (path === "/api/manual" && request.method === "DELETE") {
+    if (!checkAdmin(request, env)) return unauthorized();
+    const ip = params.get("ip");
+    const cur = await getManual(env);
+    await setManual(env, cur.filter(x => x.ip !== ip));
+    return json({ ok: true });
+  }
+
+  // ---- 管理：CIDR 扫描 ----
+  if (path === "/api/cidr-scan") {
+    if (!checkAdmin(request, env)) return unauthorized();
+    const body = await request.json().catch(() => ({}));
+    const ips = expandCidr(body.cidr || "", Math.min(body.limit || 64, 64));
+    const port = body.port || 443;
+    const result = await pMap(ips, async (ip) => {
+      const r = await tcpPingN(ip, port, 1, 2500);
+      return { ip, port, delay: r.avg };
+    }, 15);
+    return json({ ok: true, ips: result.filter(x => x.delay != null).sort((a, b) => a.delay - b.delay) });
+  }
+
+  // ---- 页面 ----
+  if (path === "/" || path === "/index.html") return html(renderHome(data, requesterColo));
+  if (path === "/test") return html(renderTest());
+  if (path === "/admin") {
+    if (!checkAdmin(request, env)) return unauthorized();
+    return html(renderAdmin());
+  }
+
+  return new Response("Not Found", { status: 404 });
 }
 
-document.getElementById('btnTest')?.addEventListener('click', test);
+// ============================================================
+// 12. 入口
+// ============================================================
+export default {
+  async fetch(request, env, ctx) {
+    try { return await handle(request, env, ctx); }
+    catch (e) { return json({ ok: false, error: String(e && e.message || e), stack: e?.stack }, { status: 500 }); }
+  },
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runFullTest(env, ctx));
+  },
+};
 
-function topRows(n){
-  const rows = $$('#tb tbody tr').slice(0, n);
-  return rows.map(r=>{
-    const ip = r.dataset.ip, port = r.dataset.port || 443;
-    const d = r.dataset.delay ? (' #' + r.dataset.delay + 'ms') : '';
-    return ip + ':' + port + d;
-  }).join('\\n');
+// ============================================================
+// 13. CIDR 展开
+// ============================================================
+function expandCidr(cidr, limit = 64) {
+  const m = cidr.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)$/);
+  if (!m) return [];
+  const base = ((+m[1]) << 24) | ((+m[2]) << 16) | ((+m[3]) << 8) | (+m[4]);
+  const bits = +m[5];
+  const size = Math.min(2 ** (32 - bits), limit);
+  const out = [];
+  for (let i = 0; i < size; i++) {
+    const n = (base & (0xffffffff << (32 - bits))) + i;
+    out.push([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join("."));
+  }
+  return out;
 }
-async function copyTop(n){
-  try{ await navigator.clipboard.writeText(topRows(n)); $('#status').textContent='已复制前'+n; }
-  catch(e){ alert(topRows(n)); }
-}
-function exportTxt(){
-  const blob = new Blob([topRows(999)], {type:'text/plain'});
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'cf-best-ip.txt'; a.click();
-}
-</script>
-</body></html>`;
 
-  return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+// ============================================================
+// 14. HTML 模板
+// ============================================================
+function layout(title, body, extraHead = "") {
+  return `<!doctype html><html lang="zh-CN"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>${title}</title>
+<style>
+:root{--bg:#0b0f14;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#f9826c;--ok:#7ee787;--warn:#d8af3c;--bad:#ff7b72}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+a{color:#58a6ff;text-decoration:none}a:hover{text-decoration:underline}
+.wrap{max-width:1100px;margin:0 auto;padding:24px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:16px;margin-bottom:16px}
+h1{margin:0 0 4px;font-size:22px}h2{margin:16px 0 8px;font-size:16px;color:var(--mut)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.btn{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:8px 14px;font-weight:600;cursor:pointer;font-size:13px}
+.btn:disabled{opacity:.5;cursor:wait}.btn.ghost{background:transparent;border:1px solid var(--bd);color:var(--fg)}
+input,select,textarea{background:#0d1117;color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:7px 10px;font:13px monospace}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:6px 8px;text-align:left;border-bottom:1px solid var(--bd)}
+th{font-weight:600;color:var(--mut);font-size:11px;text-transform:uppercase}
+.tag{display:inline-block;padding:1px 6px;border-radius:10px;background:#21262d;font-size:11px;color:var(--mut)}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+nav{display:flex;gap:14px;font-size:13px}nav a{color:var(--mut)}nav a.active{color:var(--fg)}
+code{background:#0d1117;padding:1px 5px;border-radius:3px;font-size:12px}
+${extraHead}
+</style></head><body><div class="wrap">
+<header style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px">
+  <div><h1>☁️ cf-best-ip</h1><div class="mut">融合社区方案 · 集大成版 v${VERSION}</div></div>
+  <nav><a href="/">首页</a><a href="/test">在线测速</a><a href="/admin">管理</a><a href="https://github.com/LeilaoMi/cf-best-ip" target="_blank">GitHub</a></nav>
+</header>
+${body}
+<footer class="mut" style="margin-top:24px;font-size:12px;text-align:center">基于 Cloudflare Workers · MIT License · Made with caffeine ☕</footer>
+</div></body></html>`;
+}
+
+function renderHome(data, myColo) {
+  const ips = data.ips || [];
+  const top = ips.slice(0, 15);
+  const updated = data.updatedAt ? new Date(data.updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "（未运行）";
+  const byCountry = {};
+  for (const x of ips) { const k = x.country || "?"; byCountry[k] = (byCountry[k] || 0) + 1; }
+  const ctyTags = Object.entries(byCountry).sort((a, b) => b[1] - a[1]).slice(0, 10)
+    .map(([c, n]) => `<span class="tag">${flag(c)} ${c} ${n}</span>`).join(" ");
+  const rows = top.map((x, i) => `<tr>
+    <td>${i + 1}</td>
+    <td><code>${x.ip}</code></td><td>${x.port}</td>
+    <td>${flag(x.country)} ${x.country || "—"}</td>
+    <td>${x.colo || "—"}</td>
+    <td>${carrierName(x.carrier)}</td>
+    <td class="${x.delay < 50 ? "ok" : x.delay < 200 ? "warn" : "bad"}">${x.delay}ms</td>
+    <td>${x.mbps ? x.mbps + " Mbps" : "—"}</td>
+  </tr>`).join("");
+  return layout("cf-best-ip · Cloudflare 优选 IP", `
+<div class="card">
+  <h2>当前节点状态</h2>
+  <div class="row" style="font-size:13px">
+    <div>📦 可用节点：<b>${ips.length}</b></div>
+    <div>⏰ 最后更新：<b>${updated}</b></div>
+    <div>📍 你在：<b>${myColo || "?"}</b> (${COLO_TO_COUNTRY[myColo] || "?"})</div>
+  </div>
+  <div style="margin-top:10px">${ctyTags}</div>
+</div>
+
+<div class="card">
+  <h2>Top 15 节点</h2>
+  <table><thead><tr><th>#</th><th>IP</th><th>端口</th><th>国家</th><th>Colo</th><th>运营商</th><th>延迟</th><th>带宽</th></tr></thead>
+  <tbody>${rows || `<tr><td colspan="8" class="mut">尚无数据，请进入「管理」点击「立即测速」</td></tr>`}</tbody></table>
+</div>
+
+<div class="card">
+  <h2>订阅接口（支持地区/运营商/端口筛选）</h2>
+  <table><tbody>
+  <tr><td>纯文本订阅</td><td><code>/sub</code> · <code>/sub?country=US,JP&top=20</code></td></tr>
+  <tr><td>JSON</td><td><code>/api/ips?carrier=CT&maxDelay=100</code></td></tr>
+  <tr><td>EdgeTunnel 兼容</td><td><code>/api/preferred-ips?country=HK</code></td></tr>
+  <tr><td>V2Ray (base64)</td><td><code>/api/v2ray</code></td></tr>
+  <tr><td>Clash</td><td><code>/api/clash?colo=HKG,NRT</code></td></tr>
+  <tr><td>智能就近</td><td><code>/sub?smart=1</code> 按你所在 colo 自动优先同区域节点</td></tr>
+  <tr><td>统计</td><td><code>/api/stats</code> · <code>/api/history?days=7</code></td></tr>
+  </tbody></table>
+  <p class="mut" style="margin-top:8px">支持参数：<code>country</code>/<code>colo</code>/<code>carrier</code>(CT/CU/CM)/<code>port</code>/<code>maxDelay</code>/<code>minMbps</code>/<code>top</code>/<code>exclude</code>/<code>smart</code></p>
+</div>`);
+}
+
+function renderTest() {
+  return layout("在线测速 · cf-best-ip", `
+<div class="card">
+  <h2>浏览器在线测速</h2>
+  <p class="mut">边缘节点 → 候选 IP 的真实 TCP 三次握手延迟。点击下方按钮开始测速。</p>
+  <div class="row">
+    <button class="btn" id="btn">▶ 开始测速 Top 30</button>
+    <button class="btn ghost" id="copy">复制 Top 5</button>
+    <span class="mut" id="status">待命</span>
+  </div>
+</div>
+<div class="card">
+  <table><thead><tr><th>#</th><th>IP</th><th>端口</th><th>国家</th><th>Colo</th><th>延迟</th></tr></thead>
+  <tbody id="tb"></tbody></table>
+</div>
+<script>
+const $=s=>document.querySelector(s);const $$=s=>Array.from(document.querySelectorAll(s));
+async function load(){const r=await fetch('/api/ips?top=30');const d=await r.json();return d.ips||[]}
+function row(x,i){return '<tr data-ip="'+x.ip+'" data-port="'+x.port+'"><td>'+(i+1)+'</td><td><code>'+x.ip+'</code></td><td>'+x.port+'</td><td>'+(x.country||'—')+'</td><td>'+(x.colo||'—')+'</td><td class="delay">…</td></tr>'}
+async function probe(ip,port){const r=await fetch('/api/probe?ip='+ip+'&port='+port+'&times=3').then(r=>r.json()).catch(()=>({}));return r.avg}
+async function run(){const btn=$('#btn');btn.disabled=true;$('#status').textContent='测速中…';
+  const ips=await load();$('#tb').innerHTML=ips.map(row).join('');
+  const rows=$$('#tb tr');let i=0,done=0;async function w(){while(i<rows.length){const r=rows[i++];const d=await probe(r.dataset.ip,r.dataset.port);const td=r.querySelector('.delay');if(d==null){td.textContent='失败';td.className='delay bad';r.dataset.delay=99999}else{td.textContent=d+'ms';td.className='delay '+(d<50?'ok':d<200?'warn':'bad');r.dataset.delay=d}done++;$('#status').textContent='进度 '+done+'/'+rows.length}}
+  await Promise.all([w(),w(),w(),w(),w()]);
+  const tb=$('#tb tbody')||$('#tb');const sorted=Array.from(tb.children).sort((a,b)=>+a.dataset.delay-+b.dataset.delay);sorted.forEach((r,i)=>{r.cells[0].textContent=i+1;tb.appendChild(r)});
+  btn.disabled=false;$('#status').textContent='完成';}
+$('#btn').onclick=run;
+$('#copy').onclick=async()=>{const txt=$$('#tb tr').slice(0,5).map(r=>r.dataset.ip+':'+r.dataset.port).join('\\n');try{await navigator.clipboard.writeText(txt);$('#status').textContent='已复制 5 个'}catch(e){alert(txt)}};
+</script>`);
+}
+
+function renderAdmin() {
+  return layout("管理 · cf-best-ip", `
+<div class="card"><h2>操作</h2>
+  <div class="row">
+    <button class="btn" id="refresh">🔄 立即测速</button>
+    <button class="btn ghost" id="syncdns">📡 同步 DNS</button>
+    <span class="mut" id="msg"></span>
+  </div></div>
+
+<div class="card"><h2>手动添加 IP</h2>
+  <textarea id="manual" rows="4" style="width:100%" placeholder="一行一个，支持 1.2.3.4 / 1.2.3.4:443 / 1.2.3.4:443#CT"></textarea>
+  <div class="row" style="margin-top:8px"><button class="btn" id="add">添加</button><button class="btn ghost" id="loadm">查看已添加</button></div>
+  <pre id="manualList" class="mut" style="font-size:11px;max-height:160px;overflow:auto"></pre></div>
+
+<div class="card"><h2>CIDR 扫描（≤ 64 IP）</h2>
+  <div class="row"><input id="cidr" placeholder="173.245.48.0/26" style="width:240px"/><input id="cport" value="443" style="width:80px"/><button class="btn" id="scan">扫描</button></div>
+  <pre id="scanRes" class="mut" style="font-size:12px;max-height:240px;overflow:auto"></pre></div>
+
+<div class="card"><h2>配置</h2>
+  <div id="cfg" class="mut" style="font-size:12px">加载中…</div>
+  <textarea id="cfgEdit" rows="6" style="width:100%;margin-top:8px"></textarea>
+  <button class="btn" id="saveCfg" style="margin-top:8px">保存配置</button></div>
+
+<script>
+const $=s=>document.querySelector(s);
+function msg(t){$('#msg').textContent=t;setTimeout(()=>$('#msg').textContent='',4000)}
+$('#refresh').onclick=async()=>{$('#refresh').disabled=true;msg('测速中…可能需 30~60 秒');const r=await fetch('/api/refresh').then(r=>r.json());msg('完成：'+r.count+' 节点，耗时 '+r.elapsedMs+'ms');$('#refresh').disabled=false};
+$('#syncdns').onclick=async()=>{const r=await fetch('/api/dns/sync').then(r=>r.json());msg(JSON.stringify(r))};
+$('#add').onclick=async()=>{const r=await fetch('/api/manual',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lines:$('#manual').value})}).then(r=>r.json());msg('已添加，当前 '+r.count);$('#manual').value=''};
+$('#loadm').onclick=async()=>{const r=await fetch('/api/manual').then(r=>r.json());$('#manualList').textContent=JSON.stringify(r,null,2)};
+$('#scan').onclick=async()=>{const r=await fetch('/api/cidr-scan',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({cidr:$('#cidr').value,port:+$('#cport').value})}).then(r=>r.json());$('#scanRes').textContent=JSON.stringify(r.ips,null,2)};
+(async()=>{const c=await fetch('/api/config').then(r=>r.json());$('#cfg').textContent='当前配置：';$('#cfgEdit').value=JSON.stringify(c,null,2)})();
+$('#saveCfg').onclick=async()=>{const body=JSON.parse($('#cfgEdit').value);const r=await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());msg('已保存')};
+</script>`);
 }
