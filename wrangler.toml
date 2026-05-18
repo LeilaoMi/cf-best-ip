@@ -1,0 +1,23 @@
+name = "cf-best-ip"
+main = "src/worker.js"
+compatibility_date = "2024-12-01"
+
+# KV 命名空间：需要先在 Cloudflare 后台创建一个 KV，把 id 填进来
+# 命令行：  npx wrangler kv namespace create KV
+# 然后把返回的 id 粘到这里
+[[kv_namespaces]]
+binding = "KV"
+id = "REPLACE_WITH_YOUR_KV_ID"
+
+# 定时任务：每 6 小时刷新一次
+[triggers]
+crons = ["0 */6 * * *"]
+
+# 环境变量（敏感字段建议用 `wrangler secret put`，不要写明文）
+#   wrangler secret put ADMIN_PASSWORD
+#   wrangler secret put SUB_TOKEN
+#   wrangler secret put CF_API_TOKEN
+[vars]
+CF_ZONE_ID    = ""   # 你域名的 Zone ID（在 CF 域名概览右栏复制）
+CF_RECORD_NAME = ""  # 例如 cf.example.com
+DNS_TOP_N     = "10"
