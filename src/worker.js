@@ -84,6 +84,29 @@ const COUNTRY_FLAGS = {
 
 const CARRIER_LABEL = { CT: "电信", CU: "联通", CM: "移动", CMCC: "移动", CF: "通用", DEF: "通用" };
 
+// 中国大陆三大运营商 ASN（用于按访问者 IP 猜运营商）
+const CN_ASN_TO_CARRIER = {
+  4134: "CT", 4812: "CT", 4847: "CT", 17621: "CT", 17623: "CT",
+  23724: "CT", 24134: "CT", 24138: "CT", 58453: "CT", 134543: "CT", 137692: "CT",
+  4837: "CU", 9929: "CU", 10099: "CU", 17816: "CU",
+  9808: "CM", 24400: "CM", 24445: "CM", 56040: "CM", 56041: "CM", 56042: "CM", 9394: "CM", 56046: "CM",
+};
+
+/** 从 request.cf 抽访问者信息 + 猜运营商 */
+function getVisitor(request) {
+  const cf = request.cf || {};
+  const asn = Number(cf.asn) || null;
+  return {
+    country: cf.country || null,
+    region: cf.regionCode || cf.region || null,
+    city: cf.city || null,
+    colo: cf.colo || null,
+    asn,
+    asOrg: cf.asOrganization || null,
+    carrier: asn ? (CN_ASN_TO_CARRIER[asn] || null) : null,
+  };
+}
+
 // ============================================================
 // 2. 工具函数
 // ============================================================
@@ -332,26 +355,23 @@ async function runFullTest(env, ctx, opts = {}) {
     return (b.sources?.length || 0) - (a.sources?.length || 0);
   });
 
-  // 4. 给前若干个尝试探 colo / country（best-effort，资源不够就跳过）
-  const topForColo = alive.slice(0, Math.min(20, alive.length));
-  await pMap(topForColo, async (item) => {
-    try {
-      const info = await detectColo(item.ip, item.port, 2500);
-      if (info && info.colo) Object.assign(item, info);
-    } catch {}
-  }, 8);
+  // 4. colo/国家探测：CF Workers 非企业版下 resolveOverride 不生效，
+  //    会把所有目标 IP 都标成 Worker 自己的 colo（如 FRA/DE），属于假数据 —— 已禁用。
+  //    如果你有企业版账户，可手动恢复以下代码块：
+  //    await pMap(alive.slice(0, 20), async item => {
+  //      const info = await detectColo(item.ip, item.port, 2500);
+  //      if (info?.colo) Object.assign(item, info);
+  //    }, 8);
 
   // 5. 应用国家黑名单（只对已知 country 的过滤）
   if (cfg.countryBlocklist && cfg.countryBlocklist.length) {
     alive = alive.filter(x => !x.country || !cfg.countryBlocklist.includes(x.country));
   }
 
-  // 6. 抽样带宽测速（best-effort，失败也不影响主流程）
-  const bwTargets = alive.slice(0, cfg.bandwidthSampleSize);
-  await pMap(bwTargets, async (item) => {
-    const mbps = await probeBandwidth(item.ip, cfg.bandwidthBytes, 6000);
-    item.mbps = mbps;
-  }, 5);
+  // 6. 带宽测试同样依赖 resolveOverride，非企业版下无效，已禁用
+  //    await pMap(alive.slice(0, cfg.bandwidthSampleSize), async item => {
+  //      item.mbps = await probeBandwidth(item.ip, cfg.bandwidthBytes, 6000);
+  //    }, 5);
 
   // 7. 持久化
   const payload = {
@@ -556,6 +576,7 @@ async function handle(request, env, ctx) {
   const data = await getLatest(env);
   const ips = data.ips || [];
   const requesterColo = request.cf?.colo;
+  const visitor = getVisitor(request);
 
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: { "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST,DELETE,OPTIONS", "access-control-allow-headers": "content-type,authorization" } });
@@ -611,8 +632,8 @@ async function handle(request, env, ctx) {
     const times = Math.min(Number(params.get("times") || 3), 5);
     if (!ip || !/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return json({ ok: false, error: "bad ip" }, { status: 400 });
     const r = await tcpPingN(ip, port, times, 3000);
-    const info = r.avg != null ? await detectColo(ip, port, 4000) : {};
-    return json({ ok: r.avg != null, ip, port, ...r, ...info });
+    // 注意：Workers 平台禁止从 Worker 连 CF 自家 IP，对 CF IP 返回的 loss 始终为 1
+    return json({ ok: r.avg != null, ip, port, ...r, hint: r.avg == null ? "Workers cannot connect to Cloudflare-owned IPs; this is a platform limitation, not your IP being down." : undefined });
   }
 
   // ---- 历史 ----
@@ -692,8 +713,8 @@ async function handle(request, env, ctx) {
   }
 
   // ---- 页面 ----
-  if (path === "/" || path === "/index.html") return html(renderHome(data, requesterColo));
-  if (path === "/test") return html(renderTest());
+  if (path === "/" || path === "/index.html") return html(renderHome(data, visitor));
+  if (path === "/test") return html(renderTest(visitor));
   if (path === "/admin") {
     if (!checkAdmin(request, env)) return unauthorized();
     return html(renderAdmin());
@@ -737,113 +758,298 @@ function expandCidr(cidr, limit = 64) {
 // ============================================================
 function layout(title, body, extraHead = "") {
   return `<!doctype html><html lang="zh-CN"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="theme-color" content="#0b0f14"/>
 <title>${title}</title>
 <style>
 :root{--bg:#0b0f14;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#f9826c;--ok:#7ee787;--warn:#d8af3c;--bad:#ff7b72}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding-bottom:env(safe-area-inset-bottom)}
 a{color:#58a6ff;text-decoration:none}a:hover{text-decoration:underline}
-.wrap{max-width:1100px;margin:0 auto;padding:24px}
-.card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:16px;margin-bottom:16px}
-h1{margin:0 0 4px;font-size:22px}h2{margin:16px 0 8px;font-size:16px;color:var(--mut)}
+.wrap{max-width:1000px;margin:0 auto;padding:14px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px;margin-bottom:12px}
+h1{margin:0;font-size:20px;line-height:1.2}
+h2{margin:0 0 10px;font-size:14px;color:var(--mut);font-weight:600;letter-spacing:.04em;text-transform:uppercase}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.btn{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:8px 14px;font-weight:600;cursor:pointer;font-size:13px}
-.btn:disabled{opacity:.5;cursor:wait}.btn.ghost{background:transparent;border:1px solid var(--bd);color:var(--fg)}
-input,select,textarea{background:#0d1117;color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:7px 10px;font:13px monospace}
-table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:6px 8px;text-align:left;border-bottom:1px solid var(--bd)}
-th{font-weight:600;color:var(--mut);font-size:11px;text-transform:uppercase}
-.tag{display:inline-block;padding:1px 6px;border-radius:10px;background:#21262d;font-size:11px;color:var(--mut)}
+.btn{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:10px 14px;font-weight:600;cursor:pointer;font-size:13px;min-height:40px;touch-action:manipulation}
+.btn:active{transform:translateY(1px)}.btn:disabled{opacity:.5;cursor:wait}
+.btn.ghost{background:transparent;border:1px solid var(--bd);color:var(--fg)}
+.btn.sm{padding:6px 10px;min-height:32px;font-size:12px}
+input,select,textarea{background:#0d1117;color:var(--fg);border:1px solid var(--bd);border-radius:8px;padding:9px 12px;font:13px/1.4 -apple-system,sans-serif;min-height:40px;-webkit-appearance:none;appearance:none}
+select{background-image:linear-gradient(45deg,transparent 50%,var(--mut) 50%),linear-gradient(135deg,var(--mut) 50%,transparent 50%);background-position:calc(100% - 14px) 50%,calc(100% - 9px) 50%;background-size:5px 5px;background-repeat:no-repeat;padding-right:32px}
+input:focus,select:focus,textarea:focus{outline:0;border-color:var(--acc)}
+.tag{display:inline-flex;align-items:center;padding:2px 8px;border-radius:12px;background:#21262d;font-size:11px;color:var(--mut);gap:3px;white-space:nowrap}
+.tag.ct{background:rgba(126,231,135,.12);color:var(--ok)}
+.tag.cu{background:rgba(216,175,60,.12);color:var(--warn)}
+.tag.cm{background:rgba(88,166,255,.12);color:#58a6ff}
+.tag.cf{background:rgba(249,130,108,.12);color:var(--acc)}
 .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.mut{color:var(--mut)}
-nav{display:flex;gap:14px;font-size:13px}nav a{color:var(--mut)}nav a.active{color:var(--fg)}
-code{background:#0d1117;padding:1px 5px;border-radius:3px;font-size:12px}
+nav{display:flex;gap:10px;font-size:13px;flex-wrap:wrap}nav a{color:var(--mut);padding:4px 0}
+code{background:#0d1117;padding:2px 6px;border-radius:4px;font-size:12px;font-family:ui-monospace,Menlo,monospace;word-break:break-all}
+
+/* 访问者信息 banner */
+.visitor{background:linear-gradient(135deg,rgba(249,130,108,.08),rgba(88,166,255,.08));border:1px solid var(--bd);border-radius:10px;padding:12px 14px;margin-bottom:12px;display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;font-size:13px}
+.visitor b{color:var(--acc)}
+.visitor .pill{padding:3px 10px;border-radius:14px;background:rgba(249,130,108,.12);color:var(--acc);font-weight:600;font-size:12px}
+
+/* 节点卡片列表 */
+.nodes{display:grid;gap:8px;grid-template-columns:1fr}
+.node{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;padding:12px;background:#0d1117;border:1px solid var(--bd);border-radius:8px;align-items:center}
+.node-no{font-size:11px;color:var(--mut);grid-row:span 2;align-self:start;padding-top:2px;min-width:22px}
+.node-ip{font-family:ui-monospace,Menlo,monospace;font-size:14px;font-weight:600;letter-spacing:-.01em;word-break:break-all}
+.node-meta{font-size:11px;color:var(--mut);display:flex;flex-wrap:wrap;gap:6px 10px;grid-column:2/3}
+.node-act{display:flex;gap:6px;align-self:start}
+.copybtn{background:#21262d;border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:6px 10px;font-size:11px;cursor:pointer;min-height:30px}
+.copybtn:active{background:#30363d}
+
+/* sticky filter bar */
+.filterbar{position:sticky;top:0;z-index:10;background:var(--bg);padding:10px 0 12px;margin:-2px 0 12px;border-bottom:1px solid var(--bd)}
+.filterbar .row{gap:6px}
+.filterbar select,.filterbar input{min-height:36px;padding:6px 10px;font-size:12px}
+.filterbar .lbl{font-size:11px;color:var(--mut);margin-right:2px}
+
+/* 桌面端 */
+@media (min-width:720px){
+  .wrap{padding:24px}
+  .card{padding:18px;margin-bottom:16px}
+  h1{font-size:24px}
+  .nodes{grid-template-columns:1fr 1fr}
+  nav{gap:16px;font-size:14px}
+}
+@media (min-width:980px){
+  .nodes{grid-template-columns:1fr 1fr 1fr}
+}
+
+/* 表格（仅桌面端展示） */
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--bd)}
+th{font-weight:600;color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+
 ${extraHead}
 </style></head><body><div class="wrap">
-<header style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px">
-  <div><h1>☁️ cf-best-ip</h1><div class="mut">融合社区方案 · 集大成版 v${VERSION}</div></div>
-  <nav><a href="/">首页</a><a href="/test">在线测速</a><a href="/admin">管理</a><a href="https://github.com/LeilaoMi/cf-best-ip" target="_blank">GitHub</a></nav>
+<header style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;gap:12px;flex-wrap:wrap">
+  <div><h1>☁️ cf-best-ip</h1><div class="mut" style="font-size:11px;margin-top:2px">融合社区方案 · 集大成版 v${VERSION}</div></div>
+  <nav><a href="/">首页</a><a href="/test">节点浏览</a><a href="/admin">管理</a><a href="https://github.com/LeilaoMi/cf-best-ip" target="_blank" rel="noreferrer">GitHub</a></nav>
 </header>
 ${body}
-<footer class="mut" style="margin-top:24px;font-size:12px;text-align:center">基于 Cloudflare Workers · MIT License · Made with caffeine ☕</footer>
+<footer class="mut" style="margin-top:20px;font-size:11px;text-align:center;padding:14px 0">基于 Cloudflare Workers · MIT License · ☕</footer>
 </div></body></html>`;
 }
 
-function renderHome(data, myColo) {
-  const ips = data.ips || [];
-  const top = ips.slice(0, 15);
-  const updated = data.updatedAt ? new Date(data.updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "（未运行）";
-  const byCountry = {};
-  for (const x of ips) { const k = x.country || "?"; byCountry[k] = (byCountry[k] || 0) + 1; }
-  const ctyTags = Object.entries(byCountry).sort((a, b) => b[1] - a[1]).slice(0, 10)
-    .map(([c, n]) => `<span class="tag">${flag(c)} ${c} ${n}</span>`).join(" ");
-  const rows = top.map((x, i) => `<tr>
-    <td>${i + 1}</td>
-    <td><code>${x.ip}</code></td><td>${x.port}</td>
-    <td>${flag(x.country)} ${x.country || "—"}</td>
-    <td>${x.colo || "—"}</td>
-    <td>${carrierName(x.carrier)}</td>
-    <td class="${x.delay < 50 ? "ok" : x.delay < 200 ? "warn" : "bad"}">${x.delay}ms</td>
-    <td>${x.mbps ? x.mbps + " Mbps" : "—"}</td>
-  </tr>`).join("");
-  return layout("cf-best-ip · Cloudflare 优选 IP", `
-<div class="card">
-  <h2>当前节点状态</h2>
-  <div class="row" style="font-size:13px">
-    <div>📦 可用节点：<b>${ips.length}</b></div>
-    <div>⏰ 最后更新：<b>${updated}</b></div>
-    <div>📍 你在：<b>${myColo || "?"}</b> (${COLO_TO_COUNTRY[myColo] || "?"})</div>
-  </div>
-  <div style="margin-top:10px">${ctyTags}</div>
-</div>
-
-<div class="card">
-  <h2>Top 15 节点</h2>
-  <table><thead><tr><th>#</th><th>IP</th><th>端口</th><th>国家</th><th>Colo</th><th>运营商</th><th>延迟</th><th>带宽</th></tr></thead>
-  <tbody>${rows || `<tr><td colspan="8" class="mut">尚无数据，请进入「管理」点击「立即测速」</td></tr>`}</tbody></table>
-</div>
-
-<div class="card">
-  <h2>订阅接口（支持地区/运营商/端口筛选）</h2>
-  <table><tbody>
-  <tr><td>纯文本订阅</td><td><code>/sub</code> · <code>/sub?country=US,JP&top=20</code></td></tr>
-  <tr><td>JSON</td><td><code>/api/ips?carrier=CT&maxDelay=100</code></td></tr>
-  <tr><td>EdgeTunnel 兼容</td><td><code>/api/preferred-ips?country=HK</code></td></tr>
-  <tr><td>V2Ray (base64)</td><td><code>/api/v2ray</code></td></tr>
-  <tr><td>Clash</td><td><code>/api/clash?colo=HKG,NRT</code></td></tr>
-  <tr><td>智能就近</td><td><code>/sub?smart=1</code> 按你所在 colo 自动优先同区域节点</td></tr>
-  <tr><td>统计</td><td><code>/api/stats</code> · <code>/api/history?days=7</code></td></tr>
-  </tbody></table>
-  <p class="mut" style="margin-top:8px">支持参数：<code>country</code>/<code>colo</code>/<code>carrier</code>(CT/CU/CM)/<code>port</code>/<code>maxDelay</code>/<code>minMbps</code>/<code>top</code>/<code>exclude</code>/<code>smart</code></p>
-</div>`);
+function renderVisitorBanner(v) {
+  const flagStr = flag(v.country);
+  const region = [v.country, v.region, v.city].filter(Boolean).join(" · ") || "未知";
+  const carrierTag = v.carrier
+    ? `<span class="pill">建议优选: ${carrierName(v.carrier)}</span>`
+    : (v.country === "CN"
+        ? `<span class="pill mut" style="background:#21262d;color:var(--mut)">未识别运营商，建议通用</span>`
+        : `<span class="pill" style="background:rgba(126,231,135,.12);color:var(--ok)">海外用户，建议通用</span>`);
+  const asInfo = v.asOrg ? `<span class="mut">${v.asOrg}${v.asn ? " · AS" + v.asn : ""}</span>` : "";
+  return `<div class="visitor">
+    <span style="font-size:18px">${flagStr}</span>
+    <span>你来自 <b>${region}</b></span>
+    ${asInfo}
+    ${carrierTag}
+  </div>`;
 }
 
-function renderTest() {
-  return layout("在线测速 · cf-best-ip", `
+function renderHome(data, visitor) {
+  const ips = data.ips || [];
+  const updated = data.updatedAt ? new Date(data.updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "（未运行）";
+  const total = ips.length;
+  const byCarrier = ips.reduce((m, x) => { const c = x.carrier || "CF"; m[c] = (m[c] || 0) + 1; return m; }, {});
+  const carriersHtml = ["CT", "CU", "CM", "CF"].map(c => {
+    const n = byCarrier[c] || 0;
+    const recommend = visitor.carrier === c;
+    return `<a class="tag ${c.toLowerCase()}" href="/test?carrier=${c}" style="font-size:13px;padding:6px 12px${recommend ? ";box-shadow:0 0 0 2px var(--acc)" : ""}">${carrierName(c)} <b style="margin-left:4px">${n}</b></a>`;
+  }).join(" ");
+
+  // 推荐订阅链接：基于访问者
+  const subBase = "/sub";
+  const subPaths = visitor.carrier
+    ? [{ name: `${carrierName(visitor.carrier)}优选`, path: `${subBase}?carrier=${visitor.carrier}&top=10` }]
+    : [];
+  subPaths.push(
+    { name: "智能就近", path: `${subBase}?smart=1&top=10` },
+    { name: "全部 Top 20", path: `${subBase}?top=20` },
+    { name: "海外低延迟", path: `${subBase}?country=HK,JP,SG,US&top=10` },
+  );
+  const subLinks = subPaths.map(s =>
+    `<div class="node" style="grid-template-columns:1fr auto"><div><div style="font-weight:600">${s.name}</div><div class="mut" style="font-size:11px;margin-top:2px"><code>${s.path}</code></div></div><button class="copybtn" data-copy="${s.path}">复制</button></div>`
+  ).join("");
+
+  return layout("cf-best-ip · 优选 IP 服务", `
+${renderVisitorBanner(visitor)}
+
 <div class="card">
-  <h2>浏览器在线测速</h2>
-  <p class="mut">边缘节点 → 候选 IP 的真实 TCP 三次握手延迟。点击下方按钮开始测速。</p>
+  <h2>节点池状态</h2>
+  <div class="row" style="gap:14px;font-size:13px">
+    <div>📦 总节点 <b style="font-size:18px;color:var(--acc)">${total}</b></div>
+    <div>⏰ 更新于 ${updated}</div>
+  </div>
+  <div style="margin-top:12px;display:flex;gap:6px;flex-wrap:wrap">${carriersHtml}</div>
+</div>
+
+<div class="card">
+  <h2>快捷订阅</h2>
+  <div class="nodes">${subLinks}</div>
+  <p class="mut" style="font-size:11px;margin-top:10px">点"复制"获取相对路径，需自行拼上完整域名。橘色框是基于你当前 IP 推荐的方案。</p>
+</div>
+
+<div class="card">
+  <h2>所有 API 接口</h2>
+  <div style="font-size:12px;line-height:2">
+    <div><code>/sub</code> · <code>/sub?carrier=CT&top=10</code> · <code>/sub?country=HK,JP</code> · <code>/sub?smart=1</code> — 纯文本订阅</div>
+    <div><code>/api/ips</code> — JSON，支持所有筛选参数</div>
+    <div><code>/api/preferred-ips</code> — EdgeTunnel 兼容</div>
+    <div><code>/api/v2ray</code> — V2Ray base64</div>
+    <div><code>/api/clash</code> — Clash YAML</div>
+    <div><code>/api/stats</code> — 分布统计 · <code>/api/history?days=7</code></div>
+  </div>
+  <p class="mut" style="font-size:11px;margin-top:10px">参数：<code>country</code> / <code>colo</code> / <code>carrier</code>(CT/CU/CM) / <code>port</code> / <code>maxDelay</code> / <code>top</code> / <code>exclude</code> / <code>smart=1</code>，可任意组合</p>
+</div>
+
+<script>
+const origin = location.origin;
+document.querySelectorAll('[data-copy]').forEach(b => b.onclick = async () => {
+  const url = origin + b.dataset.copy;
+  try { await navigator.clipboard.writeText(url); const o = b.textContent; b.textContent = '✓ 已复制'; setTimeout(() => b.textContent = o, 1500); }
+  catch (e) { prompt('复制此链接', url); }
+});
+</script>`);
+}
+
+function renderTest(visitor) {
+  const presetCarrier = visitor.carrier || "";
+  const visitorJson = JSON.stringify(visitor);
+  return layout("节点浏览 · cf-best-ip", `
+${renderVisitorBanner(visitor)}
+
+<div class="filterbar">
   <div class="row">
-    <button class="btn" id="btn">▶ 开始测速 Top 30</button>
-    <button class="btn ghost" id="copy">复制 Top 5</button>
-    <span class="mut" id="status">待命</span>
+    <span class="lbl">运营商</span>
+    <select id="fCarrier">
+      <option value="">全部</option>
+      <option value="CT"${presetCarrier === "CT" ? " selected" : ""}>电信 CT</option>
+      <option value="CU"${presetCarrier === "CU" ? " selected" : ""}>联通 CU</option>
+      <option value="CM"${presetCarrier === "CM" ? " selected" : ""}>移动 CM</option>
+      <option value="CF">通用 CF</option>
+    </select>
+    <span class="lbl">国家</span>
+    <select id="fCountry"><option value="">全部</option></select>
+    <span class="lbl">数量</span>
+    <select id="fTop">
+      <option>10</option><option selected>20</option><option>30</option><option>50</option><option>100</option>
+    </select>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <button class="btn sm" id="btnCopy">📋 复制订阅</button>
+    <button class="btn sm ghost" id="btnDownload">⬇ 下载 .txt</button>
+    <button class="btn sm ghost" id="btnRefresh">🔄 刷新</button>
+    <span class="mut" id="status" style="margin-left:auto;font-size:11px"></span>
   </div>
 </div>
+
 <div class="card">
-  <table><thead><tr><th>#</th><th>IP</th><th>端口</th><th>国家</th><th>Colo</th><th>延迟</th></tr></thead>
-  <tbody id="tb"></tbody></table>
+  <h2><span id="hdr">节点列表</span></h2>
+  <div class="nodes" id="list"><div class="mut" style="padding:14px;text-align:center">加载中…</div></div>
 </div>
+
+<div class="card">
+  <h2>测速说明</h2>
+  <p class="mut" style="font-size:12px;line-height:1.7;margin:0">
+    ⚠️ <b>Cloudflare Workers 平台禁止从 Worker 直接连接 Cloudflare 自家 IP</b>，
+    所以在网页上"测速"对 CF IP 永远会失败 — 这是平台限制，不是 bug。<br/>
+    上方节点列表来自 <b>7 个公开数据源</b>，这些源由各位社区维护者从中国大陆三网真实测速得来。
+    要测你本机到这些 IP 的真实延迟，请：<br/>
+    1. 在上方按你的运营商筛选 → 复制订阅<br/>
+    2. 把订阅地址扔给客户端（V2RayN / Clash / NekoBox 等），客户端会做真实测速并自动切到最快的<br/>
+    3. 或下载 <a href="https://github.com/XIU2/CloudflareSpeedTest/releases" target="_blank" rel="noreferrer">CloudflareSpeedTest</a> 命令行版做硬核测速
+  </p>
+</div>
+
 <script>
-const $=s=>document.querySelector(s);const $$=s=>Array.from(document.querySelectorAll(s));
-async function load(){const r=await fetch('/api/ips?top=30');const d=await r.json();return d.ips||[]}
-function row(x,i){return '<tr data-ip="'+x.ip+'" data-port="'+x.port+'"><td>'+(i+1)+'</td><td><code>'+x.ip+'</code></td><td>'+x.port+'</td><td>'+(x.country||'—')+'</td><td>'+(x.colo||'—')+'</td><td class="delay">…</td></tr>'}
-async function probe(ip,port){const r=await fetch('/api/probe?ip='+ip+'&port='+port+'&times=3').then(r=>r.json()).catch(()=>({}));return r.avg}
-async function run(){const btn=$('#btn');btn.disabled=true;$('#status').textContent='测速中…';
-  const ips=await load();$('#tb').innerHTML=ips.map(row).join('');
-  const rows=$$('#tb tr');let i=0,done=0;async function w(){while(i<rows.length){const r=rows[i++];const d=await probe(r.dataset.ip,r.dataset.port);const td=r.querySelector('.delay');if(d==null){td.textContent='失败';td.className='delay bad';r.dataset.delay=99999}else{td.textContent=d+'ms';td.className='delay '+(d<50?'ok':d<200?'warn':'bad');r.dataset.delay=d}done++;$('#status').textContent='进度 '+done+'/'+rows.length}}
-  await Promise.all([w(),w(),w(),w(),w()]);
-  const tb=$('#tb tbody')||$('#tb');const sorted=Array.from(tb.children).sort((a,b)=>+a.dataset.delay-+b.dataset.delay);sorted.forEach((r,i)=>{r.cells[0].textContent=i+1;tb.appendChild(r)});
-  btn.disabled=false;$('#status').textContent='完成';}
-$('#btn').onclick=run;
-$('#copy').onclick=async()=>{const txt=$$('#tb tr').slice(0,5).map(r=>r.dataset.ip+':'+r.dataset.port).join('\\n');try{await navigator.clipboard.writeText(txt);$('#status').textContent='已复制 5 个'}catch(e){alert(txt)}};
+const visitor = ${visitorJson};
+const $ = s => document.querySelector(s);
+const fC = $('#fCarrier'), fCt = $('#fCountry'), fT = $('#fTop');
+let allIps = [];
+
+function carrierTag(c) {
+  const m = {CT:'电信',CU:'联通',CM:'移动',CMCC:'移动',CF:'通用'};
+  const cls = (c || 'cf').toLowerCase();
+  return '<span class="tag '+cls+'">'+(m[c]||'通用')+'</span>';
+}
+function flagEmoji(c){const map={HK:'🇭🇰',JP:'🇯🇵',KR:'🇰🇷',TW:'🇹🇼',SG:'🇸🇬',US:'🇺🇸',CA:'🇨🇦',GB:'🇬🇧',DE:'🇩🇪',FR:'🇫🇷',NL:'🇳🇱',AU:'🇦🇺',RU:'🇷🇺',IN:'🇮🇳',CN:'🇨🇳',TH:'🇹🇭',MY:'🇲🇾'};return map[c]||'🌐';}
+
+function renderList(ips) {
+  if (!ips.length) { $('#list').innerHTML = '<div class="mut" style="padding:14px;text-align:center">没有匹配的节点，调整筛选试试</div>'; $('#hdr').textContent='节点列表 (0)'; return; }
+  $('#hdr').textContent = '节点列表 ('+ips.length+')';
+  $('#list').innerHTML = ips.map((x, i) => {
+    const meta = [
+      x.country ? flagEmoji(x.country)+' '+x.country : null,
+      x.colo,
+      x.sources ? '源 '+x.sources.length : null,
+    ].filter(Boolean).join(' · ');
+    return '<div class="node">' +
+      '<div class="node-no">#'+(i+1)+'</div>' +
+      '<div><div class="node-ip">'+x.ip+'<span class="mut" style="font-weight:400;font-size:12px">:'+x.port+'</span></div>' +
+        '<div class="node-meta">'+carrierTag(x.carrier)+'<span>'+meta+'</span></div>' +
+      '</div>' +
+      '<div class="node-act"><button class="copybtn" data-ip="'+x.ip+':'+x.port+'">复制</button></div>' +
+    '</div>';
+  }).join('');
+  document.querySelectorAll('[data-ip]').forEach(b => b.onclick = async () => {
+    try { await navigator.clipboard.writeText(b.dataset.ip); const o=b.textContent; b.textContent='✓'; setTimeout(()=>b.textContent=o, 1200); }
+    catch (e) { prompt('复制', b.dataset.ip); }
+  });
+}
+
+function buildSubUrl() {
+  const p = new URLSearchParams();
+  if (fC.value) p.set('carrier', fC.value);
+  if (fCt.value) p.set('country', fCt.value);
+  if (fT.value) p.set('top', fT.value);
+  return '/sub' + (p.toString() ? '?' + p.toString() : '');
+}
+
+async function load() {
+  $('#status').textContent = '加载中…';
+  const p = new URLSearchParams();
+  p.set('top', '500');
+  const r = await fetch('/api/ips?' + p.toString()).then(r=>r.json()).catch(()=>({ips:[]}));
+  allIps = r.ips || [];
+  // 填充国家下拉
+  const countries = [...new Set(allIps.map(x => x.country).filter(Boolean))].sort();
+  fCt.innerHTML = '<option value="">全部</option>' + countries.map(c => '<option value="'+c+'">'+flagEmoji(c)+' '+c+'</option>').join('');
+  applyFilter();
+  $('#status').textContent = '已加载 '+allIps.length+' 个候选';
+}
+
+function applyFilter() {
+  let list = allIps.slice();
+  if (fC.value) list = list.filter(x => (x.carrier||'CF') === fC.value);
+  if (fCt.value) list = list.filter(x => x.country === fCt.value);
+  list = list.slice(0, +fT.value || 20);
+  renderList(list);
+}
+
+fC.onchange = fCt.onchange = fT.onchange = applyFilter;
+
+$('#btnCopy').onclick = async () => {
+  const url = location.origin + buildSubUrl();
+  try { await navigator.clipboard.writeText(url); $('#status').textContent = '✓ 订阅链接已复制'; }
+  catch (e) { prompt('复制此订阅链接', url); }
+};
+$('#btnDownload').onclick = async () => {
+  const r = await fetch(buildSubUrl()).then(r=>r.text());
+  const b = new Blob([r], {type:'text/plain'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'cf-best-ip.txt'; a.click();
+};
+$('#btnRefresh').onclick = load;
+
+load();
 </script>`);
 }
 
