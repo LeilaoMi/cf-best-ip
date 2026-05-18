@@ -124,6 +124,15 @@ const DEFAULT_CFG = {
 };
 
 const SOURCES = [
+  // ===== v2.4 hostmonit (uouin.com / ipdb.030101.xyz 同款源):带真实延迟/丢包/速度 =====
+  {
+    name: "hostmonit/三网实测",
+    url: "https://api.hostmonit.com/get_optimization_ip",
+    type: "hostmonit_json",
+    method: "POST",
+    body: { key: "o1zrmHAF" },
+    category: "cf-native",
+  },
   { name: "addressesapi/ip.164746.xyz", url: "https://addressesapi.090227.xyz/ip.164746.xyz", type: "carrier", category: "cf-native" },
   { name: "addressesapi/CloudFlareYes", url: "https://addressesapi.090227.xyz/CloudFlareYes", type: "carrier", category: "cf-native" },
   { name: "addressesapi/cmcc",          url: "https://addressesapi.090227.xyz/cmcc", type: "carrier", category: "cf-native" },
@@ -524,18 +533,46 @@ async function setManual(env, list) { await kvSet(env, "ips:manual", list); }
 // ============================================================
 async function fetchSource(src) {
   try {
-    const r = await withTimeout(
-      fetch(src.url, {
-        cf: { cacheTtl: 300 },
-        headers: {
-          "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-          "accept": "text/plain,text/html,application/json,*/*;q=0.8",
-          "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-        },
-      }),
-      8000,
-    );
+    const fetchOpts = {
+      cf: { cacheTtl: 300 },
+      headers: {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "accept": "text/plain,text/html,application/json,*/*;q=0.8",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+      },
+    };
+    if (src.method) fetchOpts.method = src.method;
+    if (src.body) {
+      fetchOpts.body = JSON.stringify(src.body);
+      fetchOpts.headers["content-type"] = "application/json";
+    }
+    const r = await withTimeout(fetch(src.url, fetchOpts), 8000);
     if (!r.ok) return { name: src.name, ips: [], error: `HTTP ${r.status}` };
+
+    // hostmonit JSON 分支:带真实延迟/丢包/速度/colo
+    if (src.type === "hostmonit_json") {
+      const j = await r.json();
+      const out = [];
+      for (const line of ["CT", "CU", "CM"]) {
+        for (const x of (j?.info?.[line] || [])) {
+          out.push({
+            ip: x.ip,
+            port: 443,
+            carrier: line,
+            country: "CN",
+            delay: x.latency,
+            loss: x.loss,
+            mbps: x.speed,
+            colo: x.colo && x.colo !== "Default" ? x.colo : undefined,
+            node: x.node,
+            tested: true,
+            category: "cf-native",
+          });
+        }
+      }
+      return { name: src.name, ips: out };
+    }
+
     const body = await r.text();
     const ips = [];
     const category = src.category || "cf-native";
@@ -1552,759 +1589,244 @@ function renderHome(data, visitor) {
   const ips = data.ips || [];
   const updated = data.updatedAt ? new Date(data.updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "（未运行）";
   const total = ips.length;
-  const root = visitor.root || "";
 
-  const flag = (cc) => cc && cc.length === 2 ? String.fromCodePoint(...cc.toUpperCase().split('').map(c => 0x1F1E6 + c.charCodeAt(0) - 65)) : "🌐";
+  const flagOf = (cc) => cc && cc.length === 2
+    ? String.fromCodePoint(...cc.toUpperCase().split('').map(c => 0x1F1E6 + c.charCodeAt(0) - 65))
+    : "🌐";
 
-  const ct    = ips.filter(x => x.carrier === "CT").slice(0, 30);
-  const cu    = ips.filter(x => x.carrier === "CU").slice(0, 30);
-  const cm    = ips.filter(x => x.carrier === "CM").slice(0, 30);
-  const proxy = ips.filter(x => x.category === "cf-proxy").slice(0, 30);
-  const allTop = ips.filter(x => x.category !== "cf-proxy").slice(0, 60);
+  // 取每类 top 30；hostmonit 来的有真实 delay/loss/mbps/colo，会优先排在前面
+  const sortFn = (a, b) => {
+    // 先 tested 优先（hostmonit 数据）
+    if (a.tested && !b.tested) return -1;
+    if (!a.tested && b.tested) return 1;
+    if (a.tested && b.tested) return (a.delay || 9999) - (b.delay || 9999);
+    return (b.sources || []).length - (a.sources || []).length;
+  };
+  const ct = ips.filter(x => x.carrier === "CT").sort(sortFn).slice(0, 30);
+  const cu = ips.filter(x => x.carrier === "CU").sort(sortFn).slice(0, 30);
+  const cm = ips.filter(x => x.carrier === "CM" || x.carrier === "CMCC").sort(sortFn).slice(0, 30);
+  const proxy = ips.filter(x => x.category === "cf-proxy").sort(sortFn).slice(0, 30);
+  const allNative = ips.filter(x => x.category !== "cf-proxy" && !["CT","CU","CM","CMCC"].includes(x.carrier)).sort(sortFn).slice(0, 30);
 
-  const subdomains = root ? {
-    cf:    `cf.${root}`,
-    cm:    `cm.${root}`,
-    ct:    `ct.${root}`,
-    cu:    `cu.${root}`,
-    proxy: `proxy.${root}`,
-  } : null;
+  const nativeCount = ips.filter(x => x.category !== "cf-proxy").length;
+  const proxyCount = ips.filter(x => x.category === "cf-proxy").length;
 
-  const renderRows = (list, defaultLine) => list.length ? list.map((x, i) => {
-    const line = x.category === "cf-proxy" ? "反代" : (CARRIER_LABEL[x.carrier] || defaultLine);
-    const lineColor = { "电信":"#7ee787", "联通":"#a78bfa", "移动":"#79b8ff", "反代":"#f0a83b", "CF":"#f9826c", "通用":"#f9826c" }[line] || "#888";
-    const port = x.port && x.port !== 443 ? `:${x.port}` : "";
-    return `<tr><td class="num">${i+1}</td><td><span class="line-badge" style="background:${lineColor}22;color:${lineColor};border:1px solid ${lineColor}55">${line}</span></td><td class="ip-cell"><code>${x.ip}${port}</code></td><td>${flag(x.country)} <span class="mut" style="font-size:11px">${x.country||"-"}</span></td><td><button class="copybtn" data-copy="${x.ip}">复制</button></td></tr>`;
-  }).join("") : `<tr><td colspan="5" class="mut" style="text-align:center;padding:24px;font-size:12px">该分类暂无 IP · 等 Cron 下次抓取 或 在 /admin 手动添加</td></tr>`;
+  const fmtDelay = (x) => x.delay != null ? `${x.delay}ms` : "—";
+  const fmtSpeed = (x) => x.mbps != null ? `${x.mbps} MB/s` : "—";
+  const fmtColo = (x) => x.colo || x.node || "—";
 
-  const tabs = [
-    { id: "all",   label: `全部 CF`, count: allTop.length, rows: renderRows(allTop, "CF") },
-    { id: "ct",    label: `电信`,     count: ct.length,     rows: renderRows(ct, "电信") },
-    { id: "cu",    label: `联通`,     count: cu.length,     rows: renderRows(cu, "联通") },
-    { id: "cm",    label: `移动`,     count: cm.length,     rows: renderRows(cm, "移动") },
-    { id: "proxy", label: `反代`,     count: proxy.length,  rows: renderRows(proxy, "反代") },
-  ];
-  const tabBar = tabs.map((t, i) => `<button class="tab ${i===0?'active':''}" data-tab="${t.id}">${t.label}<span class="tab-n">${t.count}</span></button>`).join("");
-  const panes  = tabs.map((t, i) => `<div class="pane" id="pane-${t.id}" style="display:${i===0?'block':'none'}"><table class="iptbl"><thead><tr><th>#</th><th>线路</th><th>优选 IP</th><th>国家</th><th>操作</th></tr></thead><tbody>${t.rows}</tbody></table></div>`).join("");
+  const renderRow = (x, i) => `<tr>
+    <td class="num">${i + 1}</td>
+    <td><span class="badge badge-${(x.carrier || "CF").toLowerCase()}">${carrierName(x.carrier || "CF")}</span></td>
+    <td class="ipcell"><span class="ip" data-ip="${x.ip}">${x.ip}</span></td>
+    <td class="cell-loss">${x.loss != null ? (x.loss * 100).toFixed(0) + "%" : "—"}</td>
+    <td class="cell-delay">${fmtDelay(x)}</td>
+    <td class="cell-speed">${fmtSpeed(x)}</td>
+    <td class="cell-colo"><span class="flagcc">${flagOf(x.country)} ${x.country || "—"}</span></td>
+    <td><button class="copybtn" data-copy="${x.ip}">复制</button></td>
+  </tr>`;
 
-  const subBlock = subdomains ? `
-<div class="subdomains">
-  <h3 style="font-size:13px;margin:18px 0 10px;color:var(--mut);font-weight:500">📡 域名直接解析（已自动同步至 Cloudflare DNS）</h3>
-  <div class="sub-grid">
-    ${[
-      { key:"cf",    label:"CF 主站", desc:"Cloudflare 自家 IP",       color:"#f9826c" },
-      { key:"ct",    label:"电信",     desc:"电信优化",                color:"#7ee787" },
-      { key:"cu",    label:"联通",     desc:"联通优化",                color:"#a78bfa" },
-      { key:"cm",    label:"移动",     desc:"移动优化",                color:"#79b8ff" },
-      { key:"proxy", label:"反代",     desc:"反代 IP（非 CF）",          color:"#f0a83b" },
-    ].map(s => `<div class="sub-card" style="border-left:3px solid ${s.color}"><div class="sub-label" style="color:${s.color}">${s.label}</div><code class="sub-host" data-copy="${subdomains[s.key]}">${subdomains[s.key]}</code><div class="mut" style="font-size:10px;margin-top:2px">${s.desc}</div></div>`).join("")}
-  </div>
-</div>` : "";
+  const renderTable = (rows) => rows.length
+    ? `<table class="iptbl"><thead><tr>
+        <th>#</th><th>线路</th><th>IP</th>
+        <th class="cell-loss">丢包</th>
+        <th class="cell-delay">延迟</th>
+        <th class="cell-speed">速度</th>
+        <th class="cell-colo">国家</th>
+        <th>操作</th>
+      </tr></thead><tbody>${rows.map(renderRow).join("")}</tbody></table>`
+    : `<div class="empty">⏳ 该分类暂无数据，等待下次刷新…</div>`;
 
-  return layout("CloudFlare 优选 IP", `
+  return html(`<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>CloudFlare 优选 IP · ${visitor.root || ""}</title>
+<meta name="description" content="电信、联通、移动 优质 Cloudflare 节点 IP + 反代 IP 池,真实测速数据,每 6 小时自动刷新">
 <style>
-.hero{margin:-2px -16px 16px;padding:34px 16px 24px;background:linear-gradient(135deg,#0d1421 0%,#1a1f2e 60%,#0d1421 100%);border-bottom:1px solid var(--bd);text-align:center}
-.hero h1{font-size:30px;margin:0 0 6px;letter-spacing:.02em;background:linear-gradient(90deg,#f9826c,#79b8ff);-webkit-background-clip:text;background-clip:text;color:transparent;font-weight:700}
-.hero .sub{color:var(--mut);font-size:13px;margin-bottom:14px}
-.hero .stats{display:flex;gap:6px 18px;justify-content:center;flex-wrap:wrap;font-size:12px;color:var(--mut)}
-.hero .stats b{color:var(--fg);font-weight:600}
-.tabs{display:flex;gap:4px;margin-bottom:14px;border-bottom:1px solid var(--bd);overflow-x:auto;-webkit-overflow-scrolling:touch}
-.tab{background:transparent;border:0;color:var(--mut);padding:10px 14px;font-size:13px;cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap;display:inline-flex;align-items:center;gap:6px;font-weight:500}
-.tab:hover{color:var(--fg)}
-.tab.active{color:var(--fg);border-bottom-color:var(--acc)}
-.tab-n{background:#21262d;color:var(--mut);padding:1px 7px;border-radius:10px;font-size:11px;font-weight:500;min-width:22px;text-align:center}
-.tab.active .tab-n{background:rgba(249,130,108,.2);color:var(--acc)}
-.pane{background:#0a0d12;border:1px solid var(--bd);border-radius:8px;overflow:hidden}
-.iptbl{width:100%;border-collapse:collapse;font-size:13px}
-.iptbl thead{background:#0d1117}
-.iptbl th{padding:10px 12px;text-align:left;color:var(--mut);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--bd)}
-.iptbl td{padding:8px 12px;border-bottom:1px solid #1a1f26}
+:root { --bg:#0a0d12; --card:#11161d; --bd:#1f2630; --fg:#e6edf3; --mut:#8b949e;
+  --ct:#3fb950; --cu:#a371f7; --cm:#388bfd; --cf:#f9826c; --pr:#d29922; }
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0}
+.hero{padding:36px 16px;background:linear-gradient(180deg,#000 0%,#0a0d12 100%);text-align:center;border-bottom:1px solid var(--bd)}
+.hero h1{margin:0 0 8px;font-size:30px;letter-spacing:1px}
+.hero .sub{color:var(--mut);font-size:13px;margin-bottom:18px;line-height:1.7;padding:0 8px}
+.hero-stats{display:flex;flex-wrap:wrap;gap:8px 24px;justify-content:center;font-size:12px;color:var(--mut)}
+.hero-stats b{color:var(--fg);font-size:16px;font-weight:600;margin-left:4px}
+.wrap{max-width:1100px;margin:0 auto;padding:16px}
+.tabs{display:flex;gap:6px;margin-bottom:14px;overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:4px}
+.tab{flex-shrink:0;padding:9px 14px;background:var(--card);border:1px solid var(--bd);border-radius:8px;cursor:pointer;color:var(--mut);font-size:13px;white-space:nowrap}
+.tab.active{background:#1f6feb;border-color:#1f6feb;color:#fff;font-weight:600}
+.tab .n{margin-left:4px;font-size:11px;opacity:.8}
+.refresh-bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;font-size:12px;color:var(--mut);margin-bottom:10px}
+.refresh-bar button{background:var(--card);border:1px solid var(--bd);color:var(--fg);padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px}
+.refresh-bar button:hover{background:#1f6feb;border-color:#1f6feb;color:#fff}
+.iptbl{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--bd);border-radius:10px;overflow:hidden;font-size:13px}
+.iptbl th,.iptbl td{padding:11px 8px;text-align:left;border-bottom:1px solid var(--bd)}
+.iptbl th{background:#0d1117;font-size:12px;color:var(--mut);font-weight:500}
 .iptbl tr:last-child td{border-bottom:0}
-.iptbl tr:hover{background:rgba(249,130,108,.04)}
-.iptbl .num{color:var(--mut);font-size:11px;width:40px}
-.iptbl .ip-cell code{font-family:ui-monospace,Menlo,monospace;font-size:13px;color:var(--fg);background:transparent;padding:0}
-.line-badge{font-size:11px;padding:2px 8px;border-radius:4px;font-weight:600;display:inline-block;min-width:36px;text-align:center}
-.copybtn{background:#21262d;border:1px solid var(--bd);color:var(--fg);border-radius:5px;padding:4px 10px;font-size:11px;cursor:pointer}
-.copybtn:hover{background:#30363d;border-color:var(--acc)}
-.copybtn.copied{background:rgba(126,231,135,.15);border-color:#7ee787;color:#7ee787}
-.sub-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}
-.sub-card{padding:10px 12px;background:#0d1117;border:1px solid var(--bd);border-radius:6px;cursor:pointer}
-.sub-card:hover{background:#161b22}
-.sub-label{font-size:12px;font-weight:600;margin-bottom:3px}
-.sub-host{font-family:ui-monospace,monospace;font-size:12px;color:var(--fg);display:block;word-break:break-all}
-.refresh-bar{display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--mut);margin-bottom:10px}
-.refresh-bar button{background:transparent;border:1px solid var(--bd);color:var(--mut);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px}
-.refresh-bar button:hover{color:var(--fg);border-color:var(--acc)}
-@media (max-width:720px){.hero h1{font-size:22px}.iptbl th:nth-child(5),.iptbl td:nth-child(5){display:none}.iptbl .num{display:none}.iptbl th:first-child,.iptbl td:first-child{display:none}}
+.iptbl tr:hover td{background:rgba(31,111,235,.06)}
+.iptbl .num{color:var(--mut);width:40px;text-align:center}
+.iptbl .ip{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#79c0ff;cursor:pointer;font-size:13px}
+.iptbl .ip:hover{text-decoration:underline}
+.iptbl .ipcell{min-width:120px}
+.iptbl .flagcc{white-space:nowrap}
+.badge{display:inline-block;padding:3px 9px;border-radius:5px;font-size:11px;font-weight:600;letter-spacing:.3px;color:#fff;white-space:nowrap}
+.badge-ct{background:var(--ct)}.badge-cu{background:var(--cu)}.badge-cm{background:var(--cm)}.badge-cmcc{background:var(--cm)}.badge-cf{background:var(--cf)}.badge-def{background:#6e7681}
+.copybtn{background:transparent;border:1px solid var(--bd);color:var(--mut);padding:4px 9px;border-radius:5px;cursor:pointer;font-size:11px;white-space:nowrap}
+.copybtn:hover{background:#1f6feb;border-color:#1f6feb;color:#fff}
+.copybtn.ok{background:var(--ct);border-color:var(--ct);color:#fff}
+.empty{padding:36px;text-align:center;color:var(--mut);background:var(--card);border:1px solid var(--bd);border-radius:10px;font-size:13px}
+.subs{margin:20px 0;display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+.subcard{padding:14px;background:var(--card);border:1px solid var(--bd);border-radius:10px}
+.subcard .sublabel{color:var(--mut);font-size:11px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
+.subcard .subhost{font-family:ui-monospace,monospace;font-size:13px;color:#79c0ff;word-break:break-all;line-height:1.5}
+.footer{text-align:center;padding:24px 16px;color:var(--mut);font-size:11px}
+.footer a{color:var(--mut);text-decoration:none}
+.footer a:hover{color:#79c0ff}
+/* 移动端：6.6 寸屏 (≈ 400px wide) */
+@media (max-width: 720px) {
+  .hero{padding:24px 14px}
+  .hero h1{font-size:22px}
+  .hero .sub{font-size:11px}
+  .hero-stats{gap:6px 16px;font-size:11px}
+  .hero-stats b{font-size:14px}
+  .wrap{padding:10px}
+  .iptbl{font-size:12px;border-radius:8px}
+  .iptbl th,.iptbl td{padding:8px 5px}
+  .iptbl .num{width:26px}
+  .iptbl .ip{font-size:12px}
+  /* 移动端隐藏次要列：丢包、速度、国家 */
+  .cell-loss,.cell-speed,.cell-colo{display:none}
+  .tabs{margin-bottom:10px}
+  .tab{padding:7px 11px;font-size:12px}
+  .copybtn{padding:3px 7px;font-size:10px}
+  .subcard{padding:11px}
+}
+/* 极小屏：< 360px */
+@media (max-width: 360px) {
+  .hero h1{font-size:18px}
+  .iptbl .num{display:none}
+  .iptbl th,.iptbl td{padding:7px 4px}
+}
 </style>
 
 <div class="hero">
   <h1>☁️ CloudFlare 优选 IP</h1>
-  <div class="sub">电信、联通、移动优质 Cloudflare 节点 IP + 反代 IP · 每 6 小时自动更新</div>
-  <div class="stats">
-    <span>📦 总节点 <b>${total.toLocaleString()}</b></span>
-    <span>🌐 CF 自家 <b>${(ips.length - ips.filter(x => x.category === 'cf-proxy').length).toLocaleString()}</b></span>
-    <span>🔁 反代 <b>${ips.filter(x => x.category === 'cf-proxy').length.toLocaleString()}</b></span>
-    <span>⏰ 更新 <b>${updated}</b></span>
+  <p class="sub">电信、联通、移动 优质 Cloudflare 节点 IP · 反代 IP 池<br>聚合 11 个公开源 · 真实测速数据 · 每 6 小时自动刷新</p>
+  <div class="hero-stats">
+    <div>总节点 <b>${total}</b></div>
+    <div>CF 自家 <b>${nativeCount}</b></div>
+    <div>反代 <b>${proxyCount}</b></div>
+    <div>更新于 <b id="upd">${updated}</b></div>
   </div>
 </div>
 
-<div class="refresh-bar">
-  <span>显示每个分类的 top 30 · 点击 IP 复制 · <a href="/test" style="color:var(--acc)">节点浏览</a> · <a href="/admin" style="color:var(--mut)">管理</a> · <a href="https://github.com/LeilaoMi/cf-best-ip" target="_blank" style="color:var(--mut)">GitHub</a></span>
-  <button id="reloadBtn">↻ 刷新数据</button>
-</div>
-
-<div class="tabs">${tabBar}</div>
-${panes}
-${subBlock}
-
-<div class="mut" style="text-align:center;font-size:11px;margin-top:18px;padding:12px 0">
-  API:<code>/api/ips?carrier=CT&top=10</code> · <code>/sub?carrier=CM</code> · 完整接口见 <a href="/admin" style="color:var(--acc)">/admin</a>
-</div>
-
-<script>
-  document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
-    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
-    document.querySelectorAll('.pane').forEach(p => p.style.display = 'none');
-    t.classList.add('active');
-    document.getElementById('pane-' + t.dataset.tab).style.display = 'block';
-  }));
-  document.body.addEventListener('click', async (e) => {
-    const el = e.target.closest('[data-copy]');
-    if (!el) return;
-    const val = el.dataset.copy;
-    try { await navigator.clipboard.writeText(val); }
-    catch { prompt('复制此内容', val); return; }
-    el.classList.add('copied');
-    const orig = el.textContent;
-    if (el.tagName === 'BUTTON') { el.textContent = '✓'; }
-    setTimeout(() => { el.classList.remove('copied'); if (el.tagName === 'BUTTON') el.textContent = orig; }, 1200);
-  });
-  setTimeout(() => location.reload(), 60000);
-  document.getElementById('reloadBtn').onclick = () => location.reload();
-</script>
-`);
-}
-
-function renderTest(visitor) {
-  const presetCarrier = visitor.carrier || "";
-  const visitorJson = JSON.stringify(visitor);
-  return layout("节点浏览 · cf-best-ip", `
-${renderVisitorBanner(visitor)}
-
-<div class="filterbar">
-  <div class="row">
-    <span class="lbl">运营商</span>
-    <select id="fCarrier">
-      <option value="">全部</option>
-      <option value="CT"${presetCarrier === "CT" ? " selected" : ""}>电信 CT</option>
-      <option value="CU"${presetCarrier === "CU" ? " selected" : ""}>联通 CU</option>
-      <option value="CM"${presetCarrier === "CM" ? " selected" : ""}>移动 CM</option>
-      <option value="CF">通用 CF</option>
-    </select>
-    <span class="lbl">国家</span>
-    <select id="fCountry"><option value="">全部</option></select>
-    <span class="lbl">数量</span>
-    <select id="fTop">
-      <option>10</option><option selected>20</option><option>30</option><option>50</option><option>100</option>
-    </select>
+<div class="wrap">
+  <div class="tabs" id="tabs">
+    <div class="tab active" data-tab="ct">📡 电信<span class="n">${ct.length}</span></div>
+    <div class="tab" data-tab="cu">📶 联通<span class="n">${cu.length}</span></div>
+    <div class="tab" data-tab="cm">📲 移动<span class="n">${cm.length}</span></div>
+    <div class="tab" data-tab="cf">☁️ 通用<span class="n">${allNative.length}</span></div>
+    <div class="tab" data-tab="proxy">🔄 反代<span class="n">${proxy.length}</span></div>
   </div>
-  <div class="row" style="margin-top:8px">
-    <button class="btn sm" id="btnCopy">📋 复制订阅</button>
-    <button class="btn sm ghost" id="btnDownload">⬇ 下载 .txt</button>
-    <button class="btn sm ghost" id="btnRefresh">🔄 刷新</button>
-    <span class="mut" id="status" style="margin-left:auto;font-size:11px"></span>
-  </div>
-</div>
 
-<div class="card">
-  <h2>🌍 在你当前网络下优选 Top IP（专属于你的网络）</h2>
-  <p class="mut" style="font-size:12px;line-height:1.6;margin:0 0 10px">
-    浏览器并发对 <b>50 个不同的真实 CF IP</b>（藏在 <code>p01-p50.${visitor.root || 'leilaomi.cc.cd'}</code> 这些子域里）测 TLS 握手延迟，<b style="color:var(--warn)">关代理后再开始最准</b>。
-    结果只反映你的网络，刷新一次自动同步一次。
-  </p>
-  <div class="row" style="margin-bottom:10px;gap:6px;flex-wrap:wrap">
-    <select id="probeKeep" style="min-width:90px"><option value="10">保留 Top 10</option><option value="20">保留 Top 20</option><option value="30">保留 Top 30</option><option value="50">全部 50</option></select>
-    <select id="probeReps" style="min-width:90px"><option value="3">每 IP 测 3 次</option><option value="5" selected>每 IP 测 5 次</option><option value="8">每 IP 测 8 次</option></select>
-    <button class="btn" id="btnProbe">▶ 开始优选</button>
-    <span class="mut" id="probeStatus" style="font-size:11px"></span>
+  <div class="refresh-bar">
+    <div>下次自动刷新倒计时 <b id="cd" style="color:var(--fg)">--:--</b></div>
+    <button id="manualRefresh">🔄 立即刷新</button>
   </div>
-  <div id="probeResult" class="mut" style="font-size:12px">点 "▶ 开始优选" 后这里出现你专属的 Top IP 列表</div>
-  <div class="row" id="probeActions" style="margin-top:10px;display:none;gap:6px">
-    <button class="btn sm ghost" id="copyTop">复制 IP 列表 (txt)</button>
-    <button class="btn sm ghost" id="dlTop">下载 best-for-me.txt</button>
-  </div>
-  <details style="margin-top:12px"><summary class="mut" style="font-size:11px;cursor:pointer">🔧 站长域名套测试（cf./ct./cu./cm.${visitor.root || 'leilaomi.cc.cd'}）</summary>
-    <div class="row" style="margin-top:10px;gap:6px">
-      <input id="customHost" placeholder="可选：自定义域名一起测" style="flex:1;min-width:160px"/>
-      <button class="btn sm" id="btnLocalCarrier">测 4 个套</button>
-      <span class="mut" id="localStatus" style="font-size:11px"></span>
+
+  <div id="pane-ct" class="pane">${renderTable(ct)}</div>
+  <div id="pane-cu" class="pane" style="display:none">${renderTable(cu)}</div>
+  <div id="pane-cm" class="pane" style="display:none">${renderTable(cm)}</div>
+  <div id="pane-cf" class="pane" style="display:none">${renderTable(allNative)}</div>
+  <div id="pane-proxy" class="pane" style="display:none">${renderTable(proxy)}</div>
+
+  <div class="subs">
+    <div class="subcard">
+      <div class="sublabel"><span>📡 电信</span><button class="copybtn" data-copy="ct.${(visitor.root || "你的域名")}">复制域名</button></div>
+      <div class="subhost">ct.${(visitor.root || "你的域名")}</div>
     </div>
-    <div id="localRes" style="font-size:12px;line-height:1.8;margin-top:8px" class="mut"></div>
-  </details>
+    <div class="subcard">
+      <div class="sublabel"><span>📶 联通</span><button class="copybtn" data-copy="cu.${(visitor.root || "你的域名")}">复制域名</button></div>
+      <div class="subhost">cu.${(visitor.root || "你的域名")}</div>
+    </div>
+    <div class="subcard">
+      <div class="sublabel"><span>📲 移动</span><button class="copybtn" data-copy="cm.${(visitor.root || "你的域名")}">复制域名</button></div>
+      <div class="subhost">cm.${(visitor.root || "你的域名")}</div>
+    </div>
+    <div class="subcard">
+      <div class="sublabel"><span>☁️ 主域</span><button class="copybtn" data-copy="cf.${(visitor.root || "你的域名")}">复制域名</button></div>
+      <div class="subhost">cf.${(visitor.root || "你的域名")}</div>
+    </div>
+    <div class="subcard">
+      <div class="sublabel"><span>🔄 反代</span><button class="copybtn" data-copy="proxy.${(visitor.root || "你的域名")}">复制域名</button></div>
+      <div class="subhost">proxy.${(visitor.root || "你的域名")}</div>
+    </div>
+  </div>
+
+  <div class="footer">
+    数据源:hostmonit · IPDB · countrymerge · zip.cm.edu.kg · uouin · 164746.xyz<br>
+    <a href="https://github.com/LeilaoMi/cf-best-ip" target="_blank">📦 GitHub</a> · 基于 Cloudflare Workers
+  </div>
 </div>
 
 <script>
-const visitor = ${visitorJson};
-const $ = s => document.querySelector(s);
-const fC = $('#fCarrier'), fCt = $('#fCountry'), fT = $('#fTop');
-let allIps = [];
+const tabs = document.querySelectorAll('.tab');
+const panes = document.querySelectorAll('.pane');
+tabs.forEach(t => t.onclick = () => {
+  tabs.forEach(x => x.classList.remove('active'));
+  t.classList.add('active');
+  panes.forEach(p => p.style.display = 'none');
+  document.getElementById('pane-' + t.dataset.tab).style.display = '';
+});
 
-function carrierTag(c) {
-  const m = {CT:'电信',CU:'联通',CM:'移动',CMCC:'移动',CF:'通用'};
-  const cls = (c || 'cf').toLowerCase();
-  return '<span class="tag '+cls+'">'+(m[c]||'通用')+'</span>';
-}
-function flagEmoji(c){const map={HK:'🇭🇰',JP:'🇯🇵',KR:'🇰🇷',TW:'🇹🇼',SG:'🇸🇬',US:'🇺🇸',CA:'🇨🇦',GB:'🇬🇧',DE:'🇩🇪',FR:'🇫🇷',NL:'🇳🇱',AU:'🇦🇺',RU:'🇷🇺',IN:'🇮🇳',CN:'🇨🇳',TH:'🇹🇭',MY:'🇲🇾'};return map[c]||'🌐';}
-
-function renderList(ips) {
-  if (!ips.length) { $('#list').innerHTML = '<div class="mut" style="padding:14px;text-align:center">没有匹配的节点，调整筛选试试</div>'; $('#hdr').textContent='节点列表 (0)'; return; }
-  $('#hdr').textContent = '节点列表 ('+ips.length+')';
-  $('#list').innerHTML = ips.map((x, i) => {
-    const meta = [
-      x.country ? flagEmoji(x.country)+' '+x.country : null,
-      x.colo,
-      x.sources ? '源 '+x.sources.length : null,
-    ].filter(Boolean).join(' · ');
-    return '<div class="node">' +
-      '<div class="node-no">#'+(i+1)+'</div>' +
-      '<div><div class="node-ip">'+x.ip+'<span class="mut" style="font-weight:400;font-size:12px">:'+x.port+'</span></div>' +
-        '<div class="node-meta">'+carrierTag(x.carrier)+'<span>'+meta+'</span></div>' +
-      '</div>' +
-      '<div class="node-act"><button class="copybtn" data-ip="'+x.ip+':'+x.port+'">复制</button></div>' +
-    '</div>';
-  }).join('');
-  document.querySelectorAll('[data-ip]').forEach(b => b.onclick = async () => {
-    try { await navigator.clipboard.writeText(b.dataset.ip); const o=b.textContent; b.textContent='✓'; setTimeout(()=>b.textContent=o, 1200); }
-    catch (e) { prompt('复制', b.dataset.ip); }
-  });
-}
-
-function buildSubUrl() {
-  const p = new URLSearchParams();
-  if (fC.value) p.set('carrier', fC.value);
-  if (fCt.value) p.set('country', fCt.value);
-  if (fT.value) p.set('top', fT.value);
-  return '/sub' + (p.toString() ? '?' + p.toString() : '');
-}
-
-async function load() {
-  $('#status').textContent = '加载中…';
-  const p = new URLSearchParams();
-  p.set('top', '500');
-  const r = await fetch('/api/ips?' + p.toString()).then(r=>r.json()).catch(()=>({ips:[]}));
-  allIps = r.ips || [];
-  // 填充国家下拉
-  const countries = [...new Set(allIps.map(x => x.country).filter(Boolean))].sort();
-  fCt.innerHTML = '<option value="">全部</option>' + countries.map(c => '<option value="'+c+'">'+flagEmoji(c)+' '+c+'</option>').join('');
-  applyFilter();
-  $('#status').textContent = '已加载 '+allIps.length+' 个候选';
-}
-
-function applyFilter() {
-  let list = allIps.slice();
-  if (fC.value) list = list.filter(x => (x.carrier||'CF') === fC.value);
-  if (fCt.value) list = list.filter(x => x.country === fCt.value);
-  list = list.slice(0, +fT.value || 20);
-  renderList(list);
-}
-
-fC.onchange = fCt.onchange = fT.onchange = applyFilter;
-
-$('#btnCopy').onclick = async () => {
-  const url = location.origin + buildSubUrl();
-  try { await navigator.clipboard.writeText(url); $('#status').textContent = '✓ 订阅链接已复制'; }
-  catch (e) { prompt('复制此订阅链接', url); }
-};
-$('#btnDownload').onclick = async () => {
-  const r = await fetch(buildSubUrl()).then(r=>r.text());
-  const b = new Blob([r], {type:'text/plain'});
-  const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'cf-best-ip.txt'; a.click();
-};
-$('#btnRefresh').onclick = load;
-
-load();
-
-// ===== 浏览器优选探针 —— 在用户网络下测真实 IP 延迟 =====
-async function _probeOne(host, n = 5, timeoutMs = 4000) {
-  const samples = [];
-  for (let i = 0; i < n; i++) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    const t0 = performance.now();
-    try {
-      await fetch('https://' + host + '/cdn-cgi/trace?_=' + Math.random(), { cache: 'no-store', signal: ctrl.signal, mode: 'no-cors' });
-      samples.push(performance.now() - t0);
-    } catch (e) {
-      samples.push(null);
-    }
-    clearTimeout(timer);
-  }
-  const ok = samples.filter(x => x != null);
-  return {
-    samples,
-    min: ok.length ? Math.round(Math.min(...ok)) : null,
-    avg: ok.length ? Math.round(ok.reduce((a, b) => a + b, 0) / ok.length) : null,
-    loss: 1 - ok.length / n,
-  };
-}
-
-let _slots = [];
-let _probeResults = [];
-
-async function _loadSlots() {
+document.body.addEventListener('click', async (e) => {
+  const btn = e.target.closest('.copybtn');
+  const ipEl = e.target.closest('.ip');
+  const text = btn ? btn.dataset.copy : (ipEl ? ipEl.dataset.ip : null);
+  if (!text) return;
   try {
-    const r = await fetch('/api/probe-slots').then(r => r.json());
-    _slots = r.slots || [];
-    return _slots.length;
-  } catch (e) { return 0; }
-}
-
-function _ipDelayColor(ms) {
-  if (ms == null) return '#8b949e';
-  if (ms < 80) return '#7ee787';
-  if (ms < 200) return '#d8af3c';
-  return '#ff7b72';
-}
-
-function _carrierTag(c) {
-  const m = { CT: '电信', CU: '联通', CM: '移动', CMCC: '移动', CF: '通用' };
-  const cls = (c || 'cf').toLowerCase();
-  return '<span class="tag ' + cls + '">' + (m[c] || '通用') + '</span>';
-}
-
-function _renderProbeResults(results, keep) {
-  const top = results.slice(0, keep);
-  const html = top.map((r, i) => {
-    const color = _ipDelayColor(r.avg);
-    const sign = r.avg == null ? '不通' : (r.avg + 'ms');
-    const flag = ({HK:'🇭🇰',JP:'🇯🇵',KR:'🇰🇷',TW:'🇹🇼',SG:'🇸🇬',US:'🇺🇸',CA:'🇨🇦',GB:'🇬🇧',DE:'🇩🇪',FR:'🇫🇷',NL:'🇳🇱',AU:'🇦🇺',RU:'🇷🇺',IN:'🇮🇳',CN:'🇨🇳',TH:'🇹🇭',MY:'🇲🇾',HU:'🇭🇺',IT:'🇮🇹',CH:'🇨🇭'}[r.country]) || '🌐';
-    return '<div style="display:grid;grid-template-columns:30px 1fr auto;gap:8px;align-items:center;padding:8px;border:1px solid var(--bd);border-radius:6px;margin-bottom:4px"><div class="mut" style="font-size:11px">#' + (i+1) + '</div><div><div style="font-family:monospace;font-size:13px"><b>' + r.ip + '</b>:' + (r.port||443) + '</div><div style="font-size:11px;color:var(--mut);margin-top:2px">' + _carrierTag(r.carrier) + ' ' + flag + ' ' + (r.country||'') + (r.city?' · '+r.city:'') + '</div></div><div style="text-align:right"><b style="color:' + color + ';font-size:14px">' + sign + '</b><br/><button class="copybtn" data-cp="' + r.ip + '" style="margin-top:4px">复制</button></div></div>';
-  }).join('');
-  document.getElementById('probeResult').innerHTML = html;
-  document.querySelectorAll('[data-cp]').forEach(b => b.onclick = async () => {
-    try { await navigator.clipboard.writeText(b.dataset.cp); b.textContent = '✓'; setTimeout(()=>b.textContent='复制', 1500); }
-    catch(e) { prompt('复制', b.dataset.cp); }
-  });
-}
-
-const _btnProbe = document.getElementById('btnProbe');
-if (_btnProbe) {
-  _btnProbe.onclick = async () => {
-    _btnProbe.disabled = true;
-    const st = document.getElementById('probeStatus');
-    const keep = +document.getElementById('probeKeep').value;
-    const reps = +document.getElementById('probeReps').value;
-    if (!_slots.length) {
-      st.textContent = '⏳ 加载探针槽…';
-      await _loadSlots();
+    await navigator.clipboard.writeText(text);
+    if (btn) {
+      const old = btn.textContent;
+      btn.textContent = '✓ 已复制';
+      btn.classList.add('ok');
+      setTimeout(() => { btn.textContent = old; btn.classList.remove('ok'); }, 1500);
     }
-    if (!_slots.length) {
-      document.getElementById('probeResult').innerHTML = '<span style="color:#ff7b72">探针槽尚未生成。请管理员先去 /admin 点"立即抓取"刷新一次（会自动创建子域槽）</span>';
-      _btnProbe.disabled = false;
-      return;
-    }
-    st.textContent = '⏳ 0 / ' + _slots.length;
-    document.getElementById('probeResult').innerHTML = '<div class="mut">测试中…</div>';
-    let done = 0;
-    const concurrency = 8;
-    const queue = [..._slots];
-    const results = [];
-    async function worker() {
-      while (queue.length) {
-        const s = queue.shift();
-        const r = await _probeOne(s.host, reps);
-        results.push({ ...s, ...r });
-        done++;
-        st.textContent = '⏳ ' + done + ' / ' + _slots.length;
-      }
-    }
-    await Promise.all(Array.from({ length: Math.min(concurrency, _slots.length) }, worker));
-    results.sort((a, b) => (a.avg == null ? 99999 : a.avg) - (b.avg == null ? 99999 : b.avg));
-    _probeResults = results;
-    _renderProbeResults(results, keep);
-    const best = results.find(r => r.avg != null);
-    st.textContent = best ? ('✅ 完成 · 你的最快: ' + best.ip + ' (' + best.avg + 'ms · ' + (best.carrier||'CF') + ')') : '⚠️ 全部不通，可能在墙后或正在用代理';
-    document.getElementById('probeActions').style.display = 'flex';
-    _btnProbe.disabled = false;
-  };
-}
-
-document.getElementById('copyTop')?.addEventListener('click', async () => {
-  const keep = +document.getElementById('probeKeep').value;
-  const txt = _probeResults.slice(0, keep).filter(r => r.avg != null).map(r => r.ip + ':' + (r.port||443) + '#' + (r.carrier||'CF') + '-' + r.avg + 'ms').join('\\n');
-  try { await navigator.clipboard.writeText(txt); document.getElementById('probeStatus').textContent = '已复制 ' + txt.split('\\n').length + ' 个'; }
-  catch(e) { prompt('复制', txt); }
+  } catch { prompt('复制此内容', text); }
 });
 
-document.getElementById('dlTop')?.addEventListener('click', () => {
-  const keep = +document.getElementById('probeKeep').value;
-  const txt = _probeResults.slice(0, keep).filter(r => r.avg != null).map(r => r.ip + ':' + (r.port||443) + '#' + (r.carrier||'CF') + '-' + r.avg + 'ms').join('\\n');
-  const blob = new Blob([txt], { type: 'text/plain' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'best-for-me.txt';
-  a.click();
-});
-
-// 旧的 cf./ct./cu./cm. 4 个套测试 - 站长域名调试用
-function _defaultCarrierHosts() {
-  const h = location.hostname;
-  const parts = h.split('.');
-  if (parts.length < 2) return [];
-  const root = parts.slice(1).join('.');
-  return [
-    { tag: '通用 cf.', host: 'cf.' + root },
-    { tag: '电信 ct.', host: 'ct.' + root },
-    { tag: '联通 cu.', host: 'cu.' + root },
-    { tag: '移动 cm.', host: 'cm.' + root },
-  ];
-}
-
-const _btnLocalCarrier = document.getElementById('btnLocalCarrier');
-if (_btnLocalCarrier) {
-  _btnLocalCarrier.onclick = async () => {
-    _btnLocalCarrier.disabled = true;
-    const st = document.getElementById('localStatus');
-    const res = document.getElementById('localRes');
-    res.innerHTML = '<div class="mut">⏳ 测试中…</div>';
-    const targets = _defaultCarrierHosts();
-    const custom = (document.getElementById('customHost').value || '').trim();
-    if (custom) targets.push({ tag: '自定义', host: custom });
-    st.textContent = '测试 ' + targets.length + ' 个域…';
-    const results = await Promise.all(targets.map(t => _probeOne(t.host).then(r => ({ ...t, ...r }))));
-    results.sort((a, b) => (a.avg == null ? 99999 : a.avg) - (b.avg == null ? 99999 : b.avg));
-    res.innerHTML = results.map(r => {
-      const c = _ipDelayColor(r.avg);
-      const lossPct = Math.round(r.loss * 100);
-      const sign = r.avg == null ? '✗ 不通' : ('✓ 平均 ' + r.avg + 'ms · 最低 ' + r.min + 'ms');
-      const tail = lossPct > 0 ? ' · 丢包 ' + lossPct + '%' : '';
-      return '<div style="display:flex;justify-content:space-between;gap:8px;padding:7px 0;border-bottom:1px solid #21262d"><span><b>' + r.tag + '</b> ' + r.host + '</span><b style="color:' + c + ';white-space:nowrap">' + sign + tail + '</b></div>';
-    }).join('');
-    const best = results.find(r => r.avg != null);
-    st.textContent = best ? '✅ 你这网络下最快: ' + best.host + ' (' + best.avg + 'ms)' : '⚠️ 全部不通';
-    _btnLocalCarrier.disabled = false;
-  };
-}
-
-// 启动时预拉 slots
-_loadSlots().then(n => {
-  if (!n) document.getElementById('probeResult').innerHTML = '<span class="mut">探针槽尚未生成。管理员去 /admin 点"立即抓取"会自动创建 50 个 p01-p50 子域槽</span>';
-});
-</script>`);
-}
-
-function renderAdmin() {
-  return layout("管理 · cf-best-ip", `
-<div class="card" id="kpi">
-  <div class="kpis">
-    <div class="kpi"><div class="kpi-label">节点池</div><div class="kpi-value" id="kTotal">—</div></div>
-    <div class="kpi"><div class="kpi-label">最后更新</div><div class="kpi-value" id="kUpdated" style="font-size:14px">—</div></div>
-    <div class="kpi"><div class="kpi-label">下次 Cron</div><div class="kpi-value" id="kCron" style="font-size:14px">—</div></div>
-    <div class="kpi"><div class="kpi-label">数据源</div><div class="kpi-value" id="kSrc">—</div></div>
-  </div>
-</div>
-
-<div class="card">
-  <h2>📊 运营商分布</h2>
-  <div id="bars" class="mut" style="font-size:12px">加载中…</div>
-</div>
-
-<div class="card">
-  <div class="row" style="justify-content:space-between"><h2 style="margin:0">📡 DNS 实时状态</h2>
-    <div class="row" style="gap:6px">
-      <button class="btn sm" id="syncdns">同步 DNS</button>
-      <button class="btn sm ghost" id="reloadDns">刷新</button>
-    </div></div>
-  <div id="dnsList" class="mut" style="font-size:12px;margin-top:10px">加载中…</div>
-  <span class="mut" id="dnsMsg" style="font-size:11px"></span>
-</div>
-
-<div class="card">
-  <div class="row" style="justify-content:space-between"><h2 style="margin:0">📥 数据源健康</h2>
-    <button class="btn sm ghost" id="refreshNow">立即抓取并测速</button></div>
-  <div id="srcList" style="font-size:12px;margin-top:10px">加载中…</div>
-  <span class="mut" id="refreshMsg" style="font-size:11px"></span>
-</div>
-
-<div class="card">
-  <h2>🔗 订阅链接生成器</h2>
-  <div class="row">
-    <select id="gCarrier"><option value="">全部运营商</option><option value="CT">电信</option><option value="CU">联通</option><option value="CM">移动</option><option value="CF">通用</option></select>
-    <select id="gCountry"><option value="">全部国家</option></select>
-    <select id="gTop"><option>5</option><option>10</option><option selected>20</option><option>50</option><option>100</option></select>
-    <select id="gFmt"><option value="/sub">纯文本</option><option value="/api/v2ray">V2Ray base64</option><option value="/api/clash">Clash YAML</option><option value="/api/preferred-ips">EdgeTunnel</option><option value="/api/ips">JSON</option></select>
-    <label class="row" style="gap:4px;font-size:12px"><input type="checkbox" id="gSmart"/> 智能就近</label>
-  </div>
-  <div style="margin-top:10px;padding:10px;background:#0a0d12;border:1px solid var(--bd);border-radius:6px;font-family:monospace;font-size:12px;word-break:break-all" id="genUrl">—</div>
-  <div class="row" style="margin-top:8px">
-    <button class="btn sm" id="copyUrl">复制</button>
-    <button class="btn sm ghost" id="testUrl">在新标签打开</button>
-    <span class="mut" id="genMsg" style="font-size:11px"></span>
-  </div>
-</div>
-
-<div class="card">
-  <h2>📋 节点列表</h2>
-  <div class="row" style="gap:8px;margin-bottom:10px">
-    <input id="nSearch" placeholder="搜 IP / 端口 / 国家 / 来源…" style="flex:1;min-width:180px"/>
-    <select id="nCarrier"><option value="">全部</option><option value="CT">电信</option><option value="CU">联通</option><option value="CM">移动</option><option value="CF">通用</option></select>
-    <select id="nLimit"><option>20</option><option selected>50</option><option>100</option><option>500</option></select>
-  </div>
-  <div id="nodeTable" style="font-size:12px;max-height:520px;overflow:auto">加载中…</div>
-</div>
-
-<div class="card">
-  <h2>➕ 手动添加 IP / CIDR 扫描</h2>
-  <textarea id="manual" rows="3" style="width:100%" placeholder="一行一个，支持 1.2.3.4 / 1.2.3.4:443 / 1.2.3.4:443#CT"></textarea>
-  <div class="row" style="margin-top:8px"><button class="btn sm" id="add">添加</button><button class="btn sm ghost" id="loadm">查看已添加</button></div>
-  <pre id="manualList" class="mut" style="font-size:11px;max-height:120px;overflow:auto;margin-top:8px"></pre>
-  <hr style="border:0;border-top:1px solid var(--bd);margin:14px 0"/>
-  <div class="row"><input id="cidr" placeholder="173.245.48.0/26" style="flex:1;min-width:160px"/><input id="cport" value="443" style="width:80px"/><button class="btn sm" id="scan">扫描</button></div>
-  <pre id="scanRes" class="mut" style="font-size:12px;max-height:160px;overflow:auto;margin-top:8px"></pre>
-</div>
-
-<div class="card">
-  <h2>🔑 V2Ray / Sing-box 真订阅模板</h2>
-  <p class="mut" style="font-size:12px;line-height:1.6;margin:0 0 8px">
-    粘贴一条<b>完整的 vless:// 节点 URI</b>（含你 UUID/SNI/path），Worker 会用候选 IP 自动替换 host:port 字段，生成 V2RayN/Sing-box 直接订阅的 base64 节点列表。<br/>
-    示例：<code>vless://uuid@a.example.com:443?type=ws&security=tls&sni=a.example.com&host=a.example.com&path=%2F&encryption=none#sample</code>
-  </p>
-  <textarea id="vlessTpl" rows="3" placeholder="vless://uuid@host:443?type=ws&security=tls&sni=..." style="width:100%;font-family:monospace;font-size:11px"></textarea>
-  <div class="row" style="margin-top:8px"><button class="btn sm" id="saveVless">保存模板</button><span class="mut" id="vlessMsg" style="font-size:11px"></span></div>
-  <div class="mut" style="margin-top:10px;font-size:12px">
-    订阅地址（粘到 V2RayN / Sing-box / Shadowrocket）：<br/>
-    <code id="vlessSubUrl"></code>
-  </div>
-</div>
-
-<div class="card">
-  <h2>⚙️ 配置</h2>
-  <div class="row" style="flex-direction:column;align-items:stretch;gap:8px">
-    <label class="row" style="gap:8px;align-items:center"><span style="width:140px;font-size:13px">每次返回数量 topN</span><input id="cTopN" type="number" min="1" max="200" style="width:100px"/></label>
-    <label class="row" style="gap:8px;align-items:center"><span style="width:140px;font-size:13px">自动刷新间隔（小时）</span><input id="cRefresh" type="number" min="1" max="48" style="width:100px"/></label>
-    <label class="row" style="gap:8px;align-items:center"><span style="width:140px;font-size:13px">屏蔽国家 (逗号)</span><input id="cBlock" placeholder="CN,IR" style="flex:1;min-width:120px"/></label>
-    <label class="row" style="gap:8px;align-items:center"><span style="width:140px;font-size:13px">端口列表 (逗号)</span><input id="cPorts" placeholder="443,2053" style="flex:1;min-width:120px"/></label>
-  </div>
-  <div class="row" style="margin-top:10px"><button class="btn sm" id="saveCfg">保存配置</button><span class="mut" id="cfgMsg" style="font-size:11px"></span></div>
-  <details style="margin-top:12px"><summary class="mut" style="font-size:11px;cursor:pointer">高级：JSON 编辑器</summary>
-    <textarea id="cfgEdit" rows="6" style="width:100%;margin-top:8px;font-family:monospace;font-size:11px"></textarea>
-    <button class="btn sm ghost" id="saveCfgRaw" style="margin-top:8px">保存原始 JSON</button>
-  </details>
-</div>
-
-<div class="card" style="border-color:#5a2a2a">
-  <details>
-    <summary style="cursor:pointer;color:#f85149">⚠️ 危险操作</summary>
-    <div style="margin-top:10px">
-      <button class="btn sm" id="clearCache" style="background:#3a1212;border:1px solid #5a2a2a;color:#f85149">清空 KV 缓存（节点池清零，下次 Cron 重新填）</button>
-    </div>
-  </details>
-</div>
-
-<style>
-.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}
-.kpi{padding:10px 12px;background:#0a0d12;border:1px solid var(--bd);border-radius:8px}
-.kpi-label{font-size:11px;color:var(--mut);margin-bottom:4px}
-.kpi-value{font-size:22px;font-weight:600;color:var(--fg)}
-.bar-row{display:grid;grid-template-columns:60px 1fr 50px;gap:10px;align-items:center;margin:4px 0}
-.bar-bg{height:14px;background:#0a0d12;border:1px solid var(--bd);border-radius:7px;overflow:hidden}
-.bar-fill{height:100%;border-radius:7px;transition:width .3s}
-.dns-block{padding:10px;background:#0a0d12;border:1px solid var(--bd);border-radius:6px;margin-bottom:8px}
-.dns-name{display:flex;justify-content:space-between;align-items:center}
-.dns-ips{font-family:monospace;font-size:11px;color:var(--mut);margin-top:6px;line-height:1.6;word-break:break-all}
-.src-row{display:grid;grid-template-columns:1fr 50px;gap:6px;padding:6px 8px;border-bottom:1px solid #1a1f26;align-items:center}
-.src-row:last-child{border-bottom:0}
-.src-bad{color:#f85149}
-.src-ok{color:var(--ok,#7ee787)}
-.ntbl{width:100%;border-collapse:collapse;font-size:11px}
-.ntbl th,.ntbl td{padding:5px 6px;text-align:left;border-bottom:1px solid #1a1f26}
-.ntbl th{background:#0a0d12;font-weight:500;color:var(--mut);position:sticky;top:0}
-.ntbl td.ip{font-family:monospace}
-</style>
-
-<script>
-const $ = s => document.querySelector(s);
-const $$ = s => Array.from(document.querySelectorAll(s));
-
-const CARRIER_LABEL = {CT:'电信',CU:'联通',CM:'移动',CMCC:'移动',CF:'通用'};
-const CARRIER_COLOR = {CT:'#7ee787',CU:'#a78bfa',CM:'#79b8ff',CMCC:'#79b8ff',CF:'#f9826c'};
-const FLAGS = {HK:'🇭🇰',JP:'🇯🇵',KR:'🇰🇷',TW:'🇹🇼',SG:'🇸🇬',US:'🇺🇸',CA:'🇨🇦',GB:'🇬🇧',DE:'🇩🇪',FR:'🇫🇷',NL:'🇳🇱',AU:'🇦🇺',RU:'🇷🇺',IN:'🇮🇳',CN:'🇨🇳'};
-
-function flash(el, msg, ok=true){el.textContent=msg;el.style.color=ok?'var(--ok,#7ee787)':'#f85149';setTimeout(()=>{el.textContent='';el.style.color=''},4000)}
-
-async function loadStats(){
-  const s = await fetch('/api/stats').then(r=>r.json());
-  $('#kTotal').textContent = s.total;
-  $('#kUpdated').textContent = s.updatedAt ? new Date(s.updatedAt).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}).slice(5) : '—';
-  // 下次 Cron：每 6 小时整 (0,6,12,18 UTC)
+// 倒计时 (下次 Cron: 每 6 小时整 UTC)
+function tickCountdown() {
   const now = new Date();
-  const utcH = now.getUTCHours();
-  const nextH = Math.ceil((utcH+0.001)/6)*6 % 24;
-  const next = new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate()+(nextH===0&&utcH>=18?1:0), nextH, 0, 0));
-  const mins = Math.round((next - now)/60000);
-  $('#kCron').textContent = (mins>60?Math.floor(mins/60)+'h':'')+(mins%60)+'m 后';
-  const okCount = (s.sourceStats||[]).filter(x=>!x.error && x.count>0).length;
-  const totalSrc = (s.sourceStats||[]).length;
-  $('#kSrc').textContent = okCount+'/'+totalSrc;
-  // 运营商分布
-  const carriers = ['CT','CU','CM','CF'];
-  const max = Math.max(...carriers.map(c=>(s.byCarrier.find(x=>x.key===c)||{count:0}).count), 1);
-  $('#bars').innerHTML = carriers.map(c=>{
-    const n = (s.byCarrier.find(x=>x.key===c)||{count:0}).count;
-    const w = Math.max(2, Math.round(n/max*100));
-    return '<div class="bar-row"><span>'+CARRIER_LABEL[c]+'</span><div class="bar-bg"><div class="bar-fill" style="width:'+w+'%;background:'+CARRIER_COLOR[c]+'"></div></div><b>'+n+'</b></div>';
-  }).join('');
-  // 数据源健康
-  $('#srcList').innerHTML = (s.sourceStats||[]).map(x=>{
-    const cls = (x.error || !x.count) ? 'src-bad' : 'src-ok';
-    const sign = (x.error || !x.count) ? '✗' : '✓';
-    return '<div class="src-row"><div><span class="'+cls+'">'+sign+'</span> '+x.name+(x.error?' <span class="mut" style="font-size:10px">('+x.error+')</span>':'')+'</div><b>'+(x.count||0)+'</b></div>';
-  }).join('') || '<div class="mut">无数据</div>';
-  // 填充国家下拉
-  const cs = (s.byCountry||[]).filter(x=>x.key && x.key!=='?');
-  $('#gCountry').innerHTML = '<option value="">全部国家</option>' + cs.map(c=>'<option value="'+c.key+'">'+(FLAGS[c.key]||'🌐')+' '+c.key+' ('+c.count+')</option>').join('');
-  return s;
+  const u = now.getUTCHours();
+  const nh = Math.ceil((u + 0.001) / 6) * 6 % 24;
+  const next = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(),
+    now.getUTCDate() + (nh === 0 && u >= 18 ? 1 : 0),
+    nh, 0, 0
+  ));
+  const s = Math.max(0, Math.floor((next - now) / 1000));
+  const h = String(Math.floor(s / 3600)).padStart(2, '0');
+  const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+  const sec = String(s % 60).padStart(2, '0');
+  document.getElementById('cd').textContent = h + ':' + m + ':' + sec;
 }
+tickCountdown();
+setInterval(tickCountdown, 1000);
 
-async function loadDns(){
-  const r = await fetch('/api/dns/current').then(r=>r.json());
-  if (!r.ok) { $('#dnsList').innerHTML = '<span class="mut">DNS 未配置：需要在环境变量里设置 CF_API_TOKEN / CF_ZONE_ID / CF_RECORD_NAME</span>'; return; }
-  $('#dnsList').innerHTML = (r.dns||[]).map(d=>{
-    const records = d.records && d.records.length ? d.records : (d.error ? ['<span class="src-bad">'+d.error+'</span>'] : ['<span class="mut">尚无记录</span>']);
-    return '<details class="dns-block"><summary class="dns-name"><b>'+d.name+'</b><span class="mut">'+(d.records||[]).length+' 条 A 记录</span></summary><div class="dns-ips">'+records.join(' · ')+'</div></details>';
-  }).join('') || '<span class="mut">无</span>';
-}
-
-async function loadNodes(){
-  const lim = $('#nLimit').value || 50;
-  const r = await fetch('/api/ips?top='+lim).then(r=>r.json());
-  const q = ($('#nSearch').value||'').toLowerCase();
-  const carrier = $('#nCarrier').value;
-  let list = r.ips || [];
-  if (carrier) list = list.filter(x=>(x.carrier||'CF')===carrier);
-  if (q) list = list.filter(x=>JSON.stringify(x).toLowerCase().includes(q));
-  if (!list.length) { $('#nodeTable').innerHTML = '<div class="mut" style="padding:14px;text-align:center">无匹配</div>'; return; }
-  $('#nodeTable').innerHTML =
-    '<table class="ntbl"><thead><tr><th>#</th><th>IP</th><th>端口</th><th>运营商</th><th>国家</th><th>来源</th><th></th></tr></thead><tbody>' +
-    list.map((x,i)=>{
-      const isManual = (x.sources||[]).includes('manual');
-      return '<tr><td>'+(i+1)+'</td><td class="ip">'+x.ip+'</td><td>'+x.port+'</td><td>'+CARRIER_LABEL[x.carrier||'CF']+'</td><td>'+(FLAGS[x.country]||'🌐')+' '+(x.country||'-')+'</td><td>'+((x.sources||[]).length||0)+'</td><td>'+
-        (isManual?'<button class="copybtn" data-del="'+x.ip+'">删</button>':'')+
-        '</td></tr>';
-    }).join('') + '</tbody></table>';
-  $$('[data-del]').forEach(b=>b.onclick=async()=>{
-    if(!confirm('删除手动添加的 '+b.dataset.del+'?')) return;
-    await fetch('/api/manual?ip='+encodeURIComponent(b.dataset.del),{method:'DELETE'});
-    loadNodes();
-  });
-}
-
-function buildUrl(){
-  const path = $('#gFmt').value;
-  const p = new URLSearchParams();
-  if ($('#gCarrier').value) p.set('carrier', $('#gCarrier').value);
-  if ($('#gCountry').value) p.set('country', $('#gCountry').value);
-  if ($('#gTop').value) p.set('top', $('#gTop').value);
-  if ($('#gSmart').checked) p.set('smart', '1');
-  const url = location.origin + path + (p.toString()?'?'+p.toString():'');
-  $('#genUrl').textContent = url;
-}
-
-['gCarrier','gCountry','gTop','gFmt','gSmart'].forEach(id=>$('#'+id).addEventListener('change', buildUrl));
-
-$('#copyUrl').onclick = async ()=>{
-  const u = $('#genUrl').textContent;
-  try { await navigator.clipboard.writeText(u); flash($('#genMsg'),'已复制'); }
-  catch(e){ prompt('复制此链接', u); }
-};
-$('#testUrl').onclick = ()=> window.open($('#genUrl').textContent, '_blank');
-
-$('#syncdns').onclick = async ()=>{
-  $('#syncdns').disabled = true;
-  flash($('#dnsMsg'), '同步中…');
-  const r = await fetch('/api/dns/sync').then(r=>r.json()).catch(e=>({error:e}));
-  flash($('#dnsMsg'), r.ok?'同步完成':'失败: '+JSON.stringify(r), r.ok);
-  $('#syncdns').disabled = false;
-  await loadDns();
-};
-$('#reloadDns').onclick = loadDns;
-
-$('#refreshNow').onclick = async ()=>{
-  $('#refreshNow').disabled = true;
-  flash($('#refreshMsg'), '抓取测速中…可能需 20-40 秒');
-  const r = await fetch('/api/refresh').then(r=>r.json());
-  flash($('#refreshMsg'), r.ok ? ('完成：'+r.count+' 节点 · '+r.elapsedMs+'ms') : ('失败: '+(r.error||'unknown')), r.ok);
-  $('#refreshNow').disabled = false;
-  await Promise.all([loadStats(), loadNodes()]);
-};
-
-['nSearch','nCarrier','nLimit'].forEach(id=>$('#'+id).addEventListener('input', loadNodes));
-
-$('#add').onclick = async ()=>{
-  const r = await fetch('/api/manual',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lines:$('#manual').value})}).then(r=>r.json());
-  alert('已添加，当前手动节点 '+r.count);
-  $('#manual').value=''; loadNodes();
-};
-$('#loadm').onclick = async ()=>{
-  const r = await fetch('/api/manual').then(r=>r.json());
-  $('#manualList').textContent = JSON.stringify(r, null, 2);
-};
-$('#scan').onclick = async ()=>{
-  $('#scan').disabled = true;
-  $('#scanRes').textContent = '扫描中…';
-  const r = await fetch('/api/cidr-scan',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({cidr:$('#cidr').value,port:+$('#cport').value})}).then(r=>r.json());
-  $('#scanRes').textContent = JSON.stringify(r.ips, null, 2);
-  $('#scan').disabled = false;
-};
-
-// 配置面板
-async function loadCfg(){
-  const c = await fetch('/api/config').then(r=>r.json());
-  $('#cTopN').value = c.topN ?? 30;
-  $('#cRefresh').value = c.refreshHours ?? 6;
-  $('#cBlock').value = (c.countryBlocklist||[]).join(',');
-  $('#cPorts').value = (c.ports||[443]).join(',');
-  $('#cfgEdit').value = JSON.stringify(c, null, 2);
-  if ($('#vlessTpl')) $('#vlessTpl').value = c.vlessTemplate || '';
-  if ($('#vlessSubUrl')) $('#vlessSubUrl').textContent = location.origin + '/sub/vless?top=30';
-}
-$('#saveCfg').onclick = async ()=>{
-  const body = {
-    topN: +$('#cTopN').value || 30,
-    refreshHours: +$('#cRefresh').value || 6,
-    countryBlocklist: $('#cBlock').value.split(',').map(s=>s.trim()).filter(Boolean),
-    ports: $('#cPorts').value.split(',').map(s=>+s.trim()).filter(Boolean),
-  };
-  await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
-  flash($('#cfgMsg'), '已保存');
-};
-$('#saveCfgRaw').onclick = async ()=>{
+document.getElementById('manualRefresh').onclick = async (e) => {
+  const btn = e.target;
+  btn.disabled = true; btn.textContent = '⏳ 抓取中…';
   try {
-    const body = JSON.parse($('#cfgEdit').value);
-    await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
-    flash($('#cfgMsg'), '已保存 JSON');
-    loadCfg();
-  } catch(e) { flash($('#cfgMsg'), '解析失败: '+e.message, false); }
+    const r = await fetch('/api/refresh').then(r => r.json());
+    if (r.ok) { btn.textContent = '✓ 完成，刷新页面'; setTimeout(() => location.reload(), 800); }
+    else { btn.textContent = '✗ ' + (r.hint || r.error || '失败'); setTimeout(() => { btn.disabled = false; btn.textContent = '🔄 立即刷新'; }, 3000); }
+  } catch (err) { btn.textContent = '✗ ' + err.message; btn.disabled = false; }
 };
+</script>
 
-// 危险操作
-$('#clearCache').onclick = async ()=>{
-  if (!confirm('确认清空 KV 节点池？下次 Cron 自动刷新（最长 6 小时后），或点"立即抓取"立刻填充')) return;
-  await fetch('/api/cache/clear',{method:'POST'});
-  alert('已清空');
-  loadStats(); loadNodes();
-};
-
-$('#saveVless') && ($('#saveVless').onclick = async () => {
-  await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({vlessTemplate: $('#vlessTpl').value.trim()})});
-  flash($('#vlessMsg'), '已保存模板，订阅地址立即生效');
-});
-
-(async ()=>{
-  await loadStats();
-  await Promise.all([loadDns(), loadNodes(), loadCfg()]);
-  buildUrl();
-})();
-</script>`);
+</body></html>`);
 }
