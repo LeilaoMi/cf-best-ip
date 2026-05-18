@@ -82,7 +82,13 @@ const SOURCES = [
   { name: "zip.cm.edu.kg/all",          url: "https://zip.cm.edu.kg/all.txt",                 type: "text" },
   // ===== v2.1 cfnb 新增源 =====
   { name: "countrymerge/all",           url: "https://countrymerge.pages.dev/all.txt",        type: "text" },
-  { name: "wtf-359/wtf",                url: "https://wtf-359.pages.dev/wtf.txt",             type: "text" },
+  // wtf-359 已并入 countrymerge，下行保留注释仅作历史记录
+
+  // ===== v2.2 IPDB by 030101.xyz：高质量数据源（@xinyitang3/cfnb 也推荐） =====
+  // bestcf: 优选官方 CF IPv4，30 分钟更新；bestproxy: 优选反代 IP（非 CF）30 分钟更新；proxy-api: 反代 IP 池 10 分钟更新
+  { name: "IPDB/bestcf",       url: "https://ipdb.api.030101.xyz/?type=bestcf",            type: "text" },
+  { name: "IPDB/bestproxy",    url: "https://ipdb.api.030101.xyz/?type=bestproxy",         type: "text" },
+  { name: "IPDB/proxy-api",    url: "https://ipdb.api.030101.xyz/?type=proxy",             type: "text" },
 ];
 
 // 常见 colo → 国家映射（cdn-cgi/trace 也能直接给国家，但缓存一份方便筛选）
@@ -489,7 +495,7 @@ async function fetchSource(src) {
     }
 
     // v2.1：新源用 emoji/中文标签，需要自适应解析
-    const adaptiveSources = new Set(["countrymerge/all", "wtf-359/wtf", "zip.cm.edu.kg/all"]);
+    const adaptiveSources = new Set(["countrymerge/all", "zip.cm.edu.kg/all"]);
     const useAdaptive = adaptiveSources.has(src.name);
 
     for (const raw of body.split(/[\r\n,]+/)) {
