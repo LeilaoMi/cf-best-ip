@@ -1637,7 +1637,7 @@ function renderHome(data, visitor) {
       </tr></thead><tbody>${rows.map(renderRow).join("")}</tbody></table>`
     : `<div class="empty">⏳ 该分类暂无数据，等待下次刷新…</div>`;
 
-  return html(`<!doctype html>
+  return `<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -1828,5 +1828,5 @@ document.getElementById('manualRefresh').onclick = async (e) => {
 };
 </script>
 
-</body></html>`);
+</body></html>`;
 }
