@@ -39,7 +39,7 @@ import { connect } from "cloudflare:sockets";
 // ============================================================
 // 1. 常量 / 数据源 / 字典
 // ============================================================
-const VERSION = "2.5.0";
+const VERSION = "3.0.0";
 
 // ===== v2.3: Cloudflare 公开 IPv4 anycast CIDR (官方 ips-v4) =====
 // 用 IP 段精确判定 cf-native vs cf-proxy,不再依赖 source 元数据
@@ -145,17 +145,13 @@ const SOURCES = [
   { name: "addressesapi/ct",            url: "https://addressesapi.090227.xyz/ct",   type: "carrier", category: "cf-native" },
   { name: "uouin.com/cloudflare",       url: "https://www.uouin.com/cloudflare",     type: "uouin_html", category: "cf-native" },
   { name: "ip.164746.xyz/ipTop",        url: "https://ip.164746.xyz/ipTop10.html",   type: "html", category: "cf-native" },
-  { name: "IPDB/proxy",                 url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/proxy.txt", type: "text", category: "cf-proxy" },
-  { name: "zip.cm.edu.kg/all",          url: "https://zip.cm.edu.kg/all.txt",        type: "text", category: "cf-native" },
   // ===== v2.1 cfnb 新增源 =====
-  { name: "countrymerge/all",           url: "https://countrymerge.pages.dev/all.txt",                       type: "text", category: "cf-native" },
   // wtf-359 已并入 countrymerge，下行保留注释仅作历史记录
 
   // ===== v2.2 IPDB by ymyuuu/030101.xyz：用 GitHub raw 镜像绕开 CF 出站黑名单 =====
   // 030101.xyz 的 API 把 Cloudflare 数据中心 IP 段拉黑了，从 Worker 直接调会 403。
   // 但同作者把数据自动同步到了 github.com/ymyuuu/IPDB 仓库，raw 链路畅通。
   { name: "IPDB/bestcf",                url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/bestcf.txt", type: "text", category: "cf-native" },
-  { name: "IPDB/bestproxy",             url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/BestProxy/bestproxy&country.txt", type: "text", category: "cf-proxy" },
   // 注：IPDB/proxy（上面已配置 proxy.txt）已对应 030101.xyz?type=proxy，不再重复配置
 ];
 
@@ -594,7 +590,6 @@ async function fetchSource(src) {
     const adaptiveSources = new Set([
       "countrymerge/all",
       "zip.cm.edu.kg/all",
-      "IPDB/bestproxy",
     ]);
     const useAdaptive = adaptiveSources.has(src.name);
 
@@ -628,11 +623,9 @@ async function aggregateSources() {
   }
   // 合并去重，按 ip:port 维度
   const uniq = uniqBy(all, x => `${x.ip}:${x.port}:${x.carrier || ""}`);
-  // v2.3: 用 IP 段精确重写 category，不再相信 source 元数据
-  for (const x of uniq) {
-    x.category = isCfNativeIp(x.ip) ? "cf-native" : "cf-proxy";
-  }
-  return { ips: uniq, stats };
+  // v3.0: 严格只保留落在 CF 官方 CIDR 段的 IP,反代 IP 完全丢弃
+  const cfOnly = uniq.filter(x => isCfNativeIp(x.ip));
+  return { ips: cfOnly, stats };
 }
 
 // ============================================================
@@ -778,15 +771,12 @@ async function runFullTest(env, ctx, opts = {}) {
 
   // 3. 过滤：手动添加的要测速通过；池子里的全保留
   let alive = probed.filter(x => x._manual ? (x.delay != null && x.loss < 0.5) : true);
-  // 排序：tested + delay 小的优先；其余按 cf-native > cf-proxy > 来源数量降序
+  // 排序:tested + delay 小的优先,其余按 source 计数降序
   alive.sort((a, b) => {
     if (a.tested && b.tested) return a.delay - b.delay;
     if (a.tested) return -1;
     if (b.tested) return 1;
-    // v2.2: category 优先级，cf-native 在前
-    const aCfNative = a.category === "cf-native" ? 0 : 1;
-    const bCfNative = b.category === "cf-native" ? 0 : 1;
-    if (aCfNative !== bCfNative) return aCfNative - bCfNative;
+
     return (b.sources?.length || 0) - (a.sources?.length || 0);
   });
 
@@ -901,22 +891,21 @@ async function syncAllDns(env, alive) {
   if (cfg.dnsRiskFilterEnabled) {
     pool = await applyRiskFilter(pool, cfg, Math.max(60, topN * 4));
   }
-  // v2.2: 按 category 分池，主域只放 cf-native，新增 proxy. 子域放 cf-proxy
-  const nativePool = pool.filter(x => x.category !== "cf-proxy");
-  const proxyPool = pool.filter(x => x.category === "cf-proxy");
+  // v3.0: 纯 CF 优选,只同步 cf./ct./cu./cm.,并清理历史的 proxy. 记录
   const results = [];
-  // 主域：cf-native
-  results.push(await syncRecord(env, env.CF_RECORD_NAME, nativePool, topN));
-  // 反代子域：cf-proxy
   const root = env.CF_RECORD_NAME.split(".").slice(1).join(".");
-  if (proxyPool.length) {
-    results.push(await syncRecord(env, `proxy.${root}`, proxyPool, topN));
-  }
+  // 主域:全 CF native top N
+  results.push(await syncRecord(env, env.CF_RECORD_NAME, pool, topN));
+  // 显式删除遗留 proxy.* 记录(从 v2.x 升级时清理)
+  try {
+    const stale = await listRecords(env, `proxy.${root}`);
+    for (const r of stale) await deleteRecord(env, r.id);
+    if (stale.length) results.push({ name: `proxy.${root}`, removed: stale.length, ips: [] });
+  } catch {}
   if (env.CF_DNS_BY_CARRIER === "1") {
     const groups = { CT: "ct", CU: "cu", CM: "cm" };
     for (const [carrier, prefix] of Object.entries(groups)) {
-      // 运营商子域只从 cf-native 池筛
-      const subset = nativePool.filter(x => x.carrier === carrier);
+      const subset = pool.filter(x => x.carrier === carrier);
       if (subset.length) results.push(await syncRecord(env, `${prefix}.${root}`, subset, topN));
     }
   }
@@ -1355,7 +1344,7 @@ async function handle(request, env, ctx) {
     }
     const root = env.CF_RECORD_NAME.split(".").slice(1).join(".");
     const main = env.CF_RECORD_NAME;
-    const names = [main, `proxy.${root}`, `ct.${root}`, `cu.${root}`, `cm.${root}`];
+    const names = [main, `ct.${root}`, `cu.${root}`, `cm.${root}`];
     const result = [];
     for (const n of names) {
       try {
@@ -1593,11 +1582,9 @@ function renderHome(data, visitor) {
   const ct = ips.filter(x => x.carrier === "CT").sort(sortFn).slice(0, 30);
   const cu = ips.filter(x => x.carrier === "CU").sort(sortFn).slice(0, 30);
   const cm = ips.filter(x => x.carrier === "CM" || x.carrier === "CMCC").sort(sortFn).slice(0, 30);
-  const proxy = ips.filter(x => x.category === "cf-proxy").sort(sortFn).slice(0, 30);
-  const allNative = ips.filter(x => x.category !== "cf-proxy" && !["CT","CU","CM","CMCC"].includes(x.carrier)).sort(sortFn).slice(0, 30);
+  const allNative = ips.filter(x => !["CT","CU","CM","CMCC"].includes(x.carrier)).sort(sortFn).slice(0, 30);
 
-  const nativeCount = ips.filter(x => x.category !== "cf-proxy").length;
-  const proxyCount = ips.filter(x => x.category === "cf-proxy").length;
+  const nativeCount = ips.length;
 
   const fmtDelay = (x) => x.delay != null ? `${x.delay}ms` : "—";
   const fmtSpeed = (x) => x.mbps != null ? `${x.mbps}M` : "—";
@@ -1629,7 +1616,7 @@ function renderHome(data, visitor) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>CloudFlare 优选 IP · ${visitor.root || ""}</title>
-<meta name="description" content="电信、联通、移动 优质 Cloudflare 节点 IP + 反代 IP 池,真实测速数据,每 6 小时自动刷新">
+<meta name="description" content="电信、联通、移动 优质 Cloudflare 节点 IP,真实测速数据,每 6 小时自动刷新">
 <style>
 :root { --bg:#0a0d12; --card:#11161d; --bd:#1f2630; --fg:#e6edf3; --mut:#8b949e;
   --ct:#3fb950; --cu:#a371f7; --cm:#388bfd; --cf:#f9826c; --pr:#d29922; }
@@ -1707,11 +1694,11 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
 
 <div class="hero">
   <h1>☁️ CloudFlare 优选 IP</h1>
-  <p class="sub">电信、联通、移动 优质 Cloudflare 节点 IP · 反代 IP 池<br>聚合 11 个公开源 · 真实测速数据 · 每 6 小时自动刷新</p>
+  <p class="sub">电信、联通、移动 优质 Cloudflare 节点 IP<br>聚合 14 个公开源 · 全部经 CF 官方 CIDR 段二次校验 · 真实测速数据 · 每 6 小时自动刷新</p>
   <div class="hero-stats">
     <div>总节点 <b>${total}</b></div>
     <div>CF 自家 <b>${nativeCount}</b></div>
-    <div>反代 <b>${proxyCount}</b></div>
+    
     <div>更新于 <b id="upd">${updated}</b></div>
   </div>
 </div>
@@ -1722,7 +1709,7 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
     <div class="tab" data-tab="cu">📶 联通<span class="n">${cu.length}</span></div>
     <div class="tab" data-tab="cm">📲 移动<span class="n">${cm.length}</span></div>
     <div class="tab" data-tab="cf">☁️ 通用<span class="n">${allNative.length}</span></div>
-    <div class="tab" data-tab="proxy">🔄 反代<span class="n">${proxy.length}</span></div>
+    
   </div>
 
   <div class="refresh-bar">
@@ -1734,7 +1721,7 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
   <div id="pane-cu" class="pane" style="display:none">${renderTable(cu)}</div>
   <div id="pane-cm" class="pane" style="display:none">${renderTable(cm)}</div>
   <div id="pane-cf" class="pane" style="display:none">${renderTable(allNative)}</div>
-  <div id="pane-proxy" class="pane" style="display:none">${renderTable(proxy)}</div>
+  
 
   <div class="subs">
     <div class="subcard">
@@ -1753,14 +1740,11 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
       <div class="sublabel"><span>☁️ 主域</span><button class="copybtn" data-copy="cf.${(visitor.root || "你的域名")}">复制域名</button></div>
       <div class="subhost">cf.${(visitor.root || "你的域名")}</div>
     </div>
-    <div class="subcard">
-      <div class="sublabel"><span>🔄 反代</span><button class="copybtn" data-copy="proxy.${(visitor.root || "你的域名")}">复制域名</button></div>
-      <div class="subhost">proxy.${(visitor.root || "你的域名")}</div>
-    </div>
+    
   </div>
 
   <div class="footer">
-    数据源:hostmonit · IPDB · countrymerge · zip.cm.edu.kg · uouin · 164746.xyz<br>
+    数据源:hostmonit · IPDB/bestcf · joname1/BestCFip · KafeMars · 164746.xyz · addressesapi<br>
     <a href="https://github.com/LeilaoMi/cf-best-ip" target="_blank">📦 GitHub</a> · 基于 Cloudflare Workers
   </div>
 </div>
