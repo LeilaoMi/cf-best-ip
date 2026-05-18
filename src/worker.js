@@ -60,6 +60,7 @@ const SOURCES = [
   { name: "uouin.com/cloudflare", url: "https://api.uouin.com/cloudflare.html", type: "uouin_html" },
   { name: "ip.164746.xyz/ipTop",        url: "https://ip.164746.xyz/ipTop.html",              type: "text" },
   { name: "IPDB/proxy",                 url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/proxy.txt", type: "list" },
+  { name: "zip.cm.edu.kg/all",          url: "https://zip.cm.edu.kg/all.txt",                 type: "text" },
 ];
 
 // 常见 colo → 国家映射（cdn-cgi/trace 也能直接给国家，但缓存一份方便筛选）
@@ -170,15 +171,19 @@ function carrierName(c) { return CARRIER_LABEL[c] || c || "通用"; }
 const IP_RE = /\b((?:25[0-5]|2[0-4]\d|[01]?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|[01]?\d?\d)){3})\b/g;
 
 function parseLine(line) {
-  // 接受 "1.2.3.4"、"1.2.3.4:443"、"1.2.3.4#CT"、"1.2.3.4:443#CT-1"
   const m = line.match(/(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?(?:#([\w\-]+))?/);
   if (!m) return null;
   let carrier = null;
+  let country = null;
   if (m[3]) {
     const tag = m[3].toUpperCase().split("-")[0];
-    if (["CT", "CU", "CM", "CMCC", "CF"].includes(tag)) carrier = tag === "CMCC" ? "CM" : tag;
+    if (["CT", "CU", "CM", "CMCC", "CF"].includes(tag)) {
+      carrier = tag === "CMCC" ? "CM" : tag;
+    } else if (/^[A-Z]{2}$/.test(tag)) {
+      country = tag;
+    }
   }
-  return { ip: m[1], port: m[2] ? +m[2] : 443, carrier };
+  return { ip: m[1], port: m[2] ? +m[2] : 443, carrier, country };
 }
 
 // ============================================================
@@ -348,9 +353,12 @@ async function probeBandwidth(ip, bytes, timeoutMs) {
 /** 通过 ip-api.com 批量补全 IP 的地理位置 */
 async function enrichGeo(ips) {
   if (!ips.length) return ips;
+  // 只查询 country 字段缺失的 IP（zip.cm.edu.kg 等源已自带国家代码）
+  const needed = ips.filter(x => !x.country);
+  if (!needed.length) return ips;
   const batchSize = 100;
-  for (let i = 0; i < ips.length; i += batchSize) {
-    const batch = ips.slice(i, i + batchSize);
+  for (let i = 0; i < needed.length; i += batchSize) {
+    const batch = needed.slice(i, i + batchSize);
     try {
       const r = await withTimeout(
         fetch("http://ip-api.com/batch?fields=status,country,countryCode,city,regionName,as,isp,query", {
@@ -796,6 +804,37 @@ async function handle(request, env, ctx) {
   if (path === "/api/clash") {
     if (!checkSubToken(request, env)) return text("Forbidden", { status: 403 });
     return new Response(fmtClash(applyFilter(ips, params, requesterColo)), { headers: { "content-type": "text/yaml; charset=utf-8" } });
+  }
+
+  // ---- 真订阅：V2RayN/Shadowrocket 用的 vless:// 列表（base64） ----
+  if (path === "/sub/vless" || path === "/api/sub/vless") {
+    if (!checkSubToken(request, env)) return text("Forbidden", { status: 403 });
+    const cfg = await getConfig(env);
+    const tpl = cfg.vlessTemplate || "";
+    if (!tpl.startsWith("vless://")) {
+      return text(
+        "尚未配置 vless 节点模板。\n" +
+        "请进入 /admin 在【订阅模板】区域填一条完整的 vless:// URI（含你的 UUID/SNI/path），" +
+        "本接口会用它生成 V2RayN/Sing-box 能直接订阅的 base64 节点列表。",
+        { status: 412 }
+      );
+    }
+    const list = applyFilter(ips, params, requesterColo);
+    // 解析模板：vless://<uuid>@<host>:<port>?<query>#<remark>
+    const tplMatch = tpl.match(/^vless:\/\/([^@]+)@([^:/?#]+)(?::(\d+))?(\?[^#]*)?(?:#(.*))?$/);
+    if (!tplMatch) return text("vless 模板格式错误", { status: 400 });
+    const [, uuid, , tplPort, tplQuery] = tplMatch;
+    const tplPortNum = tplPort ? +tplPort : 443;
+    const lines = list.map((x) => {
+      const port = x.port || tplPortNum;
+      const tag = [carrierName(x.carrier || "CF"), x.country || "", x.ip].filter(Boolean).join("-");
+      return `vless://${uuid}@${x.ip}:${port}${tplQuery || ""}#${encodeURIComponent(tag)}`;
+    });
+    const out = lines.join("\n");
+    const fmt = params.get("format") || "base64";
+    if (fmt === "raw") return text(out);
+    // base64：V2RayN 订阅要求 base64
+    return text(btoa(unescape(encodeURIComponent(out))));
   }
 
   // ---- JSON 列表 ----
@@ -1535,6 +1574,20 @@ function renderAdmin() {
 </div>
 
 <div class="card">
+  <h2>🔑 V2Ray / Sing-box 真订阅模板</h2>
+  <p class="mut" style="font-size:12px;line-height:1.6;margin:0 0 8px">
+    粘贴一条<b>完整的 vless:// 节点 URI</b>（含你 UUID/SNI/path），Worker 会用候选 IP 自动替换 host:port 字段，生成 V2RayN/Sing-box 直接订阅的 base64 节点列表。<br/>
+    示例：<code>vless://uuid@a.example.com:443?type=ws&security=tls&sni=a.example.com&host=a.example.com&path=%2F&encryption=none#sample</code>
+  </p>
+  <textarea id="vlessTpl" rows="3" placeholder="vless://uuid@host:443?type=ws&security=tls&sni=..." style="width:100%;font-family:monospace;font-size:11px"></textarea>
+  <div class="row" style="margin-top:8px"><button class="btn sm" id="saveVless">保存模板</button><span class="mut" id="vlessMsg" style="font-size:11px"></span></div>
+  <div class="mut" style="margin-top:10px;font-size:12px">
+    订阅地址（粘到 V2RayN / Sing-box / Shadowrocket）：<br/>
+    <code id="vlessSubUrl"></code>
+  </div>
+</div>
+
+<div class="card">
   <h2>⚙️ 配置</h2>
   <div class="row" style="flex-direction:column;align-items:stretch;gap:8px">
     <label class="row" style="gap:8px;align-items:center"><span style="width:140px;font-size:13px">每次返回数量 topN</span><input id="cTopN" type="number" min="1" max="200" style="width:100px"/></label>
@@ -1722,6 +1775,8 @@ async function loadCfg(){
   $('#cBlock').value = (c.countryBlocklist||[]).join(',');
   $('#cPorts').value = (c.ports||[443]).join(',');
   $('#cfgEdit').value = JSON.stringify(c, null, 2);
+  if ($('#vlessTpl')) $('#vlessTpl').value = c.vlessTemplate || '';
+  if ($('#vlessSubUrl')) $('#vlessSubUrl').textContent = location.origin + '/sub/vless?top=30';
 }
 $('#saveCfg').onclick = async ()=>{
   const body = {
@@ -1749,6 +1804,11 @@ $('#clearCache').onclick = async ()=>{
   alert('已清空');
   loadStats(); loadNodes();
 };
+
+$('#saveVless') && ($('#saveVless').onclick = async () => {
+  await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({vlessTemplate: $('#vlessTpl').value.trim()})});
+  flash($('#vlessMsg'), '已保存模板，订阅地址立即生效');
+});
 
 (async ()=>{
   await loadStats();
