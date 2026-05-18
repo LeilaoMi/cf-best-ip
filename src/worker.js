@@ -719,11 +719,33 @@ async function handle(request, env, ctx) {
   // ---- 管理：DNS 手动同步 ----
   if (path === "/api/dns/sync") {
     if (!checkAdmin(request, env)) return unauthorized();
-    if (!env.CF_API_TOKEN || !env.CF_ZONE_ID || !env.CF_RECORD_NAME) {
-      return json({ ok: false, error: "CF_API_TOKEN/CF_ZONE_ID/CF_RECORD_NAME 未配置" }, { status: 400 });
-    }
+    const data = await getLatest(env);
+    const ips = data.ips || [];
     const result = await syncAllDns(env, ips);
     return json({ ok: true, result });
+  }
+  if (path === "/api/dns/current") {
+    if (!env.CF_API_TOKEN || !env.CF_ZONE_ID || !env.CF_RECORD_NAME) {
+      return json({ ok: false, error: "DNS sync not configured" });
+    }
+    const root = env.CF_RECORD_NAME.split(".").slice(1).join(".");
+    const main = env.CF_RECORD_NAME;
+    const names = [main, `ct.${root}`, `cu.${root}`, `cm.${root}`];
+    const result = [];
+    for (const n of names) {
+      try {
+        const recs = await listRecords(env, n);
+        result.push({ name: n, records: recs.map(r => r.content) });
+      } catch (e) {
+        result.push({ name: n, records: [], error: String(e).slice(0, 80) });
+      }
+    }
+    return json({ ok: true, dns: result });
+  }
+  if (path === "/api/cache/clear" && request.method === "POST") {
+    if (!checkAdmin(request, env)) return unauthorized();
+    await kvSet(env, "ips:latest", { ips: [], sourceStats: [], updatedAt: 0 });
+    return json({ ok: true });
   }
 
   // ---- 管理：配置读写 ----
@@ -1116,36 +1138,294 @@ load();
 
 function renderAdmin() {
   return layout("管理 · cf-best-ip", `
-<div class="card"><h2>操作</h2>
+<div class="card" id="kpi">
+  <div class="kpis">
+    <div class="kpi"><div class="kpi-label">节点池</div><div class="kpi-value" id="kTotal">—</div></div>
+    <div class="kpi"><div class="kpi-label">最后更新</div><div class="kpi-value" id="kUpdated" style="font-size:14px">—</div></div>
+    <div class="kpi"><div class="kpi-label">下次 Cron</div><div class="kpi-value" id="kCron" style="font-size:14px">—</div></div>
+    <div class="kpi"><div class="kpi-label">数据源</div><div class="kpi-value" id="kSrc">—</div></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>📊 运营商分布</h2>
+  <div id="bars" class="mut" style="font-size:12px">加载中…</div>
+</div>
+
+<div class="card">
+  <div class="row" style="justify-content:space-between"><h2 style="margin:0">📡 DNS 实时状态</h2>
+    <div class="row" style="gap:6px">
+      <button class="btn sm" id="syncdns">同步 DNS</button>
+      <button class="btn sm ghost" id="reloadDns">刷新</button>
+    </div></div>
+  <div id="dnsList" class="mut" style="font-size:12px;margin-top:10px">加载中…</div>
+  <span class="mut" id="dnsMsg" style="font-size:11px"></span>
+</div>
+
+<div class="card">
+  <div class="row" style="justify-content:space-between"><h2 style="margin:0">📥 数据源健康</h2>
+    <button class="btn sm ghost" id="refreshNow">立即抓取并测速</button></div>
+  <div id="srcList" style="font-size:12px;margin-top:10px">加载中…</div>
+  <span class="mut" id="refreshMsg" style="font-size:11px"></span>
+</div>
+
+<div class="card">
+  <h2>🔗 订阅链接生成器</h2>
   <div class="row">
-    <button class="btn" id="refresh">🔄 立即测速</button>
-    <button class="btn ghost" id="syncdns">📡 同步 DNS</button>
-    <span class="mut" id="msg"></span>
-  </div></div>
+    <select id="gCarrier"><option value="">全部运营商</option><option value="CT">电信</option><option value="CU">联通</option><option value="CM">移动</option><option value="CF">通用</option></select>
+    <select id="gCountry"><option value="">全部国家</option></select>
+    <select id="gTop"><option>5</option><option>10</option><option selected>20</option><option>50</option><option>100</option></select>
+    <select id="gFmt"><option value="/sub">纯文本</option><option value="/api/v2ray">V2Ray base64</option><option value="/api/clash">Clash YAML</option><option value="/api/preferred-ips">EdgeTunnel</option><option value="/api/ips">JSON</option></select>
+    <label class="row" style="gap:4px;font-size:12px"><input type="checkbox" id="gSmart"/> 智能就近</label>
+  </div>
+  <div style="margin-top:10px;padding:10px;background:#0a0d12;border:1px solid var(--bd);border-radius:6px;font-family:monospace;font-size:12px;word-break:break-all" id="genUrl">—</div>
+  <div class="row" style="margin-top:8px">
+    <button class="btn sm" id="copyUrl">复制</button>
+    <button class="btn sm ghost" id="testUrl">在新标签打开</button>
+    <span class="mut" id="genMsg" style="font-size:11px"></span>
+  </div>
+</div>
 
-<div class="card"><h2>手动添加 IP</h2>
-  <textarea id="manual" rows="4" style="width:100%" placeholder="一行一个，支持 1.2.3.4 / 1.2.3.4:443 / 1.2.3.4:443#CT"></textarea>
-  <div class="row" style="margin-top:8px"><button class="btn" id="add">添加</button><button class="btn ghost" id="loadm">查看已添加</button></div>
-  <pre id="manualList" class="mut" style="font-size:11px;max-height:160px;overflow:auto"></pre></div>
+<div class="card">
+  <h2>📋 节点列表</h2>
+  <div class="row" style="gap:8px;margin-bottom:10px">
+    <input id="nSearch" placeholder="搜 IP / 端口 / 国家 / 来源…" style="flex:1;min-width:180px"/>
+    <select id="nCarrier"><option value="">全部</option><option value="CT">电信</option><option value="CU">联通</option><option value="CM">移动</option><option value="CF">通用</option></select>
+    <select id="nLimit"><option>20</option><option selected>50</option><option>100</option><option>500</option></select>
+  </div>
+  <div id="nodeTable" style="font-size:12px;max-height:520px;overflow:auto">加载中…</div>
+</div>
 
-<div class="card"><h2>CIDR 扫描（≤ 64 IP）</h2>
-  <div class="row"><input id="cidr" placeholder="173.245.48.0/26" style="width:240px"/><input id="cport" value="443" style="width:80px"/><button class="btn" id="scan">扫描</button></div>
-  <pre id="scanRes" class="mut" style="font-size:12px;max-height:240px;overflow:auto"></pre></div>
+<div class="card">
+  <h2>➕ 手动添加 IP / CIDR 扫描</h2>
+  <textarea id="manual" rows="3" style="width:100%" placeholder="一行一个，支持 1.2.3.4 / 1.2.3.4:443 / 1.2.3.4:443#CT"></textarea>
+  <div class="row" style="margin-top:8px"><button class="btn sm" id="add">添加</button><button class="btn sm ghost" id="loadm">查看已添加</button></div>
+  <pre id="manualList" class="mut" style="font-size:11px;max-height:120px;overflow:auto;margin-top:8px"></pre>
+  <hr style="border:0;border-top:1px solid var(--bd);margin:14px 0"/>
+  <div class="row"><input id="cidr" placeholder="173.245.48.0/26" style="flex:1;min-width:160px"/><input id="cport" value="443" style="width:80px"/><button class="btn sm" id="scan">扫描</button></div>
+  <pre id="scanRes" class="mut" style="font-size:12px;max-height:160px;overflow:auto;margin-top:8px"></pre>
+</div>
 
-<div class="card"><h2>配置</h2>
-  <div id="cfg" class="mut" style="font-size:12px">加载中…</div>
-  <textarea id="cfgEdit" rows="6" style="width:100%;margin-top:8px"></textarea>
-  <button class="btn" id="saveCfg" style="margin-top:8px">保存配置</button></div>
+<div class="card">
+  <h2>⚙️ 配置</h2>
+  <div class="row" style="flex-direction:column;align-items:stretch;gap:8px">
+    <label class="row" style="gap:8px;align-items:center"><span style="width:140px;font-size:13px">每次返回数量 topN</span><input id="cTopN" type="number" min="1" max="200" style="width:100px"/></label>
+    <label class="row" style="gap:8px;align-items:center"><span style="width:140px;font-size:13px">自动刷新间隔（小时）</span><input id="cRefresh" type="number" min="1" max="48" style="width:100px"/></label>
+    <label class="row" style="gap:8px;align-items:center"><span style="width:140px;font-size:13px">屏蔽国家 (逗号)</span><input id="cBlock" placeholder="CN,IR" style="flex:1;min-width:120px"/></label>
+    <label class="row" style="gap:8px;align-items:center"><span style="width:140px;font-size:13px">端口列表 (逗号)</span><input id="cPorts" placeholder="443,2053" style="flex:1;min-width:120px"/></label>
+  </div>
+  <div class="row" style="margin-top:10px"><button class="btn sm" id="saveCfg">保存配置</button><span class="mut" id="cfgMsg" style="font-size:11px"></span></div>
+  <details style="margin-top:12px"><summary class="mut" style="font-size:11px;cursor:pointer">高级：JSON 编辑器</summary>
+    <textarea id="cfgEdit" rows="6" style="width:100%;margin-top:8px;font-family:monospace;font-size:11px"></textarea>
+    <button class="btn sm ghost" id="saveCfgRaw" style="margin-top:8px">保存原始 JSON</button>
+  </details>
+</div>
+
+<div class="card" style="border-color:#5a2a2a">
+  <details>
+    <summary style="cursor:pointer;color:#f85149">⚠️ 危险操作</summary>
+    <div style="margin-top:10px">
+      <button class="btn sm" id="clearCache" style="background:#3a1212;border:1px solid #5a2a2a;color:#f85149">清空 KV 缓存（节点池清零，下次 Cron 重新填）</button>
+    </div>
+  </details>
+</div>
+
+<style>
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}
+.kpi{padding:10px 12px;background:#0a0d12;border:1px solid var(--bd);border-radius:8px}
+.kpi-label{font-size:11px;color:var(--mut);margin-bottom:4px}
+.kpi-value{font-size:22px;font-weight:600;color:var(--fg)}
+.bar-row{display:grid;grid-template-columns:60px 1fr 50px;gap:10px;align-items:center;margin:4px 0}
+.bar-bg{height:14px;background:#0a0d12;border:1px solid var(--bd);border-radius:7px;overflow:hidden}
+.bar-fill{height:100%;border-radius:7px;transition:width .3s}
+.dns-block{padding:10px;background:#0a0d12;border:1px solid var(--bd);border-radius:6px;margin-bottom:8px}
+.dns-name{display:flex;justify-content:space-between;align-items:center}
+.dns-ips{font-family:monospace;font-size:11px;color:var(--mut);margin-top:6px;line-height:1.6;word-break:break-all}
+.src-row{display:grid;grid-template-columns:1fr 50px;gap:6px;padding:6px 8px;border-bottom:1px solid #1a1f26;align-items:center}
+.src-row:last-child{border-bottom:0}
+.src-bad{color:#f85149}
+.src-ok{color:var(--ok,#7ee787)}
+.ntbl{width:100%;border-collapse:collapse;font-size:11px}
+.ntbl th,.ntbl td{padding:5px 6px;text-align:left;border-bottom:1px solid #1a1f26}
+.ntbl th{background:#0a0d12;font-weight:500;color:var(--mut);position:sticky;top:0}
+.ntbl td.ip{font-family:monospace}
+</style>
 
 <script>
-const $=s=>document.querySelector(s);
-function msg(t){$('#msg').textContent=t;setTimeout(()=>$('#msg').textContent='',4000)}
-$('#refresh').onclick=async()=>{$('#refresh').disabled=true;msg('测速中…可能需 30~60 秒');const r=await fetch('/api/refresh').then(r=>r.json());msg('完成：'+r.count+' 节点，耗时 '+r.elapsedMs+'ms');$('#refresh').disabled=false};
-$('#syncdns').onclick=async()=>{const r=await fetch('/api/dns/sync').then(r=>r.json());msg(JSON.stringify(r))};
-$('#add').onclick=async()=>{const r=await fetch('/api/manual',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lines:$('#manual').value})}).then(r=>r.json());msg('已添加，当前 '+r.count);$('#manual').value=''};
-$('#loadm').onclick=async()=>{const r=await fetch('/api/manual').then(r=>r.json());$('#manualList').textContent=JSON.stringify(r,null,2)};
-$('#scan').onclick=async()=>{const r=await fetch('/api/cidr-scan',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({cidr:$('#cidr').value,port:+$('#cport').value})}).then(r=>r.json());$('#scanRes').textContent=JSON.stringify(r.ips,null,2)};
-(async()=>{const c=await fetch('/api/config').then(r=>r.json());$('#cfg').textContent='当前配置：';$('#cfgEdit').value=JSON.stringify(c,null,2)})();
-$('#saveCfg').onclick=async()=>{const body=JSON.parse($('#cfgEdit').value);const r=await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());msg('已保存')};
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+
+const CARRIER_LABEL = {CT:'电信',CU:'联通',CM:'移动',CMCC:'移动',CF:'通用'};
+const CARRIER_COLOR = {CT:'#7ee787',CU:'#a78bfa',CM:'#79b8ff',CMCC:'#79b8ff',CF:'#f9826c'};
+const FLAGS = {HK:'🇭🇰',JP:'🇯🇵',KR:'🇰🇷',TW:'🇹🇼',SG:'🇸🇬',US:'🇺🇸',CA:'🇨🇦',GB:'🇬🇧',DE:'🇩🇪',FR:'🇫🇷',NL:'🇳🇱',AU:'🇦🇺',RU:'🇷🇺',IN:'🇮🇳',CN:'🇨🇳'};
+
+function flash(el, msg, ok=true){el.textContent=msg;el.style.color=ok?'var(--ok,#7ee787)':'#f85149';setTimeout(()=>{el.textContent='';el.style.color=''},4000)}
+
+async function loadStats(){
+  const s = await fetch('/api/stats').then(r=>r.json());
+  $('#kTotal').textContent = s.total;
+  $('#kUpdated').textContent = s.updatedAt ? new Date(s.updatedAt).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}).slice(5) : '—';
+  // 下次 Cron：每 6 小时整 (0,6,12,18 UTC)
+  const now = new Date();
+  const utcH = now.getUTCHours();
+  const nextH = Math.ceil((utcH+0.001)/6)*6 % 24;
+  const next = new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate()+(nextH===0&&utcH>=18?1:0), nextH, 0, 0));
+  const mins = Math.round((next - now)/60000);
+  $('#kCron').textContent = (mins>60?Math.floor(mins/60)+'h':'')+(mins%60)+'m 后';
+  const okCount = (s.sourceStats||[]).filter(x=>!x.error && x.count>0).length;
+  const totalSrc = (s.sourceStats||[]).length;
+  $('#kSrc').textContent = okCount+'/'+totalSrc;
+  // 运营商分布
+  const carriers = ['CT','CU','CM','CF'];
+  const max = Math.max(...carriers.map(c=>(s.byCarrier.find(x=>x.key===c)||{count:0}).count), 1);
+  $('#bars').innerHTML = carriers.map(c=>{
+    const n = (s.byCarrier.find(x=>x.key===c)||{count:0}).count;
+    const w = Math.max(2, Math.round(n/max*100));
+    return '<div class="bar-row"><span>'+CARRIER_LABEL[c]+'</span><div class="bar-bg"><div class="bar-fill" style="width:'+w+'%;background:'+CARRIER_COLOR[c]+'"></div></div><b>'+n+'</b></div>';
+  }).join('');
+  // 数据源健康
+  $('#srcList').innerHTML = (s.sourceStats||[]).map(x=>{
+    const cls = (x.error || !x.count) ? 'src-bad' : 'src-ok';
+    const sign = (x.error || !x.count) ? '✗' : '✓';
+    return '<div class="src-row"><div><span class="'+cls+'">'+sign+'</span> '+x.name+(x.error?' <span class="mut" style="font-size:10px">('+x.error+')</span>':'')+'</div><b>'+(x.count||0)+'</b></div>';
+  }).join('') || '<div class="mut">无数据</div>';
+  // 填充国家下拉
+  const cs = (s.byCountry||[]).filter(x=>x.key && x.key!=='?');
+  $('#gCountry').innerHTML = '<option value="">全部国家</option>' + cs.map(c=>'<option value="'+c.key+'">'+(FLAGS[c.key]||'🌐')+' '+c.key+' ('+c.count+')</option>').join('');
+  return s;
+}
+
+async function loadDns(){
+  const r = await fetch('/api/dns/current').then(r=>r.json());
+  if (!r.ok) { $('#dnsList').innerHTML = '<span class="mut">DNS 未配置：需要在环境变量里设置 CF_API_TOKEN / CF_ZONE_ID / CF_RECORD_NAME</span>'; return; }
+  $('#dnsList').innerHTML = (r.dns||[]).map(d=>{
+    const records = d.records && d.records.length ? d.records : (d.error ? ['<span class="src-bad">'+d.error+'</span>'] : ['<span class="mut">尚无记录</span>']);
+    return '<details class="dns-block"><summary class="dns-name"><b>'+d.name+'</b><span class="mut">'+(d.records||[]).length+' 条 A 记录</span></summary><div class="dns-ips">'+records.join(' · ')+'</div></details>';
+  }).join('') || '<span class="mut">无</span>';
+}
+
+async function loadNodes(){
+  const lim = $('#nLimit').value || 50;
+  const r = await fetch('/api/ips?top='+lim).then(r=>r.json());
+  const q = ($('#nSearch').value||'').toLowerCase();
+  const carrier = $('#nCarrier').value;
+  let list = r.ips || [];
+  if (carrier) list = list.filter(x=>(x.carrier||'CF')===carrier);
+  if (q) list = list.filter(x=>JSON.stringify(x).toLowerCase().includes(q));
+  if (!list.length) { $('#nodeTable').innerHTML = '<div class="mut" style="padding:14px;text-align:center">无匹配</div>'; return; }
+  $('#nodeTable').innerHTML =
+    '<table class="ntbl"><thead><tr><th>#</th><th>IP</th><th>端口</th><th>运营商</th><th>国家</th><th>来源</th><th></th></tr></thead><tbody>' +
+    list.map((x,i)=>{
+      const isManual = (x.sources||[]).includes('manual');
+      return '<tr><td>'+(i+1)+'</td><td class="ip">'+x.ip+'</td><td>'+x.port+'</td><td>'+CARRIER_LABEL[x.carrier||'CF']+'</td><td>'+(FLAGS[x.country]||'🌐')+' '+(x.country||'-')+'</td><td>'+((x.sources||[]).length||0)+'</td><td>'+
+        (isManual?'<button class="copybtn" data-del="'+x.ip+'">删</button>':'')+
+        '</td></tr>';
+    }).join('') + '</tbody></table>';
+  $$('[data-del]').forEach(b=>b.onclick=async()=>{
+    if(!confirm('删除手动添加的 '+b.dataset.del+'?')) return;
+    await fetch('/api/manual?ip='+encodeURIComponent(b.dataset.del),{method:'DELETE'});
+    loadNodes();
+  });
+}
+
+function buildUrl(){
+  const path = $('#gFmt').value;
+  const p = new URLSearchParams();
+  if ($('#gCarrier').value) p.set('carrier', $('#gCarrier').value);
+  if ($('#gCountry').value) p.set('country', $('#gCountry').value);
+  if ($('#gTop').value) p.set('top', $('#gTop').value);
+  if ($('#gSmart').checked) p.set('smart', '1');
+  const url = location.origin + path + (p.toString()?'?'+p.toString():'');
+  $('#genUrl').textContent = url;
+}
+
+['gCarrier','gCountry','gTop','gFmt','gSmart'].forEach(id=>$('#'+id).addEventListener('change', buildUrl));
+
+$('#copyUrl').onclick = async ()=>{
+  const u = $('#genUrl').textContent;
+  try { await navigator.clipboard.writeText(u); flash($('#genMsg'),'已复制'); }
+  catch(e){ prompt('复制此链接', u); }
+};
+$('#testUrl').onclick = ()=> window.open($('#genUrl').textContent, '_blank');
+
+$('#syncdns').onclick = async ()=>{
+  $('#syncdns').disabled = true;
+  flash($('#dnsMsg'), '同步中…');
+  const r = await fetch('/api/dns/sync').then(r=>r.json()).catch(e=>({error:e}));
+  flash($('#dnsMsg'), r.ok?'同步完成':'失败: '+JSON.stringify(r), r.ok);
+  $('#syncdns').disabled = false;
+  await loadDns();
+};
+$('#reloadDns').onclick = loadDns;
+
+$('#refreshNow').onclick = async ()=>{
+  $('#refreshNow').disabled = true;
+  flash($('#refreshMsg'), '抓取测速中…可能需 20-40 秒');
+  const r = await fetch('/api/refresh').then(r=>r.json());
+  flash($('#refreshMsg'), r.ok ? ('完成：'+r.count+' 节点 · '+r.elapsedMs+'ms') : ('失败: '+(r.error||'unknown')), r.ok);
+  $('#refreshNow').disabled = false;
+  await Promise.all([loadStats(), loadNodes()]);
+};
+
+['nSearch','nCarrier','nLimit'].forEach(id=>$('#'+id).addEventListener('input', loadNodes));
+
+$('#add').onclick = async ()=>{
+  const r = await fetch('/api/manual',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({lines:$('#manual').value})}).then(r=>r.json());
+  alert('已添加，当前手动节点 '+r.count);
+  $('#manual').value=''; loadNodes();
+};
+$('#loadm').onclick = async ()=>{
+  const r = await fetch('/api/manual').then(r=>r.json());
+  $('#manualList').textContent = JSON.stringify(r, null, 2);
+};
+$('#scan').onclick = async ()=>{
+  $('#scan').disabled = true;
+  $('#scanRes').textContent = '扫描中…';
+  const r = await fetch('/api/cidr-scan',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({cidr:$('#cidr').value,port:+$('#cport').value})}).then(r=>r.json());
+  $('#scanRes').textContent = JSON.stringify(r.ips, null, 2);
+  $('#scan').disabled = false;
+};
+
+// 配置面板
+async function loadCfg(){
+  const c = await fetch('/api/config').then(r=>r.json());
+  $('#cTopN').value = c.topN ?? 30;
+  $('#cRefresh').value = c.refreshHours ?? 6;
+  $('#cBlock').value = (c.countryBlocklist||[]).join(',');
+  $('#cPorts').value = (c.ports||[443]).join(',');
+  $('#cfgEdit').value = JSON.stringify(c, null, 2);
+}
+$('#saveCfg').onclick = async ()=>{
+  const body = {
+    topN: +$('#cTopN').value || 30,
+    refreshHours: +$('#cRefresh').value || 6,
+    countryBlocklist: $('#cBlock').value.split(',').map(s=>s.trim()).filter(Boolean),
+    ports: $('#cPorts').value.split(',').map(s=>+s.trim()).filter(Boolean),
+  };
+  await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+  flash($('#cfgMsg'), '已保存');
+};
+$('#saveCfgRaw').onclick = async ()=>{
+  try {
+    const body = JSON.parse($('#cfgEdit').value);
+    await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+    flash($('#cfgMsg'), '已保存 JSON');
+    loadCfg();
+  } catch(e) { flash($('#cfgMsg'), '解析失败: '+e.message, false); }
+};
+
+// 危险操作
+$('#clearCache').onclick = async ()=>{
+  if (!confirm('确认清空 KV 节点池？下次 Cron 自动刷新（最长 6 小时后），或点"立即抓取"立刻填充')) return;
+  await fetch('/api/cache/clear',{method:'POST'});
+  alert('已清空');
+  loadStats(); loadNodes();
+};
+
+(async ()=>{
+  await loadStats();
+  await Promise.all([loadDns(), loadNodes(), loadCfg()]);
+  buildUrl();
+})();
 </script>`);
 }
