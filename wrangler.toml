@@ -8,7 +8,7 @@ compatibility_flags = ["nodejs_compat"]
 #   npx wrangler kv namespace create KV
 [[kv_namespaces]]
 binding = "KV"
-id = "REPLACE_WITH_YOUR_KV_ID"
+id = "23c38685383d4d3f8a1391487482e0a9"
 
 # Cron Trigger：每 6 小时自动测速 + 同步 DNS
 [triggers]
@@ -17,8 +17,8 @@ crons = ["0 */6 * * *"]
 # 非敏感变量（敏感的用 wrangler secret put）
 [vars]
 # 自动 DNS 同步 —— 留空则不启用
-CF_ZONE_ID        = ""    # 域名所在 Zone ID（CF 域名概览右栏复制）
-CF_RECORD_NAME    = ""    # 例如 cf.example.com
+CF_ZONE_ID        = "9aaafd1409adada280a4a6138cad50e4"    # 域名所在 Zone ID（CF 域名概览右栏复制）
+CF_RECORD_NAME    = "cfip.leilaomi.cc.cd"    # 例如 cf.example.com
 CF_DNS_BY_CARRIER = "0"   # "1" 启用按运营商分别同步 (ct./cu./cm.)
 DNS_TOP_N         = "10"
 
