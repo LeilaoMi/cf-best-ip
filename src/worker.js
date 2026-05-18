@@ -95,15 +95,23 @@ const CN_ASN_TO_CARRIER = {
 /** 从 request.cf 抽访问者信息 + 猜运营商 */
 function getVisitor(request) {
   const cf = request.cf || {};
-  const asn = Number(cf.asn) || null;
+  const asn = cf.asn || null;
+  const asOrg = cf.asOrganization || "";
+  let carrier = CN_ASN_TO_CARRIER[asn] || null;
+  if (!carrier && asOrg) {
+    const o = asOrg.toLowerCase();
+    if (o.includes("unicom") || o.includes("cnc") || o.includes("cncgroup")) carrier = "CU";
+    else if (o.includes("china telecom") || o.includes("chinanet")) carrier = "CT";
+    else if (o.includes("china mobile") || o.includes("cmcc") || o.includes("cmnet")) carrier = "CM";
+  }
   return {
     country: cf.country || null,
-    region: cf.regionCode || cf.region || null,
+    region: cf.regionCode || null,
     city: cf.city || null,
-    colo: cf.colo || null,
     asn,
-    asOrg: cf.asOrganization || null,
-    carrier: asn ? (CN_ASN_TO_CARRIER[asn] || null) : null,
+    asOrg: asOrg || null,
+    colo: cf.colo || null,
+    carrier,
   };
 }
 
@@ -442,6 +450,7 @@ async function runFullTest(env, ctx, opts = {}) {
   // 8. DNS 同步（后台执行）
   if (env.CF_API_TOKEN && env.CF_ZONE_ID && env.CF_RECORD_NAME) {
     ctx.waitUntil(syncAllDns(env, alive).catch(() => {}));
+    ctx.waitUntil(syncProbeSlots(env, alive).catch(() => {}));
   }
   // 9. Webhook
   ctx.waitUntil(notify(env, payload).catch(() => {}));
@@ -495,17 +504,146 @@ async function syncAllDns(env, alive) {
 }
 
 // ============================================================
+// 7b. 探针子域池 —— 让任意访问者在自己网络下测真实 IP 延迟
+// ============================================================
+function pickDiverse(ips, n) {
+  const buckets = { CT: [], CU: [], CM: [], CF: [] };
+  for (const ip of ips) {
+    const k = (ip.carrier === "CMCC" ? "CM" : ip.carrier) || "CF";
+    if (!buckets[k]) buckets[k] = [];
+    buckets[k].push(ip);
+  }
+  for (const k of Object.keys(buckets)) {
+    buckets[k].sort((a, b) => (b.sources?.length || 0) - (a.sources?.length || 0));
+  }
+  // 三网每个先来 8 个，剩下从 CF 桶补
+  const out = [];
+  for (const k of ["CT", "CU", "CM"]) {
+    for (let i = 0; i < 8 && buckets[k].length; i++) out.push(buckets[k].shift());
+  }
+  while (out.length < n) {
+    let added = false;
+    for (const k of ["CF", "CT", "CU", "CM"]) {
+      if (out.length >= n) break;
+      if (buckets[k] && buckets[k].length) { out.push(buckets[k].shift()); added = true; }
+    }
+    if (!added) break;
+  }
+  return out.slice(0, n);
+}
+
+async function syncProbeSlots(env, ips, slotCount = 50, prefix = "p") {
+  if (!env.CF_API_TOKEN || !env.CF_ZONE_ID) return { ok: false, reason: "no CF_API_TOKEN/CF_ZONE_ID" };
+  const zone = env.CF_ZONE_ID;
+  const rec = env.CF_RECORD_NAME || "";
+  const root = rec.includes(".") ? rec.split(".").slice(1).join(".") : rec;
+  if (!root) return { ok: false, reason: "cannot derive root from CF_RECORD_NAME" };
+
+  // 1. 先构建 slots 数组并保存到 KV（不依赖 DNS 状态，前端立刻可用）
+  const top = pickDiverse(ips, slotCount);
+  const slots = top.map((t, i) => {
+    const slot = prefix + String(i + 1).padStart(2, "0");
+    return {
+      slot,
+      host: `${slot}.${root}`,
+      ip: t.ip,
+      port: t.port || 443,
+      carrier: t.carrier || "CF",
+      country: t.country || null,
+      countryName: t.countryName || null,
+      city: t.city || null,
+    };
+  });
+  await kvSet(env, "slots:current", { slots, root, prefix, updatedAt: Date.now() });
+
+  // 2. DNS 操作 best-effort（任何子操作失败都不影响 KV 已保存的 slots）
+  const tok = env.CF_API_TOKEN;
+  const auth = { Authorization: `Bearer ${tok}` };
+  let created = 0, updated = 0, deleted = 0;
+  const errors = [];
+
+  try {
+    const listResp = await fetch(`https://api.cloudflare.com/client/v4/zones/${zone}/dns_records?type=A&per_page=500`, { headers: auth });
+    const listData = await listResp.json();
+    const reName = new RegExp(`^${prefix}\\d+\\.${root.replace(/\./g, "\\.")}$`);
+    const curByName = {};
+    for (const r of (listData.result || [])) {
+      if (reName.test(r.name)) curByName[r.name] = r;
+    }
+
+    for (const s of slots) {
+      const existing = curByName[s.host];
+      try {
+        if (existing) {
+          if (existing.content !== s.ip) {
+            await fetch(`https://api.cloudflare.com/client/v4/zones/${zone}/dns_records/${existing.id}`, {
+              method: "PUT",
+              headers: { ...auth, "content-type": "application/json" },
+              body: JSON.stringify({ type: "A", name: s.host, content: s.ip, ttl: 60, proxied: false }),
+            });
+            updated++;
+          }
+          delete curByName[s.host];
+        } else {
+          await fetch(`https://api.cloudflare.com/client/v4/zones/${zone}/dns_records`, {
+            method: "POST",
+            headers: { ...auth, "content-type": "application/json" },
+            body: JSON.stringify({ type: "A", name: s.host, content: s.ip, ttl: 60, proxied: false }),
+          });
+          created++;
+        }
+      } catch (e) {
+        errors.push(`${s.host}: ${e.message || e}`);
+      }
+    }
+
+    // 删除剩余多余的
+    for (const name in curByName) {
+      try {
+        await fetch(`https://api.cloudflare.com/client/v4/zones/${zone}/dns_records/${curByName[name].id}`, {
+          method: "DELETE", headers: auth,
+        });
+        deleted++;
+      } catch (e) {
+        errors.push(`del ${name}: ${e.message || e}`);
+      }
+    }
+  } catch (e) {
+    errors.push(`list: ${e.message || e}`);
+  }
+
+  return { ok: true, total: slots.length, created, updated, deleted, errors };
+}
+
+// ============================================================
 // 8. Webhook 通知
 // ============================================================
 async function notify(env, payload) {
-  const top5 = (payload.ips || []).slice(0, 5);
+  if (!env.TELEGRAM_BOT_TOKEN && !env.DISCORD_WEBHOOK) return;
+  const ips = payload.ips || [];
+  const total = ips.length;
+  // 按运营商分布
+  const byCarrier = {};
+  for (const x of ips) { const k = x.carrier || "CF"; byCarrier[k] = (byCarrier[k] || 0) + 1; }
+  // 国家 top 5
+  const byCountry = {};
+  for (const x of ips) { if (x.country) byCountry[x.country] = (byCountry[x.country] || 0) + 1; }
+  const topCountries = Object.entries(byCountry).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  // 槽位数
+  const slots = await kvGet(env, "slots:current", { slots: [] });
+  const slotCount = slots.slots?.length || 0;
+  // 域名
+  const root = env.CF_RECORD_NAME ? env.CF_RECORD_NAME.split(".").slice(1).join(".") : "";
+  const homeUrl = root ? `https://cfip.${root}/` : "";
   const lines = [
     `🚀 *cf-best-ip 测速完成*`,
-    `更新时间: ${new Date(payload.updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}`,
-    `可用节点: ${payload.ips.length}`,
-    `Top 5:`,
-    ...top5.map((x, i) => `${i + 1}. \`${x.ip}\` ${flag(x.country)} ${x.colo || ""} ${x.delay}ms${x.mbps ? ` ${x.mbps}Mbps` : ""}`),
-  ];
+    `时间: ${new Date(payload.updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}`,
+    `节点池: *${total}* 个`,
+    `运营商: 电信 ${byCarrier.CT || 0} · 联通 ${byCarrier.CU || 0} · 移动 ${byCarrier.CM || 0} · 通用 ${byCarrier.CF || 0}`,
+    `国家 Top: ${topCountries.map(([c, n]) => `${flag(c)}${c}×${n}`).join(" ")}`,
+    `探针槽位: *${slotCount}* (${root ? `p01-p${String(slotCount).padStart(2, "0")}.${root}` : "未配置"})`,
+    homeUrl ? `🌐 ${homeUrl}test` : "",
+  ].filter(Boolean);
   const md = lines.join("\n");
   if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID) {
     await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -633,6 +771,9 @@ async function handle(request, env, ctx) {
   const ips = data.ips || [];
   const requesterColo = request.cf?.colo;
   const visitor = getVisitor(request);
+  if (env.CF_RECORD_NAME && env.CF_RECORD_NAME.includes(".")) {
+    visitor.root = env.CF_RECORD_NAME.split(".").slice(1).join(".");
+  }
 
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: { "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST,DELETE,OPTIONS", "access-control-allow-headers": "content-type,authorization" } });
@@ -742,6 +883,16 @@ async function handle(request, env, ctx) {
       }
     }
     return json({ ok: true, dns: result });
+  }
+  if (path === "/api/probe-slots") {
+    const cur = await kvGet(env, "slots:current", { slots: [], updatedAt: 0 });
+    return json({ ok: true, ...cur });
+  }
+  if (path === "/api/sync-slots" && request.method === "POST") {
+    if (!checkAdmin(request, env)) return unauthorized();
+    const data = await getLatest(env);
+    const result = await syncProbeSlots(env, data.ips || []);
+    return json(result);
   }
   if (path === "/api/cache/clear" && request.method === "POST") {
     if (!checkAdmin(request, env)) return unauthorized();
@@ -1037,22 +1188,30 @@ ${renderVisitorBanner(visitor)}
 </div>
 
 <div class="card">
-  <h2><span id="hdr">节点列表</span></h2>
-  <div class="nodes" id="list"><div class="mut" style="padding:14px;text-align:center">加载中…</div></div>
-</div>
-
-<div class="card">
-  <h2>🚀 本地实测（在你当前网络测真实延迟）</h2>
+  <h2>🌍 在你当前网络下优选 Top IP（专属于你的网络）</h2>
   <p class="mut" style="font-size:12px;line-height:1.6;margin:0 0 10px">
-    Worker 内部测不了 CF 节点延迟（平台限制），<b>但浏览器可以！</b>下面会测试你 4 个运营商子域的优选节点套（这些都是你自己的域，SSL 证书合法）。<br/>
-    <b style="color:var(--warn)">最准的玩法：在手机/电脑上关闭代理后再点开始实测</b>——代表你本地网络到云服务器的真实路径。
+    浏览器并发对 <b>50 个不同的真实 CF IP</b>（藏在 <code>p01-p50.${visitor.root || 'leilaomi.cc.cd'}</code> 这些子域里）测 TLS 握手延迟，<b style="color:var(--warn)">关代理后再开始最准</b>。
+    结果只反映你的网络，刷新一次自动同步一次。
   </p>
-  <div class="row" style="margin-bottom:8px">
-    <input id="customHost" placeholder="可选：自定义域名一起测（如 yourdomain.com）" style="flex:1;min-width:160px"/>
-    <button class="btn sm" id="btnLocal">开始实测</button>
-    <span class="mut" id="localStatus" style="font-size:11px"></span>
+  <div class="row" style="margin-bottom:10px;gap:6px;flex-wrap:wrap">
+    <select id="probeKeep" style="min-width:90px"><option value="10">保留 Top 10</option><option value="20">保留 Top 20</option><option value="30">保留 Top 30</option><option value="50">全部 50</option></select>
+    <select id="probeReps" style="min-width:90px"><option value="3">每 IP 测 3 次</option><option value="5" selected>每 IP 测 5 次</option><option value="8">每 IP 测 8 次</option></select>
+    <button class="btn" id="btnProbe">▶ 开始优选</button>
+    <span class="mut" id="probeStatus" style="font-size:11px"></span>
   </div>
-  <div id="localRes" style="font-size:12px;line-height:1.8" class="mut">点"开始实测"后出现结果</div>
+  <div id="probeResult" class="mut" style="font-size:12px">点 "▶ 开始优选" 后这里出现你专属的 Top IP 列表</div>
+  <div class="row" id="probeActions" style="margin-top:10px;display:none;gap:6px">
+    <button class="btn sm ghost" id="copyTop">复制 IP 列表 (txt)</button>
+    <button class="btn sm ghost" id="dlTop">下载 best-for-me.txt</button>
+  </div>
+  <details style="margin-top:12px"><summary class="mut" style="font-size:11px;cursor:pointer">🔧 站长域名套测试（cf./ct./cu./cm.${visitor.root || 'leilaomi.cc.cd'}）</summary>
+    <div class="row" style="margin-top:10px;gap:6px">
+      <input id="customHost" placeholder="可选：自定义域名一起测" style="flex:1;min-width:160px"/>
+      <button class="btn sm" id="btnLocalCarrier">测 4 个套</button>
+      <span class="mut" id="localStatus" style="font-size:11px"></span>
+    </div>
+    <div id="localRes" style="font-size:12px;line-height:1.8;margin-top:8px" class="mut"></div>
+  </details>
 </div>
 
 <script>
@@ -1136,19 +1295,7 @@ $('#btnRefresh').onclick = load;
 
 load();
 
-// ===== 本地实测：浏览器在用户当前网络下，对 cf./ct./cu./cm. 4 个子域做真实延迟测试 =====
-function _defaultProbeHosts() {
-  const h = location.hostname;
-  const parts = h.split('.');
-  if (parts.length < 2) return [];
-  const root = parts.slice(1).join('.');
-  return [
-    { tag: '通用 cf.', host: 'cf.' + root },
-    { tag: '电信 ct.', host: 'ct.' + root },
-    { tag: '联通 cu.', host: 'cu.' + root },
-    { tag: '移动 cm.', host: 'cm.' + root },
-  ];
-}
+// ===== 浏览器优选探针 —— 在用户网络下测真实 IP 延迟 =====
 async function _probeOne(host, n = 5, timeoutMs = 4000) {
   const samples = [];
   for (let i = 0; i < n; i++) {
@@ -1165,38 +1312,155 @@ async function _probeOne(host, n = 5, timeoutMs = 4000) {
   }
   const ok = samples.filter(x => x != null);
   return {
-    host,
     samples,
     min: ok.length ? Math.round(Math.min(...ok)) : null,
     avg: ok.length ? Math.round(ok.reduce((a, b) => a + b, 0) / ok.length) : null,
     loss: 1 - ok.length / n,
   };
 }
-const _btnLocal = document.getElementById('btnLocal');
-if (_btnLocal) {
-  _btnLocal.onclick = async () => {
-    _btnLocal.disabled = true;
+
+let _slots = [];
+let _probeResults = [];
+
+async function _loadSlots() {
+  try {
+    const r = await fetch('/api/probe-slots').then(r => r.json());
+    _slots = r.slots || [];
+    return _slots.length;
+  } catch (e) { return 0; }
+}
+
+function _ipDelayColor(ms) {
+  if (ms == null) return '#8b949e';
+  if (ms < 80) return '#7ee787';
+  if (ms < 200) return '#d8af3c';
+  return '#ff7b72';
+}
+
+function _carrierTag(c) {
+  const m = { CT: '电信', CU: '联通', CM: '移动', CMCC: '移动', CF: '通用' };
+  const cls = (c || 'cf').toLowerCase();
+  return '<span class="tag ' + cls + '">' + (m[c] || '通用') + '</span>';
+}
+
+function _renderProbeResults(results, keep) {
+  const top = results.slice(0, keep);
+  const html = top.map((r, i) => {
+    const color = _ipDelayColor(r.avg);
+    const sign = r.avg == null ? '不通' : (r.avg + 'ms');
+    const flag = ({HK:'🇭🇰',JP:'🇯🇵',KR:'🇰🇷',TW:'🇹🇼',SG:'🇸🇬',US:'🇺🇸',CA:'🇨🇦',GB:'🇬🇧',DE:'🇩🇪',FR:'🇫🇷',NL:'🇳🇱',AU:'🇦🇺',RU:'🇷🇺',IN:'🇮🇳',CN:'🇨🇳',TH:'🇹🇭',MY:'🇲🇾',HU:'🇭🇺',IT:'🇮🇹',CH:'🇨🇭'}[r.country]) || '🌐';
+    return '<div style="display:grid;grid-template-columns:30px 1fr auto;gap:8px;align-items:center;padding:8px;border:1px solid var(--bd);border-radius:6px;margin-bottom:4px"><div class="mut" style="font-size:11px">#' + (i+1) + '</div><div><div style="font-family:monospace;font-size:13px"><b>' + r.ip + '</b>:' + (r.port||443) + '</div><div style="font-size:11px;color:var(--mut);margin-top:2px">' + _carrierTag(r.carrier) + ' ' + flag + ' ' + (r.country||'') + (r.city?' · '+r.city:'') + '</div></div><div style="text-align:right"><b style="color:' + color + ';font-size:14px">' + sign + '</b><br/><button class="copybtn" data-cp="' + r.ip + '" style="margin-top:4px">复制</button></div></div>';
+  }).join('');
+  document.getElementById('probeResult').innerHTML = html;
+  document.querySelectorAll('[data-cp]').forEach(b => b.onclick = async () => {
+    try { await navigator.clipboard.writeText(b.dataset.cp); b.textContent = '✓'; setTimeout(()=>b.textContent='复制', 1500); }
+    catch(e) { prompt('复制', b.dataset.cp); }
+  });
+}
+
+const _btnProbe = document.getElementById('btnProbe');
+if (_btnProbe) {
+  _btnProbe.onclick = async () => {
+    _btnProbe.disabled = true;
+    const st = document.getElementById('probeStatus');
+    const keep = +document.getElementById('probeKeep').value;
+    const reps = +document.getElementById('probeReps').value;
+    if (!_slots.length) {
+      st.textContent = '⏳ 加载探针槽…';
+      await _loadSlots();
+    }
+    if (!_slots.length) {
+      document.getElementById('probeResult').innerHTML = '<span style="color:#ff7b72">探针槽尚未生成。请管理员先去 /admin 点"立即抓取"刷新一次（会自动创建子域槽）</span>';
+      _btnProbe.disabled = false;
+      return;
+    }
+    st.textContent = '⏳ 0 / ' + _slots.length;
+    document.getElementById('probeResult').innerHTML = '<div class="mut">测试中…</div>';
+    let done = 0;
+    const concurrency = 8;
+    const queue = [..._slots];
+    const results = [];
+    async function worker() {
+      while (queue.length) {
+        const s = queue.shift();
+        const r = await _probeOne(s.host, reps);
+        results.push({ ...s, ...r });
+        done++;
+        st.textContent = '⏳ ' + done + ' / ' + _slots.length;
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(concurrency, _slots.length) }, worker));
+    results.sort((a, b) => (a.avg == null ? 99999 : a.avg) - (b.avg == null ? 99999 : b.avg));
+    _probeResults = results;
+    _renderProbeResults(results, keep);
+    const best = results.find(r => r.avg != null);
+    st.textContent = best ? ('✅ 完成 · 你的最快: ' + best.ip + ' (' + best.avg + 'ms · ' + (best.carrier||'CF') + ')') : '⚠️ 全部不通，可能在墙后或正在用代理';
+    document.getElementById('probeActions').style.display = 'flex';
+    _btnProbe.disabled = false;
+  };
+}
+
+document.getElementById('copyTop')?.addEventListener('click', async () => {
+  const keep = +document.getElementById('probeKeep').value;
+  const txt = _probeResults.slice(0, keep).filter(r => r.avg != null).map(r => r.ip + ':' + (r.port||443) + '#' + (r.carrier||'CF') + '-' + r.avg + 'ms').join('\n');
+  try { await navigator.clipboard.writeText(txt); document.getElementById('probeStatus').textContent = '已复制 ' + txt.split('\n').length + ' 个'; }
+  catch(e) { prompt('复制', txt); }
+});
+
+document.getElementById('dlTop')?.addEventListener('click', () => {
+  const keep = +document.getElementById('probeKeep').value;
+  const txt = _probeResults.slice(0, keep).filter(r => r.avg != null).map(r => r.ip + ':' + (r.port||443) + '#' + (r.carrier||'CF') + '-' + r.avg + 'ms').join('\n');
+  const blob = new Blob([txt], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'best-for-me.txt';
+  a.click();
+});
+
+// 旧的 cf./ct./cu./cm. 4 个套测试 - 站长域名调试用
+function _defaultCarrierHosts() {
+  const h = location.hostname;
+  const parts = h.split('.');
+  if (parts.length < 2) return [];
+  const root = parts.slice(1).join('.');
+  return [
+    { tag: '通用 cf.', host: 'cf.' + root },
+    { tag: '电信 ct.', host: 'ct.' + root },
+    { tag: '联通 cu.', host: 'cu.' + root },
+    { tag: '移动 cm.', host: 'cm.' + root },
+  ];
+}
+
+const _btnLocalCarrier = document.getElementById('btnLocalCarrier');
+if (_btnLocalCarrier) {
+  _btnLocalCarrier.onclick = async () => {
+    _btnLocalCarrier.disabled = true;
     const st = document.getElementById('localStatus');
     const res = document.getElementById('localRes');
-    res.innerHTML = '<div class="mut">⏳ 并发测试中（每个域 5 次握手）…</div>';
-    const targets = _defaultProbeHosts();
+    res.innerHTML = '<div class="mut">⏳ 测试中…</div>';
+    const targets = _defaultCarrierHosts();
     const custom = (document.getElementById('customHost').value || '').trim();
     if (custom) targets.push({ tag: '自定义', host: custom });
     st.textContent = '测试 ' + targets.length + ' 个域…';
     const results = await Promise.all(targets.map(t => _probeOne(t.host).then(r => ({ ...t, ...r }))));
     results.sort((a, b) => (a.avg == null ? 99999 : a.avg) - (b.avg == null ? 99999 : b.avg));
     res.innerHTML = results.map(r => {
-      const c = r.avg == null ? '#8b949e' : (r.avg < 80 ? '#7ee787' : r.avg < 200 ? '#d8af3c' : '#ff7b72');
+      const c = _ipDelayColor(r.avg);
       const lossPct = Math.round(r.loss * 100);
       const sign = r.avg == null ? '✗ 不通' : ('✓ 平均 ' + r.avg + 'ms · 最低 ' + r.min + 'ms');
       const tail = lossPct > 0 ? ' · 丢包 ' + lossPct + '%' : '';
       return '<div style="display:flex;justify-content:space-between;gap:8px;padding:7px 0;border-bottom:1px solid #21262d"><span><b>' + r.tag + '</b> ' + r.host + '</span><b style="color:' + c + ';white-space:nowrap">' + sign + tail + '</b></div>';
     }).join('');
     const best = results.find(r => r.avg != null);
-    st.textContent = best ? '✅ 你这网络下最快: ' + best.host + ' (' + best.avg + 'ms) → VLESS 用这个域' : '⚠️ 全部不通，可能在墙后或正在用代理';
-    _btnLocal.disabled = false;
+    st.textContent = best ? '✅ 你这网络下最快: ' + best.host + ' (' + best.avg + 'ms)' : '⚠️ 全部不通';
+    _btnLocalCarrier.disabled = false;
   };
 }
+
+// 启动时预拉 slots
+_loadSlots().then(n => {
+  if (!n) document.getElementById('probeResult').innerHTML = '<span class="mut">探针槽尚未生成。管理员去 /admin 点"立即抓取"会自动创建 50 个 p01-p50 子域槽</span>';
+});
 </script>`);
 }
 
