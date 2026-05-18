@@ -131,6 +131,14 @@ const SOURCES = [
     body: { key: "o1zrmHAF" },
     category: "cf-native",
   },
+  // ===== v2.6 社区高星 CF native 源(纯 CF 段,大幅提升 cf-native 数量) =====
+  { name: "joname1/BestCFip",           url: "https://raw.githubusercontent.com/joname1/BestCFip/main/ipv4.txt", type: "text", category: "cf-native" },
+  { name: "KafeMars/cloudflare_ips",    url: "https://raw.githubusercontent.com/KafeMars/best-ips-domains/main/cloudflare_ips.txt", type: "text", category: "cf-native" },
+  { name: "KafeMars/US_IP4",            url: "https://raw.githubusercontent.com/KafeMars/best-ips-domains/main/US_IP4", type: "text", category: "cf-native" },
+  { name: "KafeMars/HK_IP4",            url: "https://raw.githubusercontent.com/KafeMars/best-ips-domains/main/HK_IP4", type: "text", category: "cf-native" },
+  { name: "KafeMars/JP_IP4",            url: "https://raw.githubusercontent.com/KafeMars/best-ips-domains/main/JP_IP4", type: "text", category: "cf-native" },
+  { name: "KafeMars/SG_IP4",            url: "https://raw.githubusercontent.com/KafeMars/best-ips-domains/main/SG_IP4", type: "text", category: "cf-native" },
+  { name: "KafeMars/EU_IP4",            url: "https://raw.githubusercontent.com/KafeMars/best-ips-domains/main/EU_IP4", type: "text", category: "cf-native" },
   { name: "addressesapi/ip.164746.xyz", url: "https://addressesapi.090227.xyz/ip.164746.xyz", type: "carrier", category: "cf-native" },
   { name: "addressesapi/CloudFlareYes", url: "https://addressesapi.090227.xyz/CloudFlareYes", type: "carrier", category: "cf-native" },
   { name: "addressesapi/cmcc",          url: "https://addressesapi.090227.xyz/cmcc", type: "carrier", category: "cf-native" },
@@ -245,10 +253,18 @@ function uniqBy(arr, keyFn) {
   const map = new Map();
   for (const x of arr) {
     const k = keyFn(x);
-    if (!map.has(k)) map.set(k, x);
+    if (!map.has(k)) map.set(k, { ...x });
     else {
       const cur = map.get(k);
       cur.sources = Array.from(new Set([...(cur.sources || []), ...(x.sources || [])]));
+      // 如果新进来的 IP 有 tested 数据而当前的没,接管 delay/loss/mbps/colo/tested
+      if (x.tested && !cur.tested) {
+        cur.delay = x.delay;
+        cur.loss = x.loss;
+        cur.mbps = x.mbps;
+        cur.colo = x.colo;
+        cur.tested = true;
+      }
     }
   }
   return Array.from(map.values());
@@ -611,7 +627,7 @@ async function aggregateSources() {
     all.push(...r.ips);
   }
   // 合并去重，按 ip:port 维度
-  const uniq = uniqBy(all, x => `${x.ip}:${x.port}`);
+  const uniq = uniqBy(all, x => `${x.ip}:${x.port}:${x.carrier || ""}`);
   // v2.3: 用 IP 段精确重写 category，不再相信 source 元数据
   for (const x of uniq) {
     x.category = isCfNativeIp(x.ip) ? "cf-native" : "cf-proxy";
