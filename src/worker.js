@@ -56,9 +56,9 @@ const SOURCES = [
   { name: "addressesapi/ip.164746.xyz", url: "https://addressesapi.090227.xyz/ip.164746.xyz", type: "carrier" },
   { name: "addressesapi/CloudFlareYes", url: "https://addressesapi.090227.xyz/CloudFlareYes", type: "carrier" },
   { name: "addressesapi/cmcc",          url: "https://addressesapi.090227.xyz/cmcc",          type: "carrier" },
-  { name: "addressesapi/ct",            url: "https://addressesapi.090227.xyz/ct",            type: "carrier" },
-  { name: "addressesapi/cu",            url: "https://addressesapi.090227.xyz/cu",            type: "carrier" },
-  { name: "ip.164746.xyz/ipTop",        url: "https://ip.164746.xyz/ipTop.html",              type: "csv" },
+  { name: "addressesapi/ct",            url: "https://addressesapi.090227.xyz/ct",            type: "text" },
+  { name: "uouin.com/cloudflare", url: "https://api.uouin.com/cloudflare.html", type: "uouin_html" },
+  { name: "ip.164746.xyz/ipTop",        url: "https://ip.164746.xyz/ipTop.html",              type: "text" },
   { name: "IPDB/proxy",                 url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/proxy.txt", type: "list" },
 ];
 
@@ -215,13 +215,31 @@ async function fetchSource(src) {
     if (!r.ok) return { name: src.name, ips: [], error: `HTTP ${r.status}` };
     const body = await r.text();
     const ips = [];
+
+    if (src.type === "uouin_html") {
+      // uouin 页面 IP 周围用中文标签标注 carrier
+      const carrierMap = { "电信": "CT", "联通": "CU", "移动": "CM" };
+      const seen = new Set();
+      const re = /\b\d{1,3}(?:\.\d{1,3}){3}\b/g;
+      let m;
+      while ((m = re.exec(body)) !== null) {
+        const ip = m[0];
+        if (seen.has(ip)) continue;
+        seen.add(ip);
+        const before = body.slice(Math.max(0, m.index - 500), m.index);
+        const tags = before.match(/电信|联通|移动/g) || [];
+        const last = tags[tags.length - 1];
+        ips.push({ ip, port: 443, carrier: carrierMap[last] || null, sources: [src.name] });
+      }
+      return { name: src.name, ips };
+    }
+
     for (const raw of body.split(/[\r\n,]+/)) {
       const line = raw.trim();
       if (!line || line.startsWith("#") || line.startsWith("//")) continue;
-      // 从混排 HTML/CSV 里抠出每个 IP
       const matches = line.match(/\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?(?:#[\w\-]+)?/g) || [];
-      for (const m of matches) {
-        const parsed = parseLine(m);
+      for (const mm of matches) {
+        const parsed = parseLine(mm);
         if (parsed) ips.push({ ...parsed, sources: [src.name] });
       }
     }
@@ -319,6 +337,40 @@ async function probeBandwidth(ip, bytes, timeoutMs) {
   }
 }
 
+/** 通过 ip-api.com 批量补全 IP 的地理位置 */
+async function enrichGeo(ips) {
+  if (!ips.length) return ips;
+  const batchSize = 100;
+  for (let i = 0; i < ips.length; i += batchSize) {
+    const batch = ips.slice(i, i + batchSize);
+    try {
+      const r = await withTimeout(
+        fetch("http://ip-api.com/batch?fields=status,countryCode,city,regionName,as,isp,query", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(batch.map(x => ({ query: x.ip }))),
+        }),
+        12000,
+      );
+      if (!r.ok) continue;
+      const arr = await r.json();
+      const byIp = new Map();
+      for (const it of arr) if (it && it.query) byIp.set(it.query, it);
+      for (const item of batch) {
+        const hit = byIp.get(item.ip);
+        if (hit && hit.status === "success") {
+          item.country = hit.countryCode || item.country;
+          item.region = hit.regionName || item.region;
+          item.city = hit.city || item.city;
+          item.asn = hit.as || item.asn;
+          item.isp = hit.isp || item.isp;
+        }
+      }
+    } catch {}
+  }
+  return ips;
+}
+
 // ============================================================
 // 6. 全量测速管线
 // ============================================================
@@ -372,6 +424,9 @@ async function runFullTest(env, ctx, opts = {}) {
   //    await pMap(alive.slice(0, cfg.bandwidthSampleSize), async item => {
   //      item.mbps = await probeBandwidth(item.ip, cfg.bandwidthBytes, 6000);
   //    }, 5);
+
+  const enriched = await enrichGeo(alive);
+  alive = enriched;
 
   // 7. 持久化
   const payload = {
@@ -648,11 +703,17 @@ async function handle(request, env, ctx) {
     return json({ days, history: out });
   }
 
-  // ---- 管理：手动刷新 ----
+  // ---- 公开：手动刷新（60s 冷却）----
   if (path === "/api/refresh") {
-    if (!checkAdmin(request, env)) return unauthorized();
+    const prevRaw = await env.KV?.get("refresh:cooldown");
+    const prev = prevRaw ? Number(prevRaw) : 0;
+    const remain = 60 - Math.floor((Date.now() - prev) / 1000);
+    if (remain > 0) {
+      return json({ ok: false, error: "rate-limited", retryAfter: remain, hint: `请 ${remain} 秒后再试` }, { status: 429 });
+    }
+    await env.KV?.put("refresh:cooldown", String(Date.now()), { expirationTtl: 120 });
     const result = await runFullTest(env, ctx);
-    return json({ ok: true, count: result.ips.length, elapsedMs: result.elapsedMs });
+    return json({ ok: true, count: result.ips.length, elapsedMs: result.elapsedMs, sourceStats: result.sourceStats });
   }
 
   // ---- 管理：DNS 手动同步 ----
