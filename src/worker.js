@@ -39,7 +39,7 @@ import { connect } from "cloudflare:sockets";
 // ============================================================
 // 1. 常量 / 数据源 / 字典
 // ============================================================
-const VERSION = "2.0.0";
+const VERSION = "2.1.0";
 
 const DEFAULT_CFG = {
   topN: 30,
@@ -50,6 +50,25 @@ const DEFAULT_CFG = {
   countryBlocklist: ["CN"],         // 默认屏蔽中国大陆 colo
   ports: [443],                     // 默认只测 443
   refreshHours: 6,
+  // ===== v2.1 cfnb 融合新增 =====
+  // 可用性二次检测：用 api.090227.xyz/check 验证 IP 真能反代
+  availabilityCheckEnabled: false,
+  availabilityCheckApi: "https://api.090227.xyz/check",
+  availabilityCheckTimeoutMs: 4000,
+  availabilityCheckConcurrency: 16,
+  // DNS 同步阶段独立黑名单（默认 cfnb 28 国）
+  dnsBlocklistEnabled: true,
+  dnsBlocklist: ["BD","BI","BY","CD","CF","CN","CU","DE","ET","HK","IR","KP","LY","MO","NG","NL","PK","RU","SD","SO","SY","TH","TW","UA","VE","VN","YE","ZW"],
+  // IP 风险等级过滤（DNS 阶段）
+  dnsRiskFilterEnabled: false,
+  dnsRiskMaxLevel: "高风险",     // 极度纯净/纯净/轻微风险/高风险/极度危险
+  riskCheckApi: "https://api.ipapi.is/",
+  riskCheckTimeoutMs: 4000,
+  // 分国家 TopN 模式（off = 全局 TopN）
+  perCountryMode: false,
+  perCountryTopN: 1,
+  // WxPusher 微信通知（用 env.WXPUSHER_TOKEN / WXPUSHER_UIDS）
+  wxpusherApi: "https://wxpusher.zjiecode.com/api/send/message",
 };
 
 const SOURCES = [
@@ -61,6 +80,15 @@ const SOURCES = [
   { name: "ip.164746.xyz/ipTop",        url: "https://ip.164746.xyz/ipTop.html",              type: "text" },
   { name: "IPDB/proxy",                 url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/proxy.txt", type: "list" },
   { name: "zip.cm.edu.kg/all",          url: "https://zip.cm.edu.kg/all.txt",                 type: "text" },
+  // ===== v2.1 cfnb 新增源 =====
+  { name: "countrymerge/all",           url: "https://countrymerge.pages.dev/all.txt",        type: "text" },
+  // wtf-359 已并入 countrymerge，下行保留注释仅作历史记录
+
+  // ===== v2.2 IPDB by 030101.xyz：高质量数据源（@xinyitang3/cfnb 也推荐） =====
+  // bestcf: 优选官方 CF IPv4，30 分钟更新；bestproxy: 优选反代 IP（非 CF）30 分钟更新；proxy-api: 反代 IP 池 10 分钟更新
+  { name: "IPDB/bestcf",       url: "https://ipdb.api.030101.xyz/?type=bestcf",            type: "text" },
+  { name: "IPDB/bestproxy",    url: "https://ipdb.api.030101.xyz/?type=bestproxy",         type: "text" },
+  { name: "IPDB/proxy-api",    url: "https://ipdb.api.030101.xyz/?type=proxy",             type: "text" },
 ];
 
 // 常见 colo → 国家映射（cdn-cgi/trace 也能直接给国家，但缓存一份方便筛选）
@@ -187,6 +215,225 @@ function parseLine(line) {
 }
 
 // ============================================================
+// 2b. cfnb 融合：自适应国家解析 + 可用性二次检测 + IP 风险等级
+// ============================================================
+
+// 中文国名 → 国家代码（来自 cfnb，全球覆盖）
+const CN_TO_CODE = {
+  "阿富汗":"AF","奥兰群岛":"AX","阿尔巴尼亚":"AL","阿尔及利亚":"DZ","美属萨摩亚":"AS","安道尔":"AD",
+  "安哥拉":"AO","安圭拉":"AI","南极洲":"AQ","安提瓜和巴布达":"AG","阿根廷":"AR","亚美尼亚":"AM",
+  "阿鲁巴":"AW","澳大利亚":"AU","奥地利":"AT","阿塞拜疆":"AZ","巴哈马":"BS","巴林":"BH",
+  "孟加拉国":"BD","孟加拉":"BD","巴巴多斯":"BB","白俄罗斯":"BY","比利时":"BE","伯利兹":"BZ",
+  "贝宁":"BJ","百慕大":"BM","不丹":"BT","玻利维亚":"BO","波黑":"BA","博茨瓦纳":"BW","巴西":"BR",
+  "文莱":"BN","保加利亚":"BG","布基纳法索":"BF","布隆迪":"BI","柬埔寨":"KH","喀麦隆":"CM",
+  "加拿大":"CA","佛得角":"CV","开曼群岛":"KY","中非":"CF","乍得":"TD","智利":"CL","中国":"CN",
+  "圣诞岛":"CX","哥伦比亚":"CO","科摩罗":"KM","刚果(布)":"CG","刚果(金)":"CD","库克群岛":"CK",
+  "哥斯达黎加":"CR","科特迪瓦":"CI","克罗地亚":"HR","古巴":"CU","塞浦路斯":"CY","捷克":"CZ",
+  "丹麦":"DK","吉布提":"DJ","多米尼克":"DM","多米尼加":"DO","厄瓜多尔":"EC","埃及":"EG",
+  "萨尔瓦多":"SV","赤道几内亚":"GQ","厄立特里亚":"ER","爱沙尼亚":"EE","埃塞俄比亚":"ET",
+  "斐济":"FJ","芬兰":"FI","法国":"FR","加蓬":"GA","冈比亚":"GM","格鲁吉亚":"GE","德国":"DE",
+  "加纳":"GH","希腊":"GR","格陵兰":"GL","格林纳达":"GD","关岛":"GU","危地马拉":"GT","几内亚":"GN",
+  "几内亚比绍":"GW","圭亚那":"GY","海地":"HT","梵蒂冈":"VA","洪都拉斯":"HN","香港":"HK",
+  "匈牙利":"HU","冰岛":"IS","印度":"IN","印度尼西亚":"ID","伊朗":"IR","伊拉克":"IQ","爱尔兰":"IE",
+  "以色列":"IL","意大利":"IT","牙买加":"JM","日本":"JP","约旦":"JO","哈萨克斯坦":"KZ","肯尼亚":"KE",
+  "基里巴斯":"KI","朝鲜":"KP","韩国":"KR","科威特":"KW","吉尔吉斯斯坦":"KG","老挝":"LA","拉脱维亚":"LV",
+  "黎巴嫩":"LB","莱索托":"LS","利比里亚":"LR","利比亚":"LY","列支敦士登":"LI","立陶宛":"LT",
+  "卢森堡":"LU","澳门":"MO","马其顿":"MK","马达加斯加":"MG","马拉维":"MW","马来西亚":"MY",
+  "马尔代夫":"MV","马里":"ML","马耳他":"MT","马绍尔群岛":"MH","毛里塔尼亚":"MR","毛里求斯":"MU",
+  "墨西哥":"MX","密克罗尼西亚":"FM","摩尔多瓦":"MD","摩纳哥":"MC","蒙古":"MN","黑山":"ME",
+  "摩洛哥":"MA","莫桑比克":"MZ","缅甸":"MM","纳米比亚":"NA","瑙鲁":"NR","尼泊尔":"NP","荷兰":"NL",
+  "新喀里多尼亚":"NC","新西兰":"NZ","尼加拉瓜":"NI","尼日尔":"NE","尼日利亚":"NG","纽埃":"NU",
+  "挪威":"NO","阿曼":"OM","巴基斯坦":"PK","帕劳":"PW","巴勒斯坦":"PS","巴拿马":"PA","巴布亚新几内亚":"PG",
+  "巴拉圭":"PY","秘鲁":"PE","菲律宾":"PH","波兰":"PL","葡萄牙":"PT","波多黎各":"PR","卡塔尔":"QA",
+  "罗马尼亚":"RO","俄罗斯":"RU","卢旺达":"RW","萨摩亚":"WS","圣马力诺":"SM","沙特阿拉伯":"SA","沙特":"SA",
+  "塞内加尔":"SN","塞尔维亚":"RS","塞舌尔":"SC","塞拉利昂":"SL","新加坡":"SG","斯洛伐克":"SK",
+  "斯洛文尼亚":"SI","所罗门群岛":"SB","索马里":"SO","南非":"ZA","南苏丹":"SS","西班牙":"ES",
+  "斯里兰卡":"LK","苏丹":"SD","苏里南":"SR","斯威士兰":"SZ","瑞典":"SE","瑞士":"CH","叙利亚":"SY",
+  "台湾":"TW","塔吉克斯坦":"TJ","坦桑尼亚":"TZ","泰国":"TH","东帝汶":"TL","多哥":"TG","托克劳":"TK",
+  "汤加":"TO","特立尼达和多巴哥":"TT","突尼斯":"TN","土耳其":"TR","土库曼斯坦":"TM","图瓦卢":"TV",
+  "乌干达":"UG","乌克兰":"UA","阿联酋":"AE","英国":"GB","美国":"US","乌拉圭":"UY","乌兹别克斯坦":"UZ",
+  "瓦努阿图":"VU","委内瑞拉":"VE","越南":"VN","西撒哈拉":"EH","也门":"YE","赞比亚":"ZM","津巴布韦":"ZW",
+};
+
+/**
+ * 从任意标签提取标准两位国家代码
+ * 支持 4 种格式：纯代码 (US)、中文名 (美国)、emoji 国旗 (🇺🇸)、混合 (🇺🇸 美国 LAX)
+ * @param {string} label
+ * @returns {string|null}
+ */
+function extractCountryCode(label) {
+  if (!label) return null;
+  const s = String(label).trim();
+  if (!s) return null;
+
+  // 运营商标签不是国家代码，提前排除
+  const CARRIER_TOKENS = new Set(["CT", "CU", "CM", "CMCC", "CF", "DEF"]);
+
+  // 1) 标准两位大写
+  const tokens = s.split(/[\s,;|/_\-]+/);
+  for (const tk of tokens) {
+    const cleaned = tk.replace(/^[\d\s\-_.|#]+/, "").trim();
+    if (/^[A-Z]{2}$/.test(cleaned) && !CARRIER_TOKENS.has(cleaned)) return cleaned;
+  }
+  // 2) 中文名
+  for (const tk of tokens) {
+    const noEmoji = tk.replace(/[\u{1F1E6}-\u{1F1FF}]/gu, "").replace(/[（()）]/g, "").replace(/\d+$/, "").trim();
+    if (CN_TO_CODE[noEmoji]) return CN_TO_CODE[noEmoji];
+  }
+  // 3) emoji 国旗（两个 regional indicator 字符）
+  const emojis = [];
+  for (const ch of s) {
+    const cp = ch.codePointAt(0);
+    if (cp >= 0x1F1E6 && cp <= 0x1F1FF) emojis.push(cp);
+  }
+  if (emojis.length >= 2) {
+    const a = emojis[0] - 0x1F1E6;
+    const b = emojis[1] - 0x1F1E6;
+    if (a >= 0 && a < 26 && b >= 0 && b < 26) {
+      return String.fromCharCode(65 + a) + String.fromCharCode(65 + b);
+    }
+  }
+  return null;
+}
+
+/**
+ * 强化版 parseLine：兼容 emoji / 中文 / 任意混合标签。
+ * 老 parseLine 只认 [A-Z]{2}，新源（wtf-359/countrymerge）大量使用 emoji 国旗，必须升级。
+ */
+function parseLineAdaptive(line) {
+  const m = line.match(/(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?(?:[#@\s]+(.*))?/);
+  if (!m) return null;
+  const ip = m[1];
+  const port = m[2] ? +m[2] : 443;
+  const tail = (m[3] || "").trim();
+  let carrier = null;
+  let country = null;
+  if (tail) {
+    // 先看 carrier 关键词
+    const upper = tail.toUpperCase();
+    if (/\b(CT|CHINANET|TELECOM|电信)\b/.test(upper) || /电信/.test(tail)) carrier = "CT";
+    else if (/\b(CU|UNICOM|联通)\b/.test(upper) || /联通/.test(tail)) carrier = "CU";
+    else if (/\b(CM|CMCC|MOBILE|移动)\b/.test(upper) || /移动/.test(tail)) carrier = "CM";
+    else if (/\bCF\b/.test(upper)) carrier = "CF";
+    // 再抽国家
+    country = extractCountryCode(tail);
+  }
+  return { ip, port, carrier, country };
+}
+
+/**
+ * IP 可用性二次检测 —— 来源 cfnb：调用 api.090227.xyz/check 验证 IP 真能反代
+ * 只在 cfg.availabilityCheckEnabled = true 时启用，避免烧第三方配额。
+ * 返回 { passed: [...], stats: { total, ok, fail } }
+ */
+async function applyAvailabilityFilter(ips, cfg) {
+  if (!cfg.availabilityCheckEnabled || !ips.length) {
+    return { passed: ips, stats: { total: ips.length, ok: ips.length, fail: 0, skipped: true } };
+  }
+  const concurrency = cfg.availabilityCheckConcurrency || 16;
+  const timeoutMs = cfg.availabilityCheckTimeoutMs || 4000;
+  const api = cfg.availabilityCheckApi || "https://api.090227.xyz/check";
+
+  const checkOne = async (item) => {
+    try {
+      const u = new URL(api);
+      u.searchParams.set("proxyip", `${item.ip}:${item.port || 443}`);
+      const r = await withTimeout(fetch(u.toString(), { cf: { cacheTtl: 60 } }), timeoutMs);
+      if (!r.ok) return { ...item, _availability: false };
+      const data = await r.json().catch(() => ({}));
+      const ok = data && data.success === true;
+      const stack = data?.inferred_stack || null;
+      return { ...item, _availability: ok, _stack: stack };
+    } catch {
+      return { ...item, _availability: false };
+    }
+  };
+
+  const checked = await pMap(ips, checkOne, concurrency);
+  const passed = checked.filter(x => x._availability);
+  return {
+    passed,
+    stats: { total: ips.length, ok: passed.length, fail: ips.length - passed.length },
+  };
+}
+
+/**
+ * IP 风险等级查询 —— 来源 cfnb：调用 ipapi.is 综合打分
+ * 返回 "极度纯净" / "纯净" / "轻微风险" / "高风险" / "极度危险" / "未知"
+ */
+const RISK_LEVELS = ["极度纯净", "纯净", "轻微风险", "高风险", "极度危险"];
+async function getIpRiskLevel(ip, cfg) {
+  try {
+    const api = cfg.riskCheckApi || "https://api.ipapi.is/";
+    const r = await withTimeout(
+      fetch(`${api}?q=${encodeURIComponent(ip)}`, { cf: { cacheTtl: 86400 } }),
+      cfg.riskCheckTimeoutMs || 4000
+    );
+    if (!r.ok) return "未知";
+    const data = await r.json();
+    const parseScore = (s) => {
+      if (!s) return 0;
+      const m = String(s).match(/([\d.]+)/);
+      return m ? parseFloat(m[1]) : 0;
+    };
+    const companyScore = parseScore(data?.company?.abuser_score);
+    const asnScore = parseScore(data?.asn?.abuser_score);
+    const base = ((companyScore + asnScore) / 2) * 5;
+    const flags = ["is_crawler", "is_proxy", "is_vpn", "is_tor", "is_abuser"];
+    const flagCount = flags.reduce((a, k) => a + (data?.[k] ? 1 : 0), 0);
+    let final = base + flagCount * 0.15;
+    if (data?.is_bogon) final += 1.0;
+    const pct = final * 100;
+    if (pct >= 100) return "极度危险";
+    if (pct >= 20)  return "高风险";
+    if (pct >= 5)   return "轻微风险";
+    if (pct >= 0.25) return "纯净";
+    return "极度纯净";
+  } catch {
+    return "未知";
+  }
+}
+
+/** 给定 alive 列表筛掉风险高于阈值的 IP（cap 控制扫描总量避免烧配额） */
+async function applyRiskFilter(ips, cfg, cap = 60) {
+  if (!cfg.dnsRiskFilterEnabled || !ips.length) return ips;
+  const maxIdx = RISK_LEVELS.indexOf(cfg.dnsRiskMaxLevel);
+  if (maxIdx < 0) return ips;
+  const head = ips.slice(0, cap);
+  const tail = ips.slice(cap);
+  const scored = await pMap(head, async (x) => {
+    const lvl = await getIpRiskLevel(x.ip, cfg);
+    const idx = RISK_LEVELS.indexOf(lvl);
+    // 未知（idx=-1）保留；不超过 max 阈值的保留
+    const passes = idx < 0 || idx <= maxIdx;
+    return { item: { ...x, _risk: lvl }, passes };
+  }, 8);
+  return scored.filter(r => r.passes).map(r => r.item).concat(tail);
+}
+
+/**
+ * WxPusher 微信通知（cfnb 风格），需要 env.WXPUSHER_TOKEN + env.WXPUSHER_UIDS（逗号分隔）
+ */
+async function notifyWxPusher(env, content, summary, cfg) {
+  if (!env.WXPUSHER_TOKEN || !env.WXPUSHER_UIDS) return;
+  const uids = String(env.WXPUSHER_UIDS).split(/[,\s]+/).filter(Boolean);
+  if (!uids.length) return;
+  try {
+    await withTimeout(fetch(cfg.wxpusherApi || "https://wxpusher.zjiecode.com/api/send/message", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        appToken: env.WXPUSHER_TOKEN,
+        content,
+        summary: (summary || "cf-best-ip 通知").slice(0, 100),
+        contentType: 1,
+        uids,
+      }),
+    }), 5000);
+  } catch {}
+}
+
+// ============================================================
 // 3. KV 封装
 // ============================================================
 async function kvGet(env, key, def = null) {
@@ -247,9 +494,19 @@ async function fetchSource(src) {
       return { name: src.name, ips };
     }
 
+    // v2.1：新源用 emoji/中文标签，需要自适应解析
+    const adaptiveSources = new Set(["countrymerge/all", "zip.cm.edu.kg/all"]);
+    const useAdaptive = adaptiveSources.has(src.name);
+
     for (const raw of body.split(/[\r\n,]+/)) {
       const line = raw.trim();
       if (!line || line.startsWith("#") || line.startsWith("//")) continue;
+      if (useAdaptive) {
+        // 自适应：整行解析,标签可能含 emoji/中文/空格
+        const parsed = parseLineAdaptive(line);
+        if (parsed) ips.push({ ...parsed, sources: [src.name] });
+        continue;
+      }
       const matches = line.match(/\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?(?:#[\w\-]+)?/g) || [];
       for (const mm of matches) {
         const parsed = parseLine(mm);
@@ -445,10 +702,19 @@ async function runFullTest(env, ctx, opts = {}) {
   const enriched = await enrichGeo(alive);
   alive = enriched.filter(x => x.country);
 
+  // 6b. v2.1 cfnb：可用性二次检测（默认 off,需在 /api/config 打开 availabilityCheckEnabled）
+  let availabilityStats = { skipped: true, total: alive.length, ok: alive.length };
+  if (cfg.availabilityCheckEnabled) {
+    const r = await applyAvailabilityFilter(alive, cfg);
+    alive = r.passed;
+    availabilityStats = r.stats;
+  }
+
   // 7. 持久化
   const payload = {
     ips: alive,
     sourceStats: agg.stats,
+    availabilityStats,
     updatedAt: Date.now(),
     elapsedMs: Date.now() - startedAt,
     version: VERSION,
@@ -462,6 +728,14 @@ async function runFullTest(env, ctx, opts = {}) {
   }
   // 9. Webhook
   ctx.waitUntil(notify(env, payload).catch(() => {}));
+  // 9b. v2.1 cfnb：WxPusher 微信通知
+  ctx.waitUntil(notifyWxPusher(
+    env,
+    `节点池更新完成 共 ${alive.length} 个 · 耗时 ${payload.elapsedMs}ms · 数据源 ${agg.stats.filter(s=>!s.error&&s.count>0).length}/${agg.stats.length} 健康` +
+    (availabilityStats.skipped ? "" : ` · 可用性 ${availabilityStats.ok}/${availabilityStats.total}`),
+    `cf-best-ip · ${alive.length} 个节点`,
+    cfg
+  ).catch(() => {}));
   return payload;
 }
 
@@ -498,13 +772,24 @@ async function syncRecord(env, name, ips, topN) {
 }
 async function syncAllDns(env, alive) {
   const topN = Number(env.DNS_TOP_N || 10);
+  const cfg = await getConfig(env);
+  // v2.1 cfnb：DNS 阶段独立黑名单（与前置 countryBlocklist 区分,默认 28 国）
+  let pool = alive.slice();
+  if (cfg.dnsBlocklistEnabled && cfg.dnsBlocklist?.length) {
+    const block = new Set(cfg.dnsBlocklist);
+    pool = pool.filter(x => !x.country || !block.has(x.country));
+  }
+  // v2.1 cfnb：IP 风险等级过滤（默认 off,需打开 dnsRiskFilterEnabled）
+  if (cfg.dnsRiskFilterEnabled) {
+    pool = await applyRiskFilter(pool, cfg, Math.max(60, topN * 4));
+  }
   const results = [];
-  results.push(await syncRecord(env, env.CF_RECORD_NAME, alive, topN));
+  results.push(await syncRecord(env, env.CF_RECORD_NAME, pool, topN));
   if (env.CF_DNS_BY_CARRIER === "1") {
     const root = env.CF_RECORD_NAME.split(".").slice(1).join(".");
     const groups = { CT: "ct", CU: "cu", CM: "cm" };
     for (const [carrier, prefix] of Object.entries(groups)) {
-      const subset = alive.filter(x => x.carrier === carrier);
+      const subset = pool.filter(x => x.carrier === carrier);
       if (subset.length) results.push(await syncRecord(env, `${prefix}.${root}`, subset, topN));
     }
   }
