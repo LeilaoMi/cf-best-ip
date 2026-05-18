@@ -841,10 +841,27 @@ async function createRecord(env, name, ip) {
 async function syncRecord(env, name, ips, topN) {
   if (!ips.length) return { skipped: true, name };
   const wanted = ips.slice(0, topN).map(x => x.ip);
+  const wantedSet = new Set(wanted);
   const existing = await listRecords(env, name);
-  for (const r of existing) await deleteRecord(env, r.id);
-  for (const ip of wanted) await createRecord(env, name, ip);
-  return { name, ips: wanted };
+  const existingMap = new Map(existing.map(r => [r.content, r.id]));
+  // 1) 删除不再需要的
+  let removed = 0, added = 0, kept = 0;
+  for (const r of existing) {
+    if (!wantedSet.has(r.content)) {
+      await deleteRecord(env, r.id);
+      removed++;
+    } else {
+      kept++;
+    }
+  }
+  // 2) 创建新增的
+  for (const ip of wanted) {
+    if (!existingMap.has(ip)) {
+      await createRecord(env, name, ip);
+      added++;
+    }
+  }
+  return { name, ips: wanted, kept, added, removed };
 }
 async function syncAllDns(env, alive) {
   const topN = Number(env.DNS_TOP_N || 10);
