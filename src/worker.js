@@ -1402,14 +1402,14 @@ if (_btnProbe) {
 
 document.getElementById('copyTop')?.addEventListener('click', async () => {
   const keep = +document.getElementById('probeKeep').value;
-  const txt = _probeResults.slice(0, keep).filter(r => r.avg != null).map(r => r.ip + ':' + (r.port||443) + '#' + (r.carrier||'CF') + '-' + r.avg + 'ms').join('\n');
-  try { await navigator.clipboard.writeText(txt); document.getElementById('probeStatus').textContent = '已复制 ' + txt.split('\n').length + ' 个'; }
+  const txt = _probeResults.slice(0, keep).filter(r => r.avg != null).map(r => r.ip + ':' + (r.port||443) + '#' + (r.carrier||'CF') + '-' + r.avg + 'ms').join('\\n');
+  try { await navigator.clipboard.writeText(txt); document.getElementById('probeStatus').textContent = '已复制 ' + txt.split('\\n').length + ' 个'; }
   catch(e) { prompt('复制', txt); }
 });
 
 document.getElementById('dlTop')?.addEventListener('click', () => {
   const keep = +document.getElementById('probeKeep').value;
-  const txt = _probeResults.slice(0, keep).filter(r => r.avg != null).map(r => r.ip + ':' + (r.port||443) + '#' + (r.carrier||'CF') + '-' + r.avg + 'ms').join('\n');
+  const txt = _probeResults.slice(0, keep).filter(r => r.avg != null).map(r => r.ip + ':' + (r.port||443) + '#' + (r.carrier||'CF') + '-' + r.avg + 'ms').join('\\n');
   const blob = new Blob([txt], { type: 'text/plain' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
