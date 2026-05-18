@@ -72,23 +72,23 @@ const DEFAULT_CFG = {
 };
 
 const SOURCES = [
-  { name: "addressesapi/ip.164746.xyz", url: "https://addressesapi.090227.xyz/ip.164746.xyz", type: "carrier" },
-  { name: "addressesapi/CloudFlareYes", url: "https://addressesapi.090227.xyz/CloudFlareYes", type: "carrier" },
-  { name: "addressesapi/cmcc",          url: "https://addressesapi.090227.xyz/cmcc",          type: "carrier" },
-  { name: "addressesapi/ct",            url: "https://addressesapi.090227.xyz/ct",            type: "text" },
-  { name: "uouin.com/cloudflare", url: "https://api.uouin.com/cloudflare.html", type: "uouin_html" },
-  { name: "ip.164746.xyz/ipTop",        url: "https://ip.164746.xyz/ipTop.html",              type: "text" },
-  { name: "IPDB/proxy",                 url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/proxy.txt", type: "list" },
-  { name: "zip.cm.edu.kg/all",          url: "https://zip.cm.edu.kg/all.txt",                 type: "text" },
+  { name: "addressesapi/ip.164746.xyz", url: "https://addressesapi.090227.xyz/ip.164746.xyz", type: "carrier", category: "cf-native" },
+  { name: "addressesapi/CloudFlareYes", url: "https://addressesapi.090227.xyz/CloudFlareYes", type: "carrier", category: "cf-native" },
+  { name: "addressesapi/cmcc",          url: "https://addressesapi.090227.xyz/cmcc", type: "carrier", category: "cf-native" },
+  { name: "addressesapi/ct",            url: "https://addressesapi.090227.xyz/ct",   type: "carrier", category: "cf-native" },
+  { name: "uouin.com/cloudflare",       url: "https://www.uouin.com/cloudflare",     type: "uouin_html", category: "cf-native" },
+  { name: "ip.164746.xyz/ipTop",        url: "https://ip.164746.xyz/ipTop10.html",   type: "html", category: "cf-native" },
+  { name: "IPDB/proxy",                 url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/proxy.txt", type: "text", category: "cf-proxy" },
+  { name: "zip.cm.edu.kg/all",          url: "https://zip.cm.edu.kg/all.txt",        type: "text", category: "cf-native" },
   // ===== v2.1 cfnb 新增源 =====
-  { name: "countrymerge/all",           url: "https://countrymerge.pages.dev/all.txt",        type: "text" },
+  { name: "countrymerge/all",           url: "https://countrymerge.pages.dev/all.txt",                       type: "text", category: "cf-native" },
   // wtf-359 已并入 countrymerge，下行保留注释仅作历史记录
 
   // ===== v2.2 IPDB by ymyuuu/030101.xyz：用 GitHub raw 镜像绕开 CF 出站黑名单 =====
   // 030101.xyz 的 API 把 Cloudflare 数据中心 IP 段拉黑了，从 Worker 直接调会 403。
   // 但同作者把数据自动同步到了 github.com/ymyuuu/IPDB 仓库，raw 链路畅通。
-  { name: "IPDB/bestcf",       url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/bestcf.txt",                        type: "text" },
-  { name: "IPDB/bestproxy",    url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/BestProxy/bestproxy%26country.txt", type: "text" },
+  { name: "IPDB/bestcf",                url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/bestcf.txt", type: "text", category: "cf-native" },
+  { name: "IPDB/bestproxy",             url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/BestProxy/bestproxy&country.txt", type: "text", category: "cf-proxy" },
   // 注：IPDB/proxy（上面已配置 proxy.txt）已对应 030101.xyz?type=proxy，不再重复配置
 ];
 
@@ -486,6 +486,7 @@ async function fetchSource(src) {
     if (!r.ok) return { name: src.name, ips: [], error: `HTTP ${r.status}` };
     const body = await r.text();
     const ips = [];
+    const category = src.category || "cf-native";
 
     if (src.type === "uouin_html") {
       // uouin 页面 IP 周围用中文标签标注 carrier
@@ -500,28 +501,32 @@ async function fetchSource(src) {
         const before = body.slice(Math.max(0, m.index - 500), m.index);
         const tags = before.match(/电信|联通|移动/g) || [];
         const last = tags[tags.length - 1];
-        ips.push({ ip, port: 443, carrier: carrierMap[last] || null, sources: [src.name] });
+        ips.push({ ip, port: 443, carrier: carrierMap[last] || null, category, sources: [src.name] });
       }
       return { name: src.name, ips };
     }
 
     // v2.1：新源用 emoji/中文标签，需要自适应解析
-    const adaptiveSources = new Set(["countrymerge/all", "zip.cm.edu.kg/all"]);
+    // v2.2：扩大自适应名单（IPDB/bestproxy 同样带 country 标签）
+    const adaptiveSources = new Set([
+      "countrymerge/all",
+      "zip.cm.edu.kg/all",
+      "IPDB/bestproxy",
+    ]);
     const useAdaptive = adaptiveSources.has(src.name);
 
     for (const raw of body.split(/[\r\n,]+/)) {
       const line = raw.trim();
       if (!line || line.startsWith("#") || line.startsWith("//")) continue;
       if (useAdaptive) {
-        // 自适应：整行解析,标签可能含 emoji/中文/空格
         const parsed = parseLineAdaptive(line);
-        if (parsed) ips.push({ ...parsed, sources: [src.name] });
+        if (parsed) ips.push({ ...parsed, category, sources: [src.name] });
         continue;
       }
       const matches = line.match(/\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?(?:#[\w\-]+)?/g) || [];
       for (const mm of matches) {
         const parsed = parseLine(mm);
-        if (parsed) ips.push({ ...parsed, sources: [src.name] });
+        if (parsed) ips.push({ ...parsed, category, sources: [src.name] });
       }
     }
     return { name: src.name, ips };
@@ -538,8 +543,20 @@ async function aggregateSources() {
     stats.push({ name: r.name, count: r.ips.length, error: r.error });
     all.push(...r.ips);
   }
-  // 合并去重，按 ip:port 维度
+  // 合并去重，按 ip:port 维度。多源合并时 cf-native 优先级高于 cf-proxy
   const uniq = uniqBy(all, x => `${x.ip}:${x.port}`);
+  // uniqBy 只合并 sources，没合并 category，这里补一遍
+  const bySrcCategory = new Map();
+  for (const x of all) {
+    const k = `${x.ip}:${x.port}`;
+    const cur = bySrcCategory.get(k);
+    if (!cur || (cur === "cf-proxy" && x.category === "cf-native")) {
+      bySrcCategory.set(k, x.category || "cf-native");
+    }
+  }
+  for (const x of uniq) {
+    x.category = bySrcCategory.get(`${x.ip}:${x.port}`) || "cf-native";
+  }
   return { ips: uniq, stats };
 }
 
@@ -684,11 +701,15 @@ async function runFullTest(env, ctx, opts = {}) {
 
   // 3. 过滤：手动添加的要测速通过；池子里的全保留
   let alive = probed.filter(x => x._manual ? (x.delay != null && x.loss < 0.5) : true);
-  // 排序：tested + delay 小的优先；其余按来源数量降序
+  // 排序：tested + delay 小的优先；其余按 cf-native > cf-proxy > 来源数量降序
   alive.sort((a, b) => {
     if (a.tested && b.tested) return a.delay - b.delay;
     if (a.tested) return -1;
     if (b.tested) return 1;
+    // v2.2: category 优先级，cf-native 在前
+    const aCfNative = a.category === "cf-native" ? 0 : 1;
+    const bCfNative = b.category === "cf-native" ? 0 : 1;
+    if (aCfNative !== bCfNative) return aCfNative - bCfNative;
     return (b.sources?.length || 0) - (a.sources?.length || 0);
   });
 
@@ -794,13 +815,22 @@ async function syncAllDns(env, alive) {
   if (cfg.dnsRiskFilterEnabled) {
     pool = await applyRiskFilter(pool, cfg, Math.max(60, topN * 4));
   }
+  // v2.2: 按 category 分池，主域只放 cf-native，新增 proxy. 子域放 cf-proxy
+  const nativePool = pool.filter(x => x.category !== "cf-proxy");
+  const proxyPool = pool.filter(x => x.category === "cf-proxy");
   const results = [];
-  results.push(await syncRecord(env, env.CF_RECORD_NAME, pool, topN));
+  // 主域：cf-native
+  results.push(await syncRecord(env, env.CF_RECORD_NAME, nativePool, topN));
+  // 反代子域：cf-proxy
+  const root = env.CF_RECORD_NAME.split(".").slice(1).join(".");
+  if (proxyPool.length) {
+    results.push(await syncRecord(env, `proxy.${root}`, proxyPool, topN));
+  }
   if (env.CF_DNS_BY_CARRIER === "1") {
-    const root = env.CF_RECORD_NAME.split(".").slice(1).join(".");
     const groups = { CT: "ct", CU: "cu", CM: "cm" };
     for (const [carrier, prefix] of Object.entries(groups)) {
-      const subset = pool.filter(x => x.carrier === carrier);
+      // 运营商子域只从 cf-native 池筛
+      const subset = nativePool.filter(x => x.carrier === carrier);
       if (subset.length) results.push(await syncRecord(env, `${prefix}.${root}`, subset, topN));
     }
   }
@@ -1239,7 +1269,7 @@ async function handle(request, env, ctx) {
     }
     const root = env.CF_RECORD_NAME.split(".").slice(1).join(".");
     const main = env.CF_RECORD_NAME;
-    const names = [main, `ct.${root}`, `cu.${root}`, `cm.${root}`];
+    const names = [main, `proxy.${root}`, `ct.${root}`, `cu.${root}`, `cm.${root}`];
     const result = [];
     for (const n of names) {
       try {
