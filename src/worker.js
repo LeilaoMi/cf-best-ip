@@ -1645,7 +1645,7 @@ function clientTestIp(ip) {
     const timer = setTimeout(() => finish(false), 3000);
     img.onload = () => { clearTimeout(timer); finish(true); };
     img.onerror = () => { clearTimeout(timer); finish(true); };
-    img.src = `https://\${ip}/cdn-cgi/trace?_=\${Date.now()}`;
+    img.src = 'https://' + ip + '/cdn-cgi/trace?cb=' + Date.now();
   });
 }
 
