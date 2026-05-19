@@ -1440,7 +1440,7 @@ function renderHome(data, visitor) {
   const fmtSpeed = (x) => x.mbps != null ? `${x.mbps}M` : "—";
   const fmtColo = (x) => x.colo || x.node || "—";
 
-  const renderRow = (x, i) => `<tr>
+  const renderRow = (x, i) => `<tr data-ip="${x.ip}" data-tested="${x.delay != null ? 1 : 0}">
     <td class="num">${i + 1}</td>
     <td><span class="badge badge-${(x.carrier || "CF").toLowerCase()}">${carrierName(x.carrier || "CF")}</span></td>
     <td class="ipcell"><span class="ip" data-ip="${x.ip}">${x.ip}</span></td>
@@ -1623,6 +1623,92 @@ document.body.addEventListener('click', async (e) => {
       setTimeout(() => { btn.textContent = old; btn.classList.remove('ok'); }, 1500);
     }
   } catch { prompt('复制此内容', text); }
+});
+
+
+/* ===== 客户端实测延迟 =====
+ * 使用 <img> 触发 HTTPS 挡包计时量你浏览器到该 IP 的实际连接延迟。
+ * 所有尝试中可能因 TLS 证书不匹配/服务器拒绝在 onerror 出调，
+ * 但出调之前 TCP+TLS 握手已完成，计时仍可用。
+ */
+function clientTestIp(ip) {
+  return new Promise((resolve) => {
+    const start = performance.now();
+    const img = new Image();
+    let done = false;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      const ms = Math.round(performance.now() - start);
+      resolve({ ok, ms });
+    };
+    const timer = setTimeout(() => finish(false), 3000);
+    img.onload = () => { clearTimeout(timer); finish(true); };
+    img.onerror = () => { clearTimeout(timer); finish(true); };
+    img.src = `https://${ip}/cdn-cgi/trace?_=${Date.now()}`;
+  });
+}
+
+let clientTestQueue = [];
+let clientTestActive = 0;
+const CLIENT_TEST_CONCURRENCY = 6;
+
+function colorForDelay(ms) {
+  if (ms < 100) return '#3fb950';
+  if (ms < 300) return '#d29922';
+  return '#f85149';
+}
+
+async function processClientTestQueue() {
+  while (clientTestQueue.length && clientTestActive < CLIENT_TEST_CONCURRENCY) {
+    const row = clientTestQueue.shift();
+    if (!row || row.dataset.tested === '1') continue;
+    clientTestActive++;
+    (async () => {
+      const ip = row.dataset.ip;
+      const cell = row.querySelector('.cell-delay');
+      if (!cell) { clientTestActive--; return; }
+      cell.textContent = '测速中…';
+      cell.style.color = '#888';
+      const r = await clientTestIp(ip);
+      if (r.ok && r.ms > 0 && r.ms < 3000) {
+        cell.textContent = r.ms + 'ms*';
+        cell.style.color = colorForDelay(r.ms);
+        cell.title = '从你的浏览器到该 IP 的实测延迟（* 表示客户端测试）';
+        row.dataset.tested = '1';
+      } else {
+        cell.textContent = '超时';
+        cell.style.color = '#888';
+      }
+      clientTestActive--;
+      processClientTestQueue();
+    })();
+  }
+}
+
+function startClientTestsForActivePane() {
+  const activeTab = document.querySelector('.tab.active');
+  if (!activeTab) return;
+  const pane = document.getElementById('pane-' + activeTab.dataset.tab);
+  if (!pane) return;
+  const rows = pane.querySelectorAll('tr[data-tested="0"]');
+  // 插到队列但避免重复
+  rows.forEach(r => {
+    if (!clientTestQueue.includes(r)) clientTestQueue.push(r);
+  });
+  processClientTestQueue();
+}
+
+// 页面加载后启动(当前 active tab)
+window.addEventListener('load', () => setTimeout(startClientTestsForActivePane, 500));
+
+// 切 tab 时动启新 pane 的测试
+tabs.forEach(t => {
+  const orig = t.onclick;
+  t.onclick = (e) => {
+    if (orig) orig(e);
+    setTimeout(startClientTestsForActivePane, 50);
+  };
 });
 
 // 倒计时 (下次 Cron: 每 6 小时整 UTC)
