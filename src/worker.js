@@ -1381,7 +1381,7 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
 
 <div class="hero">
   <h1>☁️ CloudFlare 优选 IP</h1>
-  <p class="sub">电信、联通、移动 优质 Cloudflare 节点 IP<br>聚合 18 个公开源 · 全部经 CF 官方 CIDR 段二次校验 · 真实测速数据 · 每 6 小时自动刷新</p>
+  <p class="sub">电信、联通、移动 优质 Cloudflare 节点 IP<br>聚合 19 个公开源 · 全部经 CF 官方 CIDR 段二次校验 · 真实测速数据 · 每 6 小时自动刷新</p>
   <div class="hero-stats">
     <div>总节点 <b>${total}</b></div>
     <div>CF 自家 <b>${nativeCount}</b></div>
