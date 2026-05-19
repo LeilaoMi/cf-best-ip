@@ -36,7 +36,7 @@ import { connect } from "cloudflare:sockets";
 // ============================================================
 // 1. 常量 / 数据源 / 字典
 // ============================================================
-const VERSION = "3.3.0";
+const VERSION = "3.4.0";
 
 // ===== v2.3: Cloudflare 公开 IPv4 anycast CIDR (官方 ips-v4) =====
 // 用 IP 段精确判定 cf-native vs cf-proxy,不再依赖 source 元数据
@@ -827,7 +827,6 @@ async function runFullTest(env, ctx, opts = {}) {
   // 8. DNS 同步（后台执行）
   if (env.CF_API_TOKEN && env.CF_ZONE_ID && env.CF_RECORD_NAME) {
     ctx.waitUntil(syncAllDns(env, alive).catch(() => {}));
-    ctx.waitUntil(syncProbeSlots(env, alive).catch(() => {}));
   }
   // 9. Webhook
   ctx.waitUntil(notify(env, payload).catch(() => {}));
@@ -906,6 +905,16 @@ async function syncAllDns(env, alive) {
     for (const r of stale) await deleteRecord(env, r.id);
     if (stale.length) results.push({ name: `proxy.${root}`, removed: stale.length, ips: [] });
   } catch {}
+
+  // 显式删除遗留 p01-p50 探针子域记录(v3.4 移除探针机制)
+  for (let i = 1; i <= 50; i++) {
+    const slotName = `p${String(i).padStart(2, "0")}.${root}`;
+    try {
+      const stale = await listRecords(env, slotName);
+      for (const r of stale) await deleteRecord(env, r.id);
+      if (stale.length) results.push({ name: slotName, removed: stale.length, ips: [] });
+    } catch {}
+  }
   if (env.CF_DNS_BY_CARRIER === "1") {
     const groups = { CT: "ct", CU: "cu", CM: "cm" };
     for (const [carrier, prefix] of Object.entries(groups)) {
@@ -919,114 +928,7 @@ async function syncAllDns(env, alive) {
 // ============================================================
 // 7b. 探针子域池 —— 让任意访问者在自己网络下测真实 IP 延迟
 // ============================================================
-function pickDiverse(ips, n) {
-  const buckets = { CT: [], CU: [], CM: [], CF: [] };
-  for (const ip of ips) {
-    const k = (ip.carrier === "CMCC" ? "CM" : ip.carrier) || "CF";
-    if (!buckets[k]) buckets[k] = [];
-    buckets[k].push(ip);
-  }
-  for (const k of Object.keys(buckets)) {
-    buckets[k].sort((a, b) => (b.sources?.length || 0) - (a.sources?.length || 0));
-  }
-  // 三网每个先来 8 个，剩下从 CF 桶补
-  const out = [];
-  for (const k of ["CT", "CU", "CM"]) {
-    for (let i = 0; i < 8 && buckets[k].length; i++) out.push(buckets[k].shift());
-  }
-  while (out.length < n) {
-    let added = false;
-    for (const k of ["CF", "CT", "CU", "CM"]) {
-      if (out.length >= n) break;
-      if (buckets[k] && buckets[k].length) { out.push(buckets[k].shift()); added = true; }
-    }
-    if (!added) break;
-  }
-  return out.slice(0, n);
-}
 
-async function syncProbeSlots(env, ips, slotCount = 50, prefix = "p") {
-  if (!env.CF_API_TOKEN || !env.CF_ZONE_ID) return { ok: false, reason: "no CF_API_TOKEN/CF_ZONE_ID" };
-  const zone = env.CF_ZONE_ID;
-  const rec = env.CF_RECORD_NAME || "";
-  const root = rec.includes(".") ? rec.split(".").slice(1).join(".") : rec;
-  if (!root) return { ok: false, reason: "cannot derive root from CF_RECORD_NAME" };
-
-  // 1. 先构建 slots 数组并保存到 KV（不依赖 DNS 状态，前端立刻可用）
-  const top = pickDiverse(ips, slotCount);
-  const slots = top.map((t, i) => {
-    const slot = prefix + String(i + 1).padStart(2, "0");
-    return {
-      slot,
-      host: `${slot}.${root}`,
-      ip: t.ip,
-      port: t.port || 443,
-      carrier: t.carrier || "CF",
-      country: t.country || null,
-      countryName: t.countryName || null,
-      city: t.city || null,
-    };
-  });
-  await kvSet(env, "slots:current", { slots, root, prefix, updatedAt: Date.now() });
-
-  // 2. DNS 操作 best-effort（任何子操作失败都不影响 KV 已保存的 slots）
-  const tok = env.CF_API_TOKEN;
-  const auth = { Authorization: `Bearer ${tok}` };
-  let created = 0, updated = 0, deleted = 0;
-  const errors = [];
-
-  try {
-    const listResp = await fetch(`https://api.cloudflare.com/client/v4/zones/${zone}/dns_records?type=A&per_page=500`, { headers: auth });
-    const listData = await listResp.json();
-    const reName = new RegExp(`^${prefix}\\d+\\.${root.replace(/\./g, "\\.")}$`);
-    const curByName = {};
-    for (const r of (listData.result || [])) {
-      if (reName.test(r.name)) curByName[r.name] = r;
-    }
-
-    for (const s of slots) {
-      const existing = curByName[s.host];
-      try {
-        if (existing) {
-          if (existing.content !== s.ip) {
-            await fetch(`https://api.cloudflare.com/client/v4/zones/${zone}/dns_records/${existing.id}`, {
-              method: "PUT",
-              headers: { ...auth, "content-type": "application/json" },
-              body: JSON.stringify({ type: "A", name: s.host, content: s.ip, ttl: 60, proxied: false }),
-            });
-            updated++;
-          }
-          delete curByName[s.host];
-        } else {
-          await fetch(`https://api.cloudflare.com/client/v4/zones/${zone}/dns_records`, {
-            method: "POST",
-            headers: { ...auth, "content-type": "application/json" },
-            body: JSON.stringify({ type: "A", name: s.host, content: s.ip, ttl: 60, proxied: false }),
-          });
-          created++;
-        }
-      } catch (e) {
-        errors.push(`${s.host}: ${e.message || e}`);
-      }
-    }
-
-    // 删除剩余多余的
-    for (const name in curByName) {
-      try {
-        await fetch(`https://api.cloudflare.com/client/v4/zones/${zone}/dns_records/${curByName[name].id}`, {
-          method: "DELETE", headers: auth,
-        });
-        deleted++;
-      } catch (e) {
-        errors.push(`del ${name}: ${e.message || e}`);
-      }
-    }
-  } catch (e) {
-    errors.push(`list: ${e.message || e}`);
-  }
-
-  return { ok: true, total: slots.length, created, updated, deleted, errors };
-}
 
 // ============================================================
 // 8. Webhook 通知
@@ -1268,10 +1170,6 @@ async function handle(request, env, ctx) {
       }
     }
     return json({ ok: true, dns: result });
-  }
-  if (path === "/api/probe-slots") {
-    const cur = await kvGet(env, "slots:current", { slots: [], updatedAt: 0 });
-    return json({ ok: true, ...cur });
   }
   // ---- 页面 ----
   if (path === "/" || path === "/index.html") return html(renderHome(data, visitor));
