@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-orange)](https://workers.cloudflare.com/)
-[![Version](https://img.shields.io/badge/version-3.2-blue)]()
+[![Version](https://img.shields.io/badge/version-3.4-blue)]()
 
 > 在 Cloudflare Worker 上跑的 **CF 自家 IP 优选服务**:聚合社区主流数据源,经官方 CIDR 校验,按运营商 / 全局展示,自动同步到自定义子域 A 记录。
 
@@ -133,9 +133,10 @@ cf.<域名> / ct. / cu. / cm. 各 top N
 
 ```
 cf-best-ip/
-├── src/worker.js        # 全部代码 (~1660 行)
-├── wrangler.toml        # Workers 配置
-└── README.md
+├── src/worker.js   # 整个项目的全部代码 (~1640 行,单文件 Worker)
+├── wrangler.toml   # Cloudflare Workers 配置
+├── README.md
+└── LICENSE         # MIT
 ```
 
 ---
