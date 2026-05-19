@@ -1,37 +1,36 @@
 /**
  * ============================================================
- *  CF Best IP · 集大成版 Worker  (v2.0)
+ *  CF Best IP · Cloudflare 优选 IP Worker  (v3.4)
  *  https://github.com/LeilaoMi/cf-best-ip
  * ============================================================
  *
- *  社区主流方案都有的功能：
- *   - 多源聚合 + Cron 定时 + KV 持久化       (cfnb / CF Workers 版)
- *   - 真实 TCP 三次握手测速 (cloudflare:sockets)
- *   - HTTP 带宽抽样测速 + colo / 国家识别    (CFST 思路)
- *   - 自动同步 Cloudflare DNS A 记录         (cfnb)
- *   - 订阅 + V2Ray base64 + Clash + EDT 兼容 (cmliu 系列)
- *   - 管理面板 + 密码保护                    (CF Workers 重制版)
- *   - 浏览器在线测速                         (itdog 风格)
- *
- *  本项目独家：
- *   ★ 多维度筛选 API：country / colo / carrier / port / maxDelay / minMbps
- *   ★ 分运营商 DNS 同步：ct.example.com / cu.example.com / cm.example.com
- *   ★ 智能就近推荐 /sub?smart=1（按访问者 colo 算距离）
- *   ★ CIDR 自定义扫描（管理面板里贴段，Worker 边缘开扫）
- *   ★ 历史快照 + Telegram / Discord Webhook 通知
+ *  功能（与代码 1:1 对齐）：
+ *   - 多源聚合 + KV 持久化  +  Cron 每 6 小时自动刷新
+ *   - CF 官方 IPv4 CIDR 二次校验，只保留 AS13335 真 CF anycast
+ *   - hostmonit 三网预测速数据 + colo / 国家识别
+ *   - 自动同步 Cloudflare DNS A 记录 (cf./ct./cu./cm. 四子域)
+ *   - 页面客户端实测延迟 (浏览器 <img> HTTPS 握手计时)
+ *   - /sub 明文 IP 列表订阅 (v2rayN / DDNS 互通) + /api/preferred-ips (EDT 格式)
  *
  *  环境变量（wrangler secret put / dashboard 添加）：
- *    CF_API_TOKEN      可选，同步 DNS 的 Cloudflare API Token (Zone:DNS:Edit)
- *    CF_ZONE_ID        可选，目标域名 Zone ID
- *    CF_RECORD_NAME    可选，主 A 记录名，例如 cf.example.com
- *    CF_DNS_BY_CARRIER 可选，"1" 启用按运营商分别同步 (ct./cu./cm. 前缀)
- *    DNS_TOP_N         可选，DNS 同步取前 N 个 IP，默认 10
- *    TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID  可选，Cron 完成后推送通知
+ *    CF_API_TOKEN              可选，同步 DNS 的 Cloudflare API Token (Zone:DNS:Edit)
+ *    CF_ZONE_ID                可选，目标域名 Zone ID
+ *    CF_RECORD_NAME            可选，主 A 记录名，例如 cf.example.com
+ *    CF_DNS_BY_CARRIER         可选，"1" 启用按运营商分别同步 (ct./cu./cm. 前缀)
+ *    DNS_TOP_N                 可选，DNS 同步取前 N 个 IP，默认 10
+ *    TELEGRAM_BOT_TOKEN /
+ *    TELEGRAM_CHAT_ID          可选，Cron 完成后推送通知
  *
- *  KV 绑定：变量名固定 KV
+ *  项目主路由：
+ *    /                         展示页（uouin 风，处理页面测速）
+ *    /api/ips                  JSON 节点列表（支持 carrier / country / colo 过滤）
+ *    /api/refresh              手动触发拉取 + 同步 DNS（60s 冷却）
+ *    /api/stats                统计信息
+ *    /api/dns/current          看 CF 当前 DNS 记录
+ *    /sub                      明文 IP 订阅
+ *    /api/preferred-ips        EDT 格式订阅
  */
 
-import { connect } from "cloudflare:sockets";
 
 // ============================================================
 // 1. 常量 / 数据源 / 字典
@@ -513,8 +512,6 @@ async function saveLatest(env, data) {
   const day = new Date().toISOString().slice(0, 10);
   await kvSet(env, `ips:history:${day}`, data, { expirationTtl: 60 * 60 * 24 * 30 });
 }
-async function getManual(env) { return await kvGet(env, "ips:manual", []); }
-async function setManual(env, list) { await kvSet(env, "ips:manual", list); }
 
 // ============================================================
 // 4. 数据源抓取
@@ -636,36 +633,6 @@ async function aggregateSources() {
 // 5. 测速核心
 // ============================================================
 
-/** TCP 三次握手测速 —— 使用 cloudflare:sockets */
-async function tcpPing(ip, port, timeoutMs) {
-  const t0 = Date.now();
-  try {
-    const sock = connect({ hostname: ip, port: Number(port) }, { allowHalfOpen: false, secureTransport: "off" });
-    // opened 是 promise，resolve 即 SYN/ACK 完成
-    await withTimeout(sock.opened, timeoutMs);
-    const ms = Date.now() - t0;
-    try { await sock.close(); } catch {}
-    return ms;
-  } catch (e) {
-    return null;
-  }
-}
-
-/** 多次 TCP ping，取平均 + 丢包率 */
-async function tcpPingN(ip, port, n, timeoutMs) {
-  const samples = [];
-  for (let i = 0; i < n; i++) {
-    const ms = await tcpPing(ip, port, timeoutMs);
-    samples.push(ms);
-  }
-  const ok = samples.filter(x => x != null);
-  return {
-    samples,
-    min: ok.length ? Math.min(...ok) : null,
-    avg: ok.length ? Math.round(ok.reduce((a, b) => a + b, 0) / ok.length) : null,
-    loss: 1 - ok.length / n,
-  };
-}
 
 /** 通过 cdn-cgi/trace 获取 colo / country —— 必须走 cloudflare-dns.com 这种已有有效证书的域名 */
 async function detectColo(ip, port, timeoutMs) {
@@ -754,9 +721,6 @@ async function runFullTest(env, ctx, opts = {}) {
 
   // 1. 拉源
   const agg = await aggregateSources();
-  const manual = await getManual(env);
-  for (const m of manual) agg.ips.push({ ...m, sources: ["manual"], _manual: true });
-
   // 2. 标记 / 测速
   //    注意：Cloudflare Workers 禁止 connect() 到自家 IP，
   //    所以对来源于公开池的 CF IP，我们直接信任源数据（它们都已被
@@ -764,17 +728,13 @@ async function runFullTest(env, ctx, opts = {}) {
   //    实际跑 ping。
   const probed = await pMap(agg.ips, async (item) => {
     const port = item.port || 443;
-    if (item._manual) {
-      const r = await tcpPingN(item.ip, port, 2, cfg.probeTimeoutMs);
-      return { ...item, port, delay: r.avg, loss: r.loss, tested: r.avg != null };
-    }
     // 已有预测速数据（如 hostmonit）则保留;否则填空
     if (item.tested) return { ...item, port };
     return { ...item, port, delay: null, loss: 0, tested: false };
   }, cfg.probeConcurrency);
 
   // 3. 过滤：手动添加的要测速通过；池子里的全保留
-  let alive = probed.filter(x => x._manual ? (x.delay != null && x.loss < 0.5) : true);
+  let alive = probed.slice();
   // 排序:tested + delay 小的优先,其余按 source 计数降序
   alive.sort((a, b) => {
     if (a.tested && b.tested) return a.delay - b.delay;
@@ -1121,15 +1081,6 @@ async function handle(request, env, ctx) {
   }
 
   // ---- 单 IP 测速 ----
-  if (path === "/api/probe") {
-    const ip = params.get("ip");
-    const port = Number(params.get("port") || 443);
-    const times = Math.min(Number(params.get("times") || 3), 5);
-    if (!ip || !/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return json({ ok: false, error: "bad ip" }, { status: 400 });
-    const r = await tcpPingN(ip, port, times, 3000);
-    // 注意：Workers 平台禁止从 Worker 连 CF 自家 IP，对 CF IP 返回的 loss 始终为 1
-    return json({ ok: r.avg != null, ip, port, ...r, hint: r.avg == null ? "Workers cannot connect to Cloudflare-owned IPs; this is a platform limitation, not your IP being down." : undefined });
-  }
 
   // ---- 历史 ----
   if (path === "/api/history") {
@@ -1197,20 +1148,6 @@ export default {
 // ============================================================
 // 13. CIDR 展开
 // ============================================================
-function expandCidr(cidr, limit = 64) {
-  const m = cidr.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)$/);
-  if (!m) return [];
-  const base = ((+m[1]) << 24) | ((+m[2]) << 16) | ((+m[3]) << 8) | (+m[4]);
-  const bits = +m[5];
-  const size = Math.min(2 ** (32 - bits), limit);
-  const out = [];
-  for (let i = 0; i < size; i++) {
-    const n = (base & (0xffffffff << (32 - bits))) + i;
-    out.push([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join("."));
-  }
-  return out;
-}
-
 // ============================================================
 // 14. HTML 模板
 // ============================================================

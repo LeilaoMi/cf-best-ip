@@ -22,7 +22,7 @@ Cloudflare 在 [2024 年 12 月声明](https://www.landiannews.com/archives/1070
 
 | 模块 | 行为 |
 |---|---|
-| **聚合** | 每 6 小时 Cron 从 18 个社区源拉取候选 IP |
+| **聚合** | 每 6 小时 Cron 从 19 个社区源拉取候选 IP |
 | **校验** | 用 Cloudflare 官方 [`ips-v4`](https://www.cloudflare.com/ips-v4) 的 15 个 CIDR 段做位运算判定,**非 AS13335 段全部丢弃** |
 | **测速** | 主数据源 `hostmonit` 在国内三大运营商 VPS 实测延迟+丢包+速度,直接复用 |
 | **展示** | 在 `cfip.<你的域名>` 显示 5 个 tab:全部 / 电信 / 联通 / 移动 / 通用 |
@@ -53,7 +53,7 @@ Cloudflare 在 [2024 年 12 月声明](https://www.landiannews.com/archives/1070
 ## 🏗️ 架构
 
 ```
-18 个社区源 → 并发拉取 → 解析 IP/carrier
+19 个社区源 → 并发拉取 → 解析 IP/carrier
        ↓
 CF 官方 CIDR 二次校验(只留 AS13335)
        ↓
@@ -111,11 +111,10 @@ cf.<域名> / ct. / cu. / cm. 各 top N
 | `/api/refresh` | POST 触发一次重新抓取(60s 冷却) |
 | `/api/ips` | JSON 全量列表,支持 `?carrier=CT/CU/CM&top=N` |
 | `/api/stats` | 池子统计 |
-| `/api/probe?ip=...&port=443` | 单 IP TCP 测速(对 CF IP 无效,平台限制) |
 | `/api/dns/current` | 当前 4 子域的 DNS 记录 |
 | `/api/history?days=7` | 过去 N 天的快照 |
 | `/sub` | 纯文本订阅:`IP:port` 一行一条,可作 DDNS 用 |
-| `/sub/edt` | EDT 格式 |
+| `/api/preferred-ips` | EDT 格式订阅（Karing 等客户端适用） |
 | `/test` | 节点浏览页(可按 carrier/country/colo 过滤) |
 
 ---
@@ -133,7 +132,7 @@ cf.<域名> / ct. / cu. / cm. 各 top N
 
 ```
 cf-best-ip/
-├── src/worker.js   # 整个项目的全部代码 (~1640 行,单文件 Worker)
+├── src/worker.js   # 整个项目的全部代码 (~1580 行,单文件 Worker)
 ├── wrangler.toml   # Cloudflare Workers 配置
 ├── README.md
 └── LICENSE         # MIT

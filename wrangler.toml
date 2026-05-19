@@ -1,31 +1,24 @@
 name = "cf-best-ip"
 main = "src/worker.js"
 compatibility_date = "2024-12-01"
-# Workers TCP socket（用于 TCP ping）需要这个 flag
-compatibility_flags = ["nodejs_compat"]
 
-# KV：先创建命名空间，把返回的 id 粘到下面
-#   npx wrangler kv namespace create KV
+# KV namespace
 [[kv_namespaces]]
 binding = "KV"
 id = "23c38685383d4d3f8a1391487482e0a9"
 
-# Cron Trigger：每 6 小时自动测速 + 同步 DNS
+# Cron Trigger - 每 6 小时拉一次源 + 同步 DNS
 [triggers]
 crons = ["0 */6 * * *"]
 
-# 非敏感变量（敏感的用 wrangler secret put）
+# 非敏感变量(public,可见即可)
 [vars]
-# 自动 DNS 同步 —— 留空则不启用
-CF_ZONE_ID        = "9aaafd1409adada280a4a6138cad50e4"    # 域名所在 Zone ID（CF 域名概览右栏复制）
-CF_RECORD_NAME    = "cf.leilaomi.cc.cd"    # 例如 cf.example.com
-CF_DNS_BY_CARRIER = "1"   # "1" 启用按运营商分别同步 (ct./cu./cm.)
+CF_ZONE_ID        = "9aaafd1409adada280a4a6138cad50e4"
+CF_RECORD_NAME    = "cf.leilaomi.cc.cd"
+CF_DNS_BY_CARRIER = "1"   # "1" = 按运营商分子域同步 (ct./cu./cm.)
 DNS_TOP_N         = "10"
 
-# 敏感变量请用 secret 命令注入：
-#   wrangler secret put ADMIN_PASSWORD
-#   wrangler secret put SUB_TOKEN              # 可选
-#   wrangler secret put CF_API_TOKEN           # 可选 (Zone:DNS:Edit)
-#   wrangler secret put TELEGRAM_BOT_TOKEN     # 可选
-#   wrangler secret put TELEGRAM_CHAT_ID       # 可选
-#   wrangler secret put DISCORD_WEBHOOK        # 可选
+# 敏感变量请用 secret 命令注入:
+#   wrangler secret put CF_API_TOKEN          # Cloudflare Zone:DNS:Edit
+#   wrangler secret put TELEGRAM_BOT_TOKEN    # 可选
+#   wrangler secret put TELEGRAM_CHAT_ID      # 可选
