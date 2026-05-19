@@ -36,7 +36,7 @@ import { connect } from "cloudflare:sockets";
 // ============================================================
 // 1. 常量 / 数据源 / 字典
 // ============================================================
-const VERSION = "3.0.0";
+const VERSION = "3.3.0";
 
 // ===== v2.3: Cloudflare 公开 IPv4 anycast CIDR (官方 ips-v4) =====
 // 用 IP 段精确判定 cf-native vs cf-proxy,不再依赖 source 元数据
@@ -1645,7 +1645,7 @@ function clientTestIp(ip) {
     const timer = setTimeout(() => finish(false), 3000);
     img.onload = () => { clearTimeout(timer); finish(true); };
     img.onerror = () => { clearTimeout(timer); finish(true); };
-    img.src = `https://${ip}/cdn-cgi/trace?_=${Date.now()}`;
+    img.src = `https://\${ip}/cdn-cgi/trace?_=\${Date.now()}`;
   });
 }
 
