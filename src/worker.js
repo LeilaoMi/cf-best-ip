@@ -1127,7 +1127,6 @@ async function handle(request, env, ctx) {
   }
   // ---- 页面 ----
   if (path === "/" || path === "/index.html") return html(renderHome(data, visitor));
-  if (path === "/test") return html(renderTest(visitor));
 
   return new Response("Not Found", { status: 404 });
 }

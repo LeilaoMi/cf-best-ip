@@ -115,7 +115,6 @@ cf.<域名> / ct. / cu. / cm. 各 top N
 | `/api/history?days=7` | 过去 N 天的快照 |
 | `/sub` | 纯文本订阅:`IP:port` 一行一条,可作 DDNS 用 |
 | `/api/preferred-ips` | EDT 格式订阅（Karing 等客户端适用） |
-| `/test` | 节点浏览页(可按 carrier/country/colo 过滤) |
 
 ---
 
