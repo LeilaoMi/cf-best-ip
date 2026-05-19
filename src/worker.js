@@ -906,15 +906,17 @@ async function syncAllDns(env, alive) {
     if (stale.length) results.push({ name: `proxy.${root}`, removed: stale.length, ips: [] });
   } catch {}
 
-  // 显式删除遗留 p01-p50 探针子域记录(v3.4 移除探针机制)
-  for (let i = 1; i <= 50; i++) {
-    const slotName = `p${String(i).padStart(2, "0")}.${root}`;
-    try {
-      const stale = await listRecords(env, slotName);
-      for (const r of stale) await deleteRecord(env, r.id);
-      if (stale.length) results.push({ name: slotName, removed: stale.length, ips: [] });
-    } catch {}
-  }
+  // v3.4 移除探针机制:bulk list & delete p\d+. 残留(每次 Cron 删到上限,逐步清完)
+  try {
+    const allRecords = await cfApi(env, `/zones/${env.CF_ZONE_ID}/dns_records?per_page=100&type=A`);
+    const probePattern = new RegExp(`^p\\d{2}\\.${root.replace(/\./g, "\\.")}$`);
+    const probeRecords = (allRecords.result || []).filter(r => probePattern.test(r.name));
+    let removed = 0;
+    for (const r of probeRecords) {
+      try { await deleteRecord(env, r.id); removed++; } catch {}
+    }
+    if (removed) results.push({ name: "probe-slots", removed, ips: [] });
+  } catch {}
   if (env.CF_DNS_BY_CARRIER === "1") {
     const groups = { CT: "ct", CU: "cu", CM: "cm" };
     for (const [carrier, prefix] of Object.entries(groups)) {
