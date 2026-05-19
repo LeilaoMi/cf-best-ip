@@ -908,7 +908,8 @@ async function syncAllDns(env, alive) {
 
   // v3.4 移除探针机制:bulk list & delete p\d+. 残留(每次 Cron 删到上限,逐步清完)
   try {
-    const allRecords = await cfApi(env, `/zones/${env.CF_ZONE_ID}/dns_records?per_page=100&type=A`);
+    const allRes = await cfApi(env, `/zones/${env.CF_ZONE_ID}/dns_records?per_page=100&type=A`);
+    const allRecords = await allRes.json();
     const probePattern = new RegExp(`^p\\d{2}\\.${root.replace(/\./g, "\\.")}$`);
     const probeRecords = (allRecords.result || []).filter(r => probePattern.test(r.name));
     let removed = 0;
