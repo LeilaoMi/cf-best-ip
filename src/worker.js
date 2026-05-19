@@ -21,15 +21,12 @@
  *   ★ 历史快照 + Telegram / Discord Webhook 通知
  *
  *  环境变量（wrangler secret put / dashboard 添加）：
- *    ADMIN_PASSWORD    必填，管理员登录密码
- *    SUB_TOKEN         可选，订阅鉴权 token，不设则订阅公开
  *    CF_API_TOKEN      可选，同步 DNS 的 Cloudflare API Token (Zone:DNS:Edit)
  *    CF_ZONE_ID        可选，目标域名 Zone ID
  *    CF_RECORD_NAME    可选，主 A 记录名，例如 cf.example.com
  *    CF_DNS_BY_CARRIER 可选，"1" 启用按运营商分别同步 (ct./cu./cm. 前缀)
  *    DNS_TOP_N         可选，DNS 同步取前 N 个 IP，默认 10
  *    TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID  可选，Cron 完成后推送通知
- *    DISCORD_WEBHOOK   可选，Discord 通知
  *
  *  KV 绑定：变量名固定 KV
  */
@@ -143,7 +140,6 @@ const SOURCES = [
   { name: "addressesapi/CloudFlareYes", url: "https://addressesapi.090227.xyz/CloudFlareYes", type: "carrier", category: "cf-native" },
   { name: "addressesapi/cmcc",          url: "https://addressesapi.090227.xyz/cmcc", type: "carrier", category: "cf-native" },
   { name: "addressesapi/ct",            url: "https://addressesapi.090227.xyz/ct",   type: "carrier", category: "cf-native" },
-  { name: "uouin.com/cloudflare",       url: "https://www.uouin.com/cloudflare",     type: "uouin_html", category: "cf-native" },
   { name: "ip.164746.xyz/ipTop",        url: "https://ip.164746.xyz/ipTop10.html",   type: "html", category: "cf-native" },
   // ===== v2.1 cfnb 新增源 =====
   // wtf-359 已并入 countrymerge，下行保留注释仅作历史记录
@@ -151,6 +147,11 @@ const SOURCES = [
   // ===== v2.2 IPDB by ymyuuu/030101.xyz：用 GitHub raw 镜像绕开 CF 出站黑名单 =====
   // 030101.xyz 的 API 把 Cloudflare 数据中心 IP 段拉黑了，从 Worker 直接调会 403。
   // 但同作者把数据自动同步到了 github.com/ymyuuu/IPDB 仓库，raw 链路畅通。
+  // ===== v3.2 DustinWin/BestCF 索引裡入 CMLiussss 全免费子域 + wetest 微测网 =====
+  { name: "CMLiussss/cm", url: "https://cf.090227.xyz/cmcc", type: "carrier", category: "cf-native" },
+  { name: "CMLiussss/cu", url: "https://cf.090227.xyz/cu",   type: "carrier", category: "cf-native" },
+  { name: "CMLiussss/ct", url: "https://cf.090227.xyz/ct",   type: "carrier", category: "cf-native" },
+  { name: "wetest.vip/cloudflare", url: "https://www.wetest.vip/page/cloudflare/address_v4.html", type: "uouin_html", category: "cf-native" },
   { name: "IPDB/bestcf",                url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/bestcf.txt", type: "text", category: "cf-native" },
   // 注：IPDB/proxy（上面已配置 proxy.txt）已对应 030101.xyz?type=proxy，不再重复配置
 ];
@@ -590,6 +591,9 @@ async function fetchSource(src) {
     const adaptiveSources = new Set([
       "countrymerge/all",
       "zip.cm.edu.kg/all",
+      "CMLiussss/cm",
+      "CMLiussss/cu",
+      "CMLiussss/ct",
     ]);
     const useAdaptive = adaptiveSources.has(src.name);
 
@@ -1028,7 +1032,7 @@ async function syncProbeSlots(env, ips, slotCount = 50, prefix = "p") {
 // 8. Webhook 通知
 // ============================================================
 async function notify(env, payload) {
-  if (!env.TELEGRAM_BOT_TOKEN && !env.DISCORD_WEBHOOK) return;
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
   const ips = payload.ips || [];
   const total = ips.length;
   // 按运营商分布
@@ -1059,13 +1063,6 @@ async function notify(env, payload) {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text: md, parse_mode: "Markdown", disable_web_page_preview: true }),
-    });
-  }
-  if (env.DISCORD_WEBHOOK) {
-    await fetch(env.DISCORD_WEBHOOK, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ content: md }),
     });
   }
 }
@@ -1160,46 +1157,10 @@ function fmtSub(ips, withComment) {
   }).join("\n");
 }
 function fmtEDT(ips) { return ips.map(x => `${x.ip}:${x.port}`).join("\n"); }
-function fmtV2ray(ips) {
-  // 简单 vmess 模板可由订阅器消费；这里仅 base64 编码 sub
-  const txt = fmtSub(ips, true);
-  return btoa(unescape(encodeURIComponent(txt)));
-}
-function fmtClash(ips) {
-  const lines = ["proxies:"];
-  for (const x of ips) {
-    const name = `CF-${x.country || ""}-${x.colo || ""}-${x.ip}`.replace(/--+/g, "-");
-    lines.push(`  - {name: "${name}", server: ${x.ip}, port: ${x.port}, type: trojan, password: REPLACE_ME, sni: REPLACE_ME, skip-cert-verify: false}`);
-  }
-  return lines.join("\n");
-}
 
 // ============================================================
 // 10. 鉴权
 // ============================================================
-function checkAdmin(request, env) {
-  if (!env.ADMIN_PASSWORD) return false;
-  const a = request.headers.get("authorization") || "";
-  if (!a.startsWith("Basic ")) return false;
-  try {
-    const dec = atob(a.slice(6));
-    const i = dec.indexOf(":");
-    const pwd = i >= 0 ? dec.slice(i + 1) : dec;
-    return pwd === env.ADMIN_PASSWORD;
-  } catch { return false; }
-}
-function unauthorized() {
-  return new Response("Auth required", {
-    status: 401,
-    headers: { "www-authenticate": 'Basic realm="cf-best-ip"' },
-  });
-}
-function checkSubToken(request, env) {
-  if (!env.SUB_TOKEN) return true;
-  const url = new URL(request.url);
-  const t = url.searchParams.get("token") || request.headers.get("authorization")?.replace(/^Bearer\s+/, "") || "";
-  return t === env.SUB_TOKEN;
-}
 
 // ============================================================
 // 11. 路由
@@ -1223,51 +1184,11 @@ async function handle(request, env, ctx) {
 
   // ---- 订阅 ----
   if (path === "/sub" || path === "/sub.txt" || path === "/api/ips.txt" || path === "/ips.txt") {
-    if (!checkSubToken(request, env)) return text("Forbidden", { status: 403 });
     const filtered = applyFilter(ips, params, requesterColo, cfg);
     return text(fmtSub(filtered, params.get("comment") !== "0"));
   }
   if (path === "/api/preferred-ips") {
-    if (!checkSubToken(request, env)) return text("Forbidden", { status: 403 });
     return text(fmtEDT(applyFilter(ips, params, requesterColo, cfg)));
-  }
-  if (path === "/api/v2ray") {
-    if (!checkSubToken(request, env)) return text("Forbidden", { status: 403 });
-    return text(fmtV2ray(applyFilter(ips, params, requesterColo, cfg)));
-  }
-  if (path === "/api/clash") {
-    if (!checkSubToken(request, env)) return text("Forbidden", { status: 403 });
-    return new Response(fmtClash(applyFilter(ips, params, requesterColo, cfg)), { headers: { "content-type": "text/yaml; charset=utf-8" } });
-  }
-
-  // ---- 真订阅：V2RayN/Shadowrocket 用的 vless:// 列表（base64） ----
-  if (path === "/sub/vless" || path === "/api/sub/vless") {
-    if (!checkSubToken(request, env)) return text("Forbidden", { status: 403 });
-    const tpl = cfg.vlessTemplate || "";
-    if (!tpl.startsWith("vless://")) {
-      return text(
-        "尚未配置 vless 节点模板。\n" +
-        "请进入 /admin 在【订阅模板】区域填一条完整的 vless:// URI（含你的 UUID/SNI/path），" +
-        "本接口会用它生成 V2RayN/Sing-box 能直接订阅的 base64 节点列表。",
-        { status: 412 }
-      );
-    }
-    const list = applyFilter(ips, params, requesterColo, cfg);
-    // 解析模板：vless://<uuid>@<host>:<port>?<query>#<remark>
-    const tplMatch = tpl.match(/^vless:\/\/([^@]+)@([^:/?#]+)(?::(\d+))?(\?[^#]*)?(?:#(.*))?$/);
-    if (!tplMatch) return text("vless 模板格式错误", { status: 400 });
-    const [, uuid, , tplPort, tplQuery] = tplMatch;
-    const tplPortNum = tplPort ? +tplPort : 443;
-    const lines = list.map((x) => {
-      const port = x.port || tplPortNum;
-      const tag = [carrierName(x.carrier || "CF"), x.country || "", x.ip].filter(Boolean).join("-");
-      return `vless://${uuid}@${x.ip}:${port}${tplQuery || ""}#${encodeURIComponent(tag)}`;
-    });
-    const out = lines.join("\n");
-    const fmt = params.get("format") || "base64";
-    if (fmt === "raw") return text(out);
-    // base64：V2RayN 订阅要求 base64
-    return text(btoa(unescape(encodeURIComponent(out))));
   }
 
   // ---- JSON 列表 ----
@@ -1330,14 +1251,6 @@ async function handle(request, env, ctx) {
     return json({ ok: true, count: result.ips.length, elapsedMs: result.elapsedMs, sourceStats: result.sourceStats });
   }
 
-  // ---- 管理：DNS 手动同步 ----
-  if (path === "/api/dns/sync") {
-    if (!checkAdmin(request, env)) return unauthorized();
-    const data = await getLatest(env);
-    const ips = data.ips || [];
-    const result = await syncAllDns(env, ips);
-    return json({ ok: true, result });
-  }
   if (path === "/api/dns/current") {
     if (!env.CF_API_TOKEN || !env.CF_ZONE_ID || !env.CF_RECORD_NAME) {
       return json({ ok: false, error: "DNS sync not configured" });
@@ -1360,72 +1273,9 @@ async function handle(request, env, ctx) {
     const cur = await kvGet(env, "slots:current", { slots: [], updatedAt: 0 });
     return json({ ok: true, ...cur });
   }
-  if (path === "/api/sync-slots" && request.method === "POST") {
-    if (!checkAdmin(request, env)) return unauthorized();
-    const data = await getLatest(env);
-    const result = await syncProbeSlots(env, data.ips || []);
-    return json(result);
-  }
-  if (path === "/api/cache/clear" && request.method === "POST") {
-    if (!checkAdmin(request, env)) return unauthorized();
-    await kvSet(env, "ips:latest", { ips: [], sourceStats: [], updatedAt: 0 });
-    return json({ ok: true });
-  }
-
-  // ---- 管理：配置读写 ----
-  if (path === "/api/config" && request.method === "GET") {
-    if (!checkAdmin(request, env)) return unauthorized();
-    return json(await getConfig(env));
-  }
-  if (path === "/api/config" && request.method === "POST") {
-    if (!checkAdmin(request, env)) return unauthorized();
-    const body = await request.json().catch(() => ({}));
-    const cfg = await setConfig(env, body);
-    return json({ ok: true, config: cfg });
-  }
-
-  // ---- 管理：手动 IP 增删 ----
-  if (path === "/api/manual" && request.method === "GET") {
-    if (!checkAdmin(request, env)) return unauthorized();
-    return json(await getManual(env));
-  }
-  if (path === "/api/manual" && request.method === "POST") {
-    if (!checkAdmin(request, env)) return unauthorized();
-    const body = await request.json().catch(() => ({}));
-    const list = (body.lines || "").split(/[\r\n,]+/).map(parseLine).filter(Boolean);
-    const cur = await getManual(env);
-    const merged = uniqBy([...cur, ...list.map(x => ({ ...x, sources: ["manual"], addedAt: Date.now() }))], x => `${x.ip}:${x.port}`);
-    await setManual(env, merged);
-    return json({ ok: true, count: merged.length });
-  }
-  if (path === "/api/manual" && request.method === "DELETE") {
-    if (!checkAdmin(request, env)) return unauthorized();
-    const ip = params.get("ip");
-    const cur = await getManual(env);
-    await setManual(env, cur.filter(x => x.ip !== ip));
-    return json({ ok: true });
-  }
-
-  // ---- 管理：CIDR 扫描 ----
-  if (path === "/api/cidr-scan") {
-    if (!checkAdmin(request, env)) return unauthorized();
-    const body = await request.json().catch(() => ({}));
-    const ips = expandCidr(body.cidr || "", Math.min(body.limit || 64, 64));
-    const port = body.port || 443;
-    const result = await pMap(ips, async (ip) => {
-      const r = await tcpPingN(ip, port, 1, 2500);
-      return { ip, port, delay: r.avg };
-    }, 15);
-    return json({ ok: true, ips: result.filter(x => x.delay != null).sort((a, b) => a.delay - b.delay) });
-  }
-
   // ---- 页面 ----
   if (path === "/" || path === "/index.html") return html(renderHome(data, visitor));
   if (path === "/test") return html(renderTest(visitor));
-  if (path === "/admin") {
-    if (!checkAdmin(request, env)) return unauthorized();
-    return html(renderAdmin());
-  }
 
   return new Response("Not Found", { status: 404 });
 }
@@ -1538,7 +1388,7 @@ ${extraHead}
 </style></head><body><div class="wrap">
 <header style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;gap:12px;flex-wrap:wrap">
   <div><h1>☁️ cf-best-ip</h1><div class="mut" style="font-size:11px;margin-top:2px">融合社区方案 · 集大成版 v${VERSION}</div></div>
-  <nav><a href="/">首页</a><a href="/test">节点浏览</a><a href="/admin">管理</a><a href="https://github.com/LeilaoMi/cf-best-ip" target="_blank" rel="noreferrer">GitHub</a></nav>
+  <nav><a href="/">首页</a><a href="/test">节点浏览</a><a href="https://github.com/LeilaoMi/cf-best-ip" target="_blank" rel="noreferrer">GitHub</a></nav>
 </header>
 ${body}
 <footer class="mut" style="margin-top:20px;font-size:11px;text-align:center;padding:14px 0">基于 Cloudflare Workers · MIT License · ☕</footer>
