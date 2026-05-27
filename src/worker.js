@@ -1,6 +1,6 @@
 /**
  * ============================================================
- *  CF Best IP · Cloudflare 优选 IP Worker  (v3.5.1)
+ *  CF Best IP · Cloudflare 优选 IP Worker  (v3.5.2)
  *  https://github.com/LeilaoMi/cf-best-ip
  * ============================================================
  *
@@ -37,7 +37,7 @@
 // ============================================================
 // 1. 常量 / 数据源 / 字典
 // ============================================================
-const VERSION = "3.5.1";
+const VERSION = "3.5.2";
 
 // ===== v2.3: Cloudflare 公开 IPv4 anycast CIDR (官方 ips-v4) =====
 // 用 IP 段精确判定 cf-native vs cf-proxy,不再依赖 source 元数据
@@ -800,17 +800,20 @@ async function listRecords(env, name) {
   const j = await cfApiJson(env, `/zones/${env.CF_ZONE_ID}/dns_records?type=A&name=${encodeURIComponent(name)}&per_page=100`);
   return j.result || [];
 }
-async function deleteRecord(env, id) {
-  return cfApiJson(env, `/zones/${env.CF_ZONE_ID}/dns_records/${id}`, { method: "DELETE" });
+async function listAllARecords(env) {
+  const all = [];
+  let page = 1;
+  while (true) {
+    const j = await cfApiJson(env, `/zones/${env.CF_ZONE_ID}/dns_records?type=A&per_page=100&page=${page}`);
+    const rows = j.result || [];
+    all.push(...rows);
+    const info = j.result_info || {};
+    if (!rows.length || page >= (info.total_pages || 1)) break;
+    page++;
+  }
+  return all;
 }
-async function createRecord(env, name, ip) {
-  return cfApiJson(env, `/zones/${env.CF_ZONE_ID}/dns_records`, {
-    method: "POST",
-    body: JSON.stringify({ type: "A", name, content: ip, ttl: 60, proxied: false }),
-  });
-}
-async function syncRecord(env, name, ips, topN) {
-  if (!ips.length) return { skipped: true, name };
+function buildWantedIps(ips, topN) {
   const wanted = [];
   const seen = new Set();
   for (const x of ips) {
@@ -819,27 +822,31 @@ async function syncRecord(env, name, ips, topN) {
     wanted.push(x.ip);
     if (wanted.length >= topN) break;
   }
+  return wanted;
+}
+async function batchDnsRecords(env, deletes, posts) {
+  if (!deletes.length && !posts.length) return null;
+  const body = {};
+  if (deletes.length) body.deletes = deletes.map(id => ({ id }));
+  if (posts.length) body.posts = posts;
+  return cfApiJson(env, `/zones/${env.CF_ZONE_ID}/dns_records/batch`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+async function syncRecordFromExisting(env, name, ips, topN, existing) {
+  if (!ips.length) return { skipped: true, name };
+  const wanted = buildWantedIps(ips, topN);
   const wantedSet = new Set(wanted);
-  const existing = await listRecords(env, name);
   const existingMap = new Map(existing.map(r => [r.content, r.id]));
-  // 1) 删除不再需要的
-  let removed = 0, added = 0, kept = 0;
-  for (const r of existing) {
-    if (!wantedSet.has(r.content)) {
-      await deleteRecord(env, r.id);
-      removed++;
-    } else {
-      kept++;
-    }
-  }
-  // 2) 创建新增的
+  const deletes = [];
+  for (const r of existing) if (!wantedSet.has(r.content)) deletes.push(r.id);
+  const posts = [];
   for (const ip of wanted) {
-    if (!existingMap.has(ip)) {
-      await createRecord(env, name, ip);
-      added++;
-    }
+    if (!existingMap.has(ip)) posts.push({ type: "A", name, content: ip, ttl: 60, proxied: false });
   }
-  return { name, ips: wanted, kept, added, removed };
+  await batchDnsRecords(env, deletes, posts);
+  return { name, ips: wanted, kept: existing.length - deletes.length, added: posts.length, removed: deletes.length };
 }
 async function syncAllDns(env, alive) {
   const startedAt = Date.now();
@@ -856,27 +863,34 @@ async function syncAllDns(env, alive) {
       pool = await applyRiskFilter(pool, cfg, Math.max(60, topN * 4));
     }
     const root = env.CF_RECORD_NAME.split(".").slice(1).join(".");
-    results.push(await syncRecord(env, env.CF_RECORD_NAME, pool, topN));
-
-    for (const staleName of [`proxy.${root}`, `proxyip.${root}`]) {
-      const stale = await listRecords(env, staleName);
-      let removed = 0;
-      for (const r of stale) { await deleteRecord(env, r.id); removed++; }
-      if (removed) results.push({ name: staleName, removed, ips: [] });
+    const allRecords = await listAllARecords(env);
+    const byName = new Map();
+    for (const r of allRecords) {
+      if (!byName.has(r.name)) byName.set(r.name, []);
+      byName.get(r.name).push(r);
     }
 
-    const all = await cfApiJson(env, `/zones/${env.CF_ZONE_ID}/dns_records?per_page=100&type=A`);
+    const staleNames = new Set([`proxy.${root}`, `proxyip.${root}`]);
     const probePattern = new RegExp(`^p\\d{2}\\.${root.replace(/\./g, "\\.")}$`);
-    const probeRecords = (all.result || []).filter(r => probePattern.test(r.name));
+    const cleanupIds = [];
+    let staleRemoved = 0;
     let probeRemoved = 0;
-    for (const r of probeRecords) { await deleteRecord(env, r.id); probeRemoved++; }
+    for (const r of allRecords) {
+      if (staleNames.has(r.name)) { cleanupIds.push(r.id); staleRemoved++; }
+      else if (probePattern.test(r.name)) { cleanupIds.push(r.id); probeRemoved++; }
+    }
+    if (cleanupIds.length) await batchDnsRecords(env, cleanupIds, []);
+    if (staleRemoved) results.push({ name: "stale-proxy", removed: staleRemoved, ips: [] });
     if (probeRemoved) results.push({ name: "probe-slots", removed: probeRemoved, ips: [] });
+
+    results.push(await syncRecordFromExisting(env, env.CF_RECORD_NAME, pool, topN, byName.get(env.CF_RECORD_NAME) || []));
 
     if (env.CF_DNS_BY_CARRIER === "1") {
       const groups = { CT: "ct", CU: "cu", CM: "cm" };
       for (const [carrier, prefix] of Object.entries(groups)) {
+        const name = `${prefix}.${root}`;
         const subset = pool.filter(x => x.carrier === carrier);
-        if (subset.length) results.push(await syncRecord(env, `${prefix}.${root}`, subset, topN));
+        if (subset.length) results.push(await syncRecordFromExisting(env, name, subset, topN, byName.get(name) || []));
       }
     }
     const summary = { ok: true, startedAt, finishedAt: Date.now(), elapsedMs: Date.now() - startedAt, topN, results };
