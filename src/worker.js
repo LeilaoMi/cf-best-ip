@@ -1,6 +1,6 @@
 /**
  * ============================================================
- *  CF Best IP · Cloudflare 优选 IP Worker  (v3.5)
+ *  CF Best IP · Cloudflare 优选 IP Worker  (v3.5.1)
  *  https://github.com/LeilaoMi/cf-best-ip
  * ============================================================
  *
@@ -37,7 +37,7 @@
 // ============================================================
 // 1. 常量 / 数据源 / 字典
 // ============================================================
-const VERSION = "3.5.0";
+const VERSION = "3.5.1";
 
 // ===== v2.3: Cloudflare 公开 IPv4 anycast CIDR (官方 ips-v4) =====
 // 用 IP 段精确判定 cf-native vs cf-proxy,不再依赖 source 元数据
@@ -749,13 +749,32 @@ async function runFullTest(env, ctx, opts = {}) {
   };
   await saveLatest(env, payload);
 
-  // 8. DNS 同步（后台执行）
+  // 8. DNS 同步
+  let dnsSync = null;
   if (env.CF_API_TOKEN && env.CF_ZONE_ID && env.CF_RECORD_NAME) {
-    ctx.waitUntil(syncAllDns(env, alive).catch(e => kvSet(env, "dns:lastSync", { ok: false, finishedAt: Date.now(), error: String(e && e.message || e) }).catch(() => {})));
+    const sync = syncAllDns(env, alive);
+    if (opts.waitForDns) {
+      try { dnsSync = await sync; }
+      catch (e) { dnsSync = await kvGet(env, "dns:lastSync", { ok: false, error: String(e && e.message || e) }); }
+    } else {
+      ctx.waitUntil(sync.catch(async e => {
+        const now = Date.now();
+        const prev = await kvGet(env, "dns:lastSync", null);
+        await kvSet(env, "dns:lastSync", {
+          ok: false,
+          startedAt: prev?.startedAt || now,
+          finishedAt: now,
+          elapsedMs: prev?.startedAt ? now - prev.startedAt : 0,
+          topN: Number(env.DNS_TOP_N || 10),
+          results: prev?.results || [],
+          error: String(e && e.message || e),
+        });
+      }).catch(() => {}));
+    }
   }
   // 9. Webhook
   ctx.waitUntil(notify(env, payload).catch(() => {}));
-  return payload;
+  return { ...payload, dnsSync };
 }
 
 // ============================================================
@@ -1088,8 +1107,8 @@ async function handle(request, env, ctx) {
       return json({ ok: false, error: "rate-limited", retryAfter: remain, hint: `请 ${remain} 秒后再试` }, { status: 429 });
     }
     await env.KV?.put("refresh:cooldown", String(Date.now()), { expirationTtl: 120 });
-    const result = await runFullTest(env, ctx);
-    return json({ ok: true, count: result.ips.length, elapsedMs: result.elapsedMs, sourceStats: result.sourceStats });
+    const result = await runFullTest(env, ctx, { waitForDns: true });
+    return json({ ok: true, count: result.ips.length, elapsedMs: result.elapsedMs, dnsSync: result.dnsSync, sourceStats: result.sourceStats });
   }
 
   if (path === "/api/dns/current") {
