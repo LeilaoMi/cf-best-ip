@@ -170,3 +170,14 @@ DNS 同步后会通过 Cloudflare DoH 和 Google DoH 检查托管域名是否已
 ### 响应头
 
 HTML/API 默认 `no-store`，并添加 `x-content-type-options`、`referrer-policy`、`x-frame-options`，避免缓存旧状态并提升基础安全性。
+
+
+### 管理权限保护
+
+`/admin` 和 `/api/diagnostics` 已使用 `ADMIN_TOKEN` 保护。`/api/refresh` 同时接受 `REFRESH_TOKEN` 或 `ADMIN_TOKEN`。
+
+首次进入可使用 `/admin?token=<ADMIN_TOKEN>`，页面会把 token 保存在当前浏览器 sessionStorage，并移除地址栏中的 token。
+
+### 外部健康监控
+
+已新增 GitHub Actions 工作流 `.github/workflows/health-check.yml`，每 30 分钟请求 `/health`。如果健康检查返回非 2xx 或 `.ok != true`，工作流会失败。

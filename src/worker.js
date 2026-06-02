@@ -287,16 +287,33 @@ function bearerToken(request) {
   const h = request.headers.get("authorization") || "";
   return h.toLowerCase().startsWith("bearer ") ? h.slice(7).trim() : "";
 }
+function queryToken(request) {
+  try { return new URL(request.url).searchParams.get("token") || ""; }
+  catch { return ""; }
+}
+function requestToken(request) {
+  return bearerToken(request) || queryToken(request);
+}
+function isAdminAuthorized(request, env) {
+  if (!env.ADMIN_TOKEN) return false;
+  return constantTimeEqual(requestToken(request), env.ADMIN_TOKEN);
+}
+function requireAdminAuth(request, env) {
+  if (isAdminAuthorized(request, env)) return null;
+  return json({ ok: false, error: "unauthorized", hint: "需要 Authorization: Bearer <ADMIN_TOKEN>，或使用 /admin?token=<ADMIN_TOKEN> 首次进入" }, { status: 401 });
+}
 function requireRefreshAuth(request, env) {
   if (request.method !== "POST") {
     return json({ ok: false, error: "method-not-allowed", hint: "请使用 POST" }, { status: 405, headers: { allow: "POST" } });
   }
   if (env.ALLOW_PUBLIC_REFRESH === "1") return null;
+  const token = requestToken(request);
+  if (env.ADMIN_TOKEN && constantTimeEqual(token, env.ADMIN_TOKEN)) return null;
   if (!env.REFRESH_TOKEN) {
     return json({ ok: false, error: "refresh-token-not-configured", hint: "请先配置 REFRESH_TOKEN secret，或仅依赖 Cron 自动刷新" }, { status: 503 });
   }
-  if (!constantTimeEqual(bearerToken(request), env.REFRESH_TOKEN)) {
-    return json({ ok: false, error: "unauthorized", hint: "需要 Authorization: Bearer <REFRESH_TOKEN>" }, { status: 401 });
+  if (!constantTimeEqual(token, env.REFRESH_TOKEN)) {
+    return json({ ok: false, error: "unauthorized", hint: "需要 Authorization: Bearer <REFRESH_TOKEN> 或 <ADMIN_TOKEN>" }, { status: 401 });
   }
   return null;
 }
@@ -1262,6 +1279,8 @@ async function handle(request, env, ctx) {
   }
 
   if (path === "/api/diagnostics") {
+    const authError = requireAdminAuth(request, env);
+    if (authError) return authError;
     const lastDnsSync = await kvGet(env, "dns:lastSync", null);
     const lastError = await kvGet(env, "refresh:lastError", null);
     return json(publicDiagnostics(data, lastDnsSync, lastError, env));
@@ -1354,6 +1373,8 @@ async function handle(request, env, ctx) {
     return json({ ok: true, topN: Number(env.DNS_TOP_N || 10), lastSync: await kvGet(env, "dns:lastSync", null), dns: result });
   }
   if (path === "/admin") {
+    const authError = requireAdminAuth(request, env);
+    if (authError) return html(renderAdminLogin());
     const lastDnsSync = await kvGet(env, "dns:lastSync", null);
     const lastError = await kvGet(env, "refresh:lastError", null);
     const history = [];
@@ -1393,6 +1414,10 @@ export default {
 // ============================================================
 // 14. HTML 模板
 // ============================================================
+function renderAdminLogin() {
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理控制台登录</title><style>body{margin:0;background:#0a0d12;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center;min-height:100vh}.card{width:min(420px,calc(100vw - 32px));background:#11161d;border:1px solid #1f2630;border-radius:14px;padding:20px}h1{font-size:22px;margin:0 0 10px}.mut{color:#8b949e;font-size:13px;line-height:1.7}input{width:100%;box-sizing:border-box;margin:14px 0 10px;padding:11px;border-radius:8px;border:1px solid #1f2630;background:#0d1117;color:#e6edf3}.btn{width:100%;background:#1f6feb;color:#fff;border:0;border-radius:8px;padding:11px;cursor:pointer}</style></head><body><div class="card"><h1>管理控制台</h1><div class="mut">请输入 ADMIN_TOKEN。Token 只保存在当前浏览器会话，不会写入服务器。</div><input id="token" type="password" placeholder="ADMIN_TOKEN"><button class="btn" id="go">进入</button></div><script>document.getElementById('go').onclick=()=>{const t=document.getElementById('token').value.trim();if(!t)return;sessionStorage.setItem('adminToken',t);location.href='/admin?token='+encodeURIComponent(t)};</script></body></html>`;
+}
+
 function renderAdmin(data, visitor) {
   const ips = (data.ips || []).slice().sort((a, b) => (b._score || 0) - (a._score || 0));
   const serviceHost = visitor.serviceHostname || "bestip.leilaomi.cc.cd";
@@ -1425,7 +1450,8 @@ body{margin:0;background:#0a0d12;color:#e6edf3;font-family:-apple-system,BlinkMa
 <div class="section"><h2>稳定分 Top 20</h2><div class="panel"><table><thead><tr><th>#</th><th>IP</th><th>线路</th><th>国家</th><th>稳定分</th><th>延迟</th><th>来源</th></tr></thead><tbody>${topRows}</tbody></table></div></div>
 <div class="section"><h2>数据源健康</h2><div class="panel"><table><thead><tr><th>数据源</th><th>数量</th><th>状态</th></tr></thead><tbody>${sourceRows}</tbody></table></div></div>
 </div><script>
-document.getElementById('refresh').onclick=async(e)=>{const btn=e.target;const token=sessionStorage.getItem('refreshToken')||prompt('输入 REFRESH_TOKEN');if(!token)return;sessionStorage.setItem('refreshToken',token);btn.disabled=true;btn.textContent='刷新中…';try{const r=await fetch('/api/refresh',{method:'POST',headers:{authorization:'Bearer '+token}}).then(r=>r.json());if(r.ok){btn.textContent='完成';setTimeout(()=>location.reload(),800)}else{if(r.error==='unauthorized')sessionStorage.removeItem('refreshToken');btn.textContent=r.hint||r.error||'失败';setTimeout(()=>{btn.disabled=false;btn.textContent='手动刷新'},3000)}}catch(err){btn.textContent=err.message;btn.disabled=false}}
+const urlToken=new URLSearchParams(location.search).get('token');if(urlToken){sessionStorage.setItem('adminToken',urlToken);history.replaceState(null,'','/admin')}
+document.getElementById('refresh').onclick=async(e)=>{const btn=e.target;const token=sessionStorage.getItem('adminToken')||prompt('输入 ADMIN_TOKEN');if(!token)return;sessionStorage.setItem('adminToken',token);btn.disabled=true;btn.textContent='刷新中…';try{const r=await fetch('/api/refresh',{method:'POST',headers:{authorization:'Bearer '+token}}).then(r=>r.json());if(r.ok){btn.textContent='完成';setTimeout(()=>location.reload(),800)}else{if(r.error==='unauthorized')sessionStorage.removeItem('adminToken');btn.textContent=r.hint||r.error||'失败';setTimeout(()=>{btn.disabled=false;btn.textContent='手动刷新'},3000)}}catch(err){btn.textContent=err.message;btn.disabled=false}}
 </script></body></html>`;
 }
 

@@ -1,0 +1,17 @@
+name: Health Check
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check cf-best-ip health
+        run: |
+          set -euo pipefail
+          body="$(curl -fsS --max-time 20 https://bestip.leilaomi.cc.cd/health)"
+          echo "$body"
+          echo "$body" | jq -e '.ok == true'

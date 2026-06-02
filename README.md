@@ -108,6 +108,7 @@ wrangler deploy
 | `AUTO_RECORD_NAME` | 默认推荐优选池，会同步成 A 记录 | `auto.example.com` |
 | `CF_RECORD_NAME` | 通用优选池，会同步成 A 记录 | `cf.example.com` |
 | `REFRESH_TOKEN` | 手动刷新 Bearer token | `openssl rand -hex 32` |
+| `ADMIN_TOKEN` | 管理控制台和诊断接口 Bearer token，也可触发刷新 | `openssl rand -hex 32` |
 
 ### 可选环境变量
 
@@ -132,7 +133,7 @@ wrangler deploy
 | `/api/ips` | JSON 全量列表，支持 `?carrier=CT/CU/CM&top=N` |
 | `/api/stats` | 池子统计 + 最近一次 DNS 同步结果 |
 | `/health` | 轻量健康检查，适合外部监控探活 |
-| `/api/diagnostics` | 诊断快照：节点数、三网分布、数据源健康、陈旧状态、DNS 同步、最近错误 |
+| `/api/diagnostics` | 诊断快照：节点数、三网分布、数据源健康、陈旧状态、DNS 同步、最近错误；需要 `ADMIN_TOKEN` |
 | `/api/dns/current` | 当前 4 子域的 DNS 记录 + 最近一次同步结果 |
 | `/api/history?days=7` | 过去 N 天的快照 |
 | `/sub` | 纯文本订阅：`IP:port` 一行一条，可作 DDNS 用 |
@@ -157,7 +158,7 @@ curl -X POST \
 - **diff-based DNS sync**：已存在且仍在 wanted 中的记录**不动**，只删托管白名单记录中多余的 A 记录、创建缺失记录，并把最近一次同步结果写入 KV 的 `dns:lastSync`，方便 `/api/stats` 和 `/api/dns/current` 排查。
 - **DNS 生效验证**：同步后通过 Cloudflare / Google DoH 检查 `auto/cf/ct/cu/cm` 是否已解析到期望 IP，结果显示在首页、`/admin` 和 `/api/stats`。
 - **变更阈值控制**：默认每个域名单次最多替换约 30% 记录，优先保留当前仍可用 A 记录，降低客户端连接波动。
-- **管理控制台**：`/admin` 可查看 DNS 同步详情、最近错误、7 天趋势、稳定分 Top 20、数据源健康，并支持手动刷新。
+- **管理控制台**：`/admin` 需要 `ADMIN_TOKEN`，可查看 DNS 同步详情、最近错误、7 天趋势、稳定分 Top 20、数据源健康，并支持手动刷新。
 - **陈旧数据告警**：超过 8 小时未刷新时，首页、`/admin`、`/health`、`/api/diagnostics` 会明确提示。
 - **安全与缓存头**：HTML/API 响应默认 no-store，并带基础安全响应头；`/robots.txt` 避免索引 admin/API。
 - **Worker 平台限制**：Cloudflare Workers 禁止从 Worker 出口连接 CF 自家 IP（`connect()` 会失败），所以**本项目不在 Worker 内做 TCP 测速**，完全依赖 hostmonit 等后端测速数据。
@@ -189,3 +190,7 @@ cf-best-ip/
 ## 📜 License
 
 MIT
+
+## 监控
+
+仓库包含 `.github/workflows/health-check.yml`，每 30 分钟请求 `https://bestip.leilaomi.cc.cd/health`，用于发现 Worker、Cron 或数据源异常。
