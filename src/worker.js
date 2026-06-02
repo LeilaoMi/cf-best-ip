@@ -861,7 +861,7 @@ async function runFullTest(env, ctx, opts = {}) {
     }
   }
   // 9. Webhook
-  ctx.waitUntil(notify(env, payload).catch(() => {}));
+  ctx.waitUntil(notify(env, { ...payload, dnsSync }).catch(() => {}));
   return { ...payload, dnsSync };
 }
 
@@ -970,7 +970,29 @@ async function batchDnsRecords(env, deletes, posts) {
 }
 async function syncRecordFromExisting(env, name, ips, topN, existing) {
   if (!ips.length) return { skipped: true, name };
-  const wanted = buildWantedIps(ips, topN);
+  const ratio = Math.min(Math.max(Number(env.DNS_MAX_CHANGE_RATIO || 0.3), 0.05), 1);
+  const maxChanges = existing.length ? Math.max(1, Math.floor(topN * ratio)) : topN;
+  const candidatePool = buildWantedIps(ips, Math.max(topN * 3, topN));
+  const candidateSet = new Set(candidatePool);
+  const existingContents = existing.map(r => r.content);
+  const final = [];
+  const addFinal = (ip) => { if (ip && !final.includes(ip) && final.length < topN) final.push(ip); };
+
+  for (const ip of existingContents) if (candidateSet.has(ip)) addFinal(ip);
+
+  let addedNew = 0;
+  for (const ip of candidatePool) {
+    if (final.length >= topN) break;
+    if (existingContents.includes(ip)) continue;
+    if (addedNew >= maxChanges && existing.length) break;
+    addFinal(ip);
+    addedNew++;
+  }
+
+  for (const ip of existingContents) addFinal(ip);
+  for (const ip of candidatePool) addFinal(ip);
+
+  const wanted = final.slice(0, topN);
   const wantedSet = new Set(wanted);
   const existingMap = new Map(existing.map(r => [r.content, r.id]));
   const deletes = [];
@@ -980,7 +1002,7 @@ async function syncRecordFromExisting(env, name, ips, topN, existing) {
     if (!existingMap.has(ip)) posts.push({ type: "A", name, content: ip, ttl: 60, proxied: false });
   }
   await batchDnsRecords(env, deletes, posts);
-  return { name, ips: wanted, kept: existing.length - deletes.length, added: posts.length, removed: deletes.length };
+  return { name, ips: wanted, kept: existing.length - deletes.length, added: posts.length, removed: deletes.length, maxChanges };
 }
 async function syncAllDns(env, alive) {
   const startedAt = Date.now();
@@ -1051,11 +1073,16 @@ async function notify(env, payload) {
   // 域名
   const serviceHostname = getServiceHostname(env);
   const homeUrl = serviceHostname ? `https://${serviceHostname}/` : "";
+  const dnsRows = Array.isArray(payload.dnsSync) ? payload.dnsSync : [];
+  const changed = dnsRows.reduce((n, r) => n + (r.added || 0) + (r.removed || 0), 0);
+  const verified = payload.dnsVerification || payload.lastDnsSync?.verification;
   const lines = [
-    `🚀 *cf-best-ip 测速完成*`,
+    `🚀 *cf-best-ip 刷新完成*`,
     `时间: ${new Date(payload.updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}`,
     `节点池: *${total}* 个`,
     `运营商: 电信 ${byCarrier.CT || 0} · 联通 ${byCarrier.CU || 0} · 移动 ${byCarrier.CM || 0} · 通用 ${byCarrier.CF || 0}`,
+    `DNS 变更: ${changed} 项${dnsRows.length ? ` · ${dnsRows.map(r => `${r.name}:${r.added || 0}/${r.removed || 0}`).join(" ")}` : ""}`,
+    verified ? `DNS 验证: ${verified.ok ? "通过" : "待传播"}` : "",
     `国家 Top: ${topCountries.map(([c, n]) => `${flag(c)}${c}×${n}`).join(" ")}`,
     homeUrl ? `🌐 ${homeUrl}` : "",
   ].filter(Boolean);
@@ -1234,7 +1261,7 @@ async function handle(request, env, ctx) {
     for (let i = 0; i < days; i++) {
       const d = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10);
       const snap = await kvGet(env, `ips:history:${d}`);
-      if (snap) out.push({ date: d, count: snap.ips.length, top1: snap.ips[0] });
+      if (snap) out.push({ date: d, count: snap.ips.length, byCarrier: countByCarrier(snap.ips), top1: snap.ips[0], updatedAt: snap.updatedAt });
     }
     return json({ days, history: out });
   }
@@ -1270,6 +1297,18 @@ async function handle(request, env, ctx) {
     }
     return json({ ok: true, topN: Number(env.DNS_TOP_N || 10), lastSync: await kvGet(env, "dns:lastSync", null), dns: result });
   }
+  if (path === "/admin") {
+    const lastDnsSync = await kvGet(env, "dns:lastSync", null);
+    const lastError = await kvGet(env, "refresh:lastError", null);
+    const history = [];
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10);
+      const snap = await kvGet(env, `ips:history:${d}`);
+      if (snap) history.push({ date: d, count: snap.ips.length, byCarrier: countByCarrier(snap.ips), updatedAt: snap.updatedAt });
+    }
+    return html(renderAdmin({ ...data, lastDnsSync, lastError, history }, visitor));
+  }
+
   // ---- 页面 ----
   if (path === "/" || path === "/index.html") {
     const lastDnsSync = await kvGet(env, "dns:lastSync", null);
@@ -1298,6 +1337,40 @@ export default {
 // ============================================================
 // 14. HTML 模板
 // ============================================================
+function renderAdmin(data, visitor) {
+  const ips = (data.ips || []).slice().sort((a, b) => (b._score || 0) - (a._score || 0));
+  const serviceHost = visitor.serviceHostname || "bestip.leilaomi.cc.cd";
+  const root = visitor.root || "leilaomi.cc.cd";
+  const hosts = [visitor.autoRecordName || `auto.${root}`, visitor.cfRecordName || `cf.${root}`, `ct.${root}`, `cu.${root}`, `cm.${root}`];
+  const lastSync = data.lastDnsSync || null;
+  const lastError = data.lastError || null;
+  const history = data.history || [];
+  const sourceStats = data.sourceStats || [];
+  const top = ips.slice(0, 20);
+  const fmtTime = (ts) => ts ? new Date(ts).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "—";
+  const syncRows = (lastSync?.results || []).filter(x => x?.name);
+  const verifyRows = new Map((lastSync?.verification?.checks || []).map(x => [x.name, x]));
+  const sourceRows = sourceStats.map(s => `<tr><td>${s.name}</td><td>${s.count || 0}</td><td>${s.error ? `<span class="bad">${s.error}</span>` : '<span class="ok">正常</span>'}</td></tr>`).join("");
+  const topRows = top.map((x, i) => `<tr><td>${i + 1}</td><td>${x.ip}</td><td>${carrierName(x.carrier || "CF")}</td><td>${x.country || "—"}</td><td>${x._score ?? "—"}</td><td>${x.delay != null ? x.delay + "ms" : "—"}</td><td>${x.sources?.length || 0}</td></tr>`).join("");
+  const syncHtml = syncRows.length ? syncRows.map(r => {
+    const v = verifyRows.get(r.name);
+    const vText = v ? (v.ok ? `已生效 ${v.matched}/${v.expected}` : `待传播 ${v.matched}/${v.expected}`) : "未验证";
+    return `<div class="card"><b>${r.name}</b><span>保留 ${r.kept || 0} · 新增 ${r.added || 0} · 删除 ${r.removed || 0} · 上限 ${r.maxChanges || "—"} · ${vText}</span></div>`;
+  }).join("") : '<div class="empty">暂无 DNS 同步记录</div>';
+  const histRows = history.map(h => `<tr><td>${h.date}</td><td>${h.count}</td><td>${h.byCarrier?.CT || 0}</td><td>${h.byCarrier?.CU || 0}</td><td>${h.byCarrier?.CM || 0}</td><td>${h.byCarrier?.CF || 0}</td></tr>`).join("");
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>cf-best-ip 管理控制台</title><style>
+body{margin:0;background:#0a0d12;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1180px;margin:0 auto;padding:18px}.hero{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:16px}.hero h1{margin:0;font-size:26px}.mut{color:#8b949e;font-size:13px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-bottom:16px}.card,.panel{background:#11161d;border:1px solid #1f2630;border-radius:12px;padding:14px}.card b{display:block;margin-bottom:6px}.card span{color:#8b949e;font-size:12px;line-height:1.6}.actions{display:flex;flex-wrap:wrap;gap:8px}.btn{background:#1f6feb;color:#fff;border:0;border-radius:8px;padding:9px 12px;cursor:pointer}.btn.secondary{background:#222b36}.ok{color:#3fb950}.bad{color:#f85149}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #1f2630;text-align:left}th{color:#8b949e;font-weight:500}.section{margin:18px 0}.section h2{font-size:16px;margin:0 0 10px}.empty{color:#8b949e;padding:12px}.host{font-family:ui-monospace,monospace;color:#79c0ff;word-break:break-all}</style></head><body><div class="wrap">
+<div class="hero"><div><h1>cf-best-ip 管理控制台</h1><div class="mut">${serviceHost} · 最近刷新 ${fmtTime(data.updatedAt)}</div></div><div class="actions"><a class="btn secondary" href="/">返回首页</a><button class="btn" id="refresh">手动刷新</button></div></div>
+<div class="grid"><div class="card"><b>总节点</b><span>${ips.length} 个</span></div><div class="card"><b>DNS 状态</b><span>${lastSync?.ok ? '最近同步成功' : '暂无成功同步'} · ${lastSync?.verification?.ok ? '验证通过' : '等待验证/传播'}</span></div><div class="card"><b>最近错误</b><span>${lastError ? `${lastError.error || 'error'} · ${lastError.message || ''}` : '无记录'}</span></div><div class="card"><b>入口域名</b><span class="host">${hosts.join('<br>')}</span></div></div>
+<div class="section"><h2>DNS 同步详情</h2><div class="grid">${syncHtml}</div></div>
+<div class="section"><h2>7 天趋势</h2><div class="panel"><table><thead><tr><th>日期</th><th>总数</th><th>电信</th><th>联通</th><th>移动</th><th>通用</th></tr></thead><tbody>${histRows || '<tr><td colspan="6">暂无历史</td></tr>'}</tbody></table></div></div>
+<div class="section"><h2>稳定分 Top 20</h2><div class="panel"><table><thead><tr><th>#</th><th>IP</th><th>线路</th><th>国家</th><th>稳定分</th><th>延迟</th><th>来源</th></tr></thead><tbody>${topRows}</tbody></table></div></div>
+<div class="section"><h2>数据源健康</h2><div class="panel"><table><thead><tr><th>数据源</th><th>数量</th><th>状态</th></tr></thead><tbody>${sourceRows}</tbody></table></div></div>
+</div><script>
+document.getElementById('refresh').onclick=async(e)=>{const btn=e.target;const token=sessionStorage.getItem('refreshToken')||prompt('输入 REFRESH_TOKEN');if(!token)return;sessionStorage.setItem('refreshToken',token);btn.disabled=true;btn.textContent='刷新中…';try{const r=await fetch('/api/refresh',{method:'POST',headers:{authorization:'Bearer '+token}}).then(r=>r.json());if(r.ok){btn.textContent='完成';setTimeout(()=>location.reload(),800)}else{if(r.error==='unauthorized')sessionStorage.removeItem('refreshToken');btn.textContent=r.hint||r.error||'失败';setTimeout(()=>{btn.disabled=false;btn.textContent='手动刷新'},3000)}}catch(err){btn.textContent=err.message;btn.disabled=false}}
+</script></body></html>`;
+}
+
 function renderHome(data, visitor) {
   const ips = data.ips || [];
   const updated = data.updatedAt ? new Date(data.updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "（未运行）";
@@ -1429,6 +1502,12 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
 .subcard{padding:14px;background:var(--card);border:1px solid var(--bd);border-radius:10px}
 .subcard .sublabel{color:var(--mut);font-size:11px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
 .subcard .subhost{font-family:ui-monospace,monospace;font-size:13px;color:#79c0ff;word-break:break-all;line-height:1.5}
+.guide{margin:20px 0;padding:16px;background:var(--card);border:1px solid var(--bd);border-radius:12px}
+.guide h2{margin:0 0 10px;font-size:16px}
+.guide-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+.guide-item{padding:12px;background:#0d1117;border:1px solid var(--bd);border-radius:10px}
+.guide-item b{display:block;margin-bottom:6px;font-size:13px}
+.guide-item span{display:block;color:var(--mut);font-size:12px;line-height:1.6}
 .footer{text-align:center;padding:24px 16px;color:var(--mut);font-size:11px}
 .footer a{color:var(--mut);text-decoration:none}
 .footer a:hover{color:#79c0ff}
@@ -1552,6 +1631,16 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
     </div>
     
   </div>
+
+  <section class="guide">
+    <h2>怎么用</h2>
+    <div class="guide-grid">
+      <div class="guide-item"><b>新手默认</b><span>复制 ${autoHost}。不确定自己线路时优先用它。</span></div>
+      <div class="guide-item"><b>按运营商</b><span>电信用 ${ctHost}，联通用 ${cuHost}，移动用 ${cmHost}。</span></div>
+      <div class="guide-item"><b>高级订阅</b><span>订阅链接 ${subUrl}；EDT/API 使用 ${preferredUrl}。</span></div>
+      <div class="guide-item"><b>管理入口</b><span>打开 /admin 查看刷新、错误、DNS、历史趋势和稳定分 Top。</span></div>
+    </div>
+  </section>
 
   <div class="footer">
     数据源:hostmonit · IPDB/bestcf · joname1/BestCFip · KafeMars · 164746.xyz · addressesapi<br>

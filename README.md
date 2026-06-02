@@ -25,7 +25,7 @@ Cloudflare 在 [2024 年 12 月声明](https://www.landiannews.com/archives/1070
 | **聚合** | 每 6 小时 Cron 从 18 个社区源拉取候选 IP |
 | **校验** | 用 Cloudflare 官方 [`ips-v4`](https://www.cloudflare.com/ips-v4) 的 15 个 CIDR 段做位运算判定,**非 AS13335 段全部丢弃** |
 | **测速** | 主数据源 `hostmonit` 在国内三大运营商 VPS 实测延迟+丢包+速度,直接复用 |
-| **展示** | 在 `bestip.<你的域名>` 显示产品化控制台:推荐域名 / 状态 / 复制入口 / 全量 IP |
+| **展示** | 在 `bestip.<你的域名>` 显示产品化首页，`/admin` 提供管理控制台 |
 | **同步** | 自动写入优选池 A 记录:`auto.` `cf.` `ct.` `cu.` `cm.`，并验证公共 DNS 是否生效 |
 | **通知** | Telegram(可选)|
 
@@ -115,6 +115,7 @@ wrangler deploy
 |---|---|
 | `CF_DNS_BY_CARRIER` | 设 `1` 启用三网分流（ct./cu./cm. 加上 auto./cf.） |
 | `DNS_TOP_N` | 每子域最多写多少条 A 记录，默认 10 |
+| `DNS_MAX_CHANGE_RATIO` | 每个域名单次最多替换比例，默认 0.3 |
 | `ALLOW_PUBLIC_REFRESH` | 设 `1` 才允许无 token 手动刷新；不推荐公开使用 |
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | Telegram 通知 |
 
@@ -152,7 +153,9 @@ curl -X POST \
 - **稳定分排序**：优先保留上一批出现过的 IP，并综合 tested、来源数、延迟、丢包、速度排序，减少 DNS 大换血。
 - **质量下降保护**：如果本次总池或三网池明显缩水，保留上一批稳定结果并跳过 DNS 同步，避免错误数据污染线上域名。
 - **diff-based DNS sync**：已存在且仍在 wanted 中的记录**不动**，只删托管白名单记录中多余的 A 记录、创建缺失记录，并把最近一次同步结果写入 KV 的 `dns:lastSync`，方便 `/api/stats` 和 `/api/dns/current` 排查。
-- **DNS 生效验证**：同步后通过 Cloudflare / Google DoH 检查 `auto/cf/ct/cu/cm` 是否已解析到期望 IP，结果显示在首页和 `/api/stats`。
+- **DNS 生效验证**：同步后通过 Cloudflare / Google DoH 检查 `auto/cf/ct/cu/cm` 是否已解析到期望 IP，结果显示在首页、`/admin` 和 `/api/stats`。
+- **变更阈值控制**：默认每个域名单次最多替换约 30% 记录，优先保留当前仍可用 A 记录，降低客户端连接波动。
+- **管理控制台**：`/admin` 可查看 DNS 同步详情、最近错误、7 天趋势、稳定分 Top 20、数据源健康，并支持手动刷新。
 - **Worker 平台限制**：Cloudflare Workers 禁止从 Worker 出口连接 CF 自家 IP（`connect()` 会失败），所以**本项目不在 Worker 内做 TCP 测速**，完全依赖 hostmonit 等后端测速数据。
 - **手动刷新保护**：`/api/refresh` 默认只接受 `POST + Bearer token`，避免公开端点被滥用去烧第三方源或 Cloudflare DNS API 配额。
 
