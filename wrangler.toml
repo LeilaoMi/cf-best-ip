@@ -2,6 +2,11 @@ name = "cf-best-ip"
 main = "src/worker.js"
 compatibility_date = "2024-12-01"
 
+# Worker 管理页 / API 自定义域名；不要把优选 IP 池域名绑定到 Worker
+routes = [
+  { pattern = "bestip.leilaomi.cc.cd", custom_domain = true },
+]
+
 # KV namespace
 [[kv_namespaces]]
 binding = "KV"
