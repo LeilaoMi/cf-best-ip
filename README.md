@@ -26,7 +26,7 @@ Cloudflare 在 [2024 年 12 月声明](https://www.landiannews.com/archives/1070
 | **校验** | 用 Cloudflare 官方 [`ips-v4`](https://www.cloudflare.com/ips-v4) 的 15 个 CIDR 段做位运算判定,**非 AS13335 段全部丢弃** |
 | **测速** | 主数据源 `hostmonit` 在国内三大运营商 VPS 实测延迟+丢包+速度,直接复用 |
 | **展示** | 在 `bestip.<你的域名>` 显示产品化控制台:推荐域名 / 状态 / 复制入口 / 全量 IP |
-| **同步** | 自动写入优选池 A 记录:`auto.` `cf.` `ct.` `cu.` `cm.` |
+| **同步** | 自动写入优选池 A 记录:`auto.` `cf.` `ct.` `cu.` `cm.`，并验证公共 DNS 是否生效 |
 | **通知** | Telegram(可选)|
 
 ---
@@ -149,7 +149,10 @@ curl -X POST \
 
 - **CIDR 判定**:`isCfNativeIp()` 把 CF 官方 15 个 CIDR 段预转成 `(network, mask)` 元组,每个 IP 做 1 次位与即判定,O(15) 常数时间。
 - **去重 key**:`(ip, port, carrier)` —— 同一 IP 在三网下可作 3 条独立记录(hostmonit 同 IP 同时为 CT 和 CM 最优时不会丢失数据)。
+- **稳定分排序**：优先保留上一批出现过的 IP，并综合 tested、来源数、延迟、丢包、速度排序，减少 DNS 大换血。
+- **质量下降保护**：如果本次总池或三网池明显缩水，保留上一批稳定结果并跳过 DNS 同步，避免错误数据污染线上域名。
 - **diff-based DNS sync**：已存在且仍在 wanted 中的记录**不动**，只删托管白名单记录中多余的 A 记录、创建缺失记录，并把最近一次同步结果写入 KV 的 `dns:lastSync`，方便 `/api/stats` 和 `/api/dns/current` 排查。
+- **DNS 生效验证**：同步后通过 Cloudflare / Google DoH 检查 `auto/cf/ct/cu/cm` 是否已解析到期望 IP，结果显示在首页和 `/api/stats`。
 - **Worker 平台限制**：Cloudflare Workers 禁止从 Worker 出口连接 CF 自家 IP（`connect()` 会失败），所以**本项目不在 Worker 内做 TCP 测速**，完全依赖 hostmonit 等后端测速数据。
 - **手动刷新保护**：`/api/refresh` 默认只接受 `POST + Bearer token`，避免公开端点被滥用去烧第三方源或 Cloudflare DNS API 配额。
 
@@ -160,7 +163,7 @@ curl -X POST \
 - 正常运行靠 Cron 自动刷新；公开页面上的手动刷新只给持有 `REFRESH_TOKEN` 的管理员使用。
 - 如果某个子域 A 记录少于 `DNS_TOP_N`，先看 `/api/dns/current` 的 `lastSync`：没有错误通常代表该运营商候选不足或被 DNS 黑名单过滤。
 - 本项目只同步 `auto.`、`cf.`、`ct.`、`cu.`、`cm.` 这组托管白名单记录，不再自动清理 `proxy.`、`proxyip.`、`pNN.` 等可能被其他服务使用的历史记录。
-- 如果某次刷新没有拿到可用 IP，Worker 会保留上一批稳定结果，跳过 DNS 同步，避免把可用域名清空。
+- 如果某次刷新没有拿到可用 IP，或候选池相比上一批明显变差，Worker 会保留上一批稳定结果，跳过 DNS 同步，避免把可用域名清空或污染。
 
 ---
 

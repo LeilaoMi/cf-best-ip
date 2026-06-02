@@ -532,6 +532,55 @@ async function saveLatest(env, data) {
   await kvSet(env, `ips:history:${day}`, data, { expirationTtl: 60 * 60 * 24 * 30 });
 }
 
+function carrierKey(x) {
+  return x?.carrier === "CMCC" ? "CM" : (x?.carrier || "CF");
+}
+function countByCarrier(ips) {
+  const out = { CT: 0, CU: 0, CM: 0, CF: 0 };
+  for (const x of ips || []) {
+    const k = carrierKey(x);
+    out[out[k] == null ? "CF" : k]++;
+  }
+  return out;
+}
+function scoreIp(item, previousMap) {
+  const prev = previousMap.get(`${item.ip}:${carrierKey(item)}`) || previousMap.get(`${item.ip}:CF`);
+  let score = 0;
+  if (prev) score += 40;
+  if (item.tested) score += 30;
+  score += Math.min((item.sources?.length || 0) * 6, 30);
+  if (item.delay != null) score += Math.max(0, 30 - item.delay / 10);
+  if (item.loss != null) score += Math.max(0, 20 - item.loss * 100);
+  if (item.mbps != null) score += Math.min(item.mbps, 30) / 2;
+  return Math.round(score * 10) / 10;
+}
+function applyStabilityScores(ips, previous) {
+  const previousMap = new Map();
+  for (const x of previous?.ips || []) previousMap.set(`${x.ip}:${carrierKey(x)}`, x);
+  return ips.map(x => ({ ...x, _score: scoreIp(x, previousMap) })).sort((a, b) => {
+    if ((b._score || 0) !== (a._score || 0)) return (b._score || 0) - (a._score || 0);
+    if (a.tested && b.tested) return (a.delay || 9999) - (b.delay || 9999);
+    if (a.tested) return -1;
+    if (b.tested) return 1;
+    return (b.sources?.length || 0) - (a.sources?.length || 0);
+  });
+}
+function qualityGuard(alive, previous) {
+  const prevIps = previous?.ips || [];
+  if (prevIps.length < 50) return null;
+  if (alive.length < Math.floor(prevIps.length * 0.6)) {
+    return { error: "pool-shrank", message: `本次可用池 ${alive.length} 个，低于上一批 ${prevIps.length} 个的 60%，已保留上一批结果。` };
+  }
+  const prevBy = countByCarrier(prevIps);
+  const nextBy = countByCarrier(alive);
+  for (const k of ["CT", "CU", "CM"]) {
+    if (prevBy[k] >= 10 && nextBy[k] < Math.floor(prevBy[k] * 0.4)) {
+      return { error: "carrier-pool-shrank", message: `${carrierName(k)}池从 ${prevBy[k]} 个降到 ${nextBy[k]} 个，已保留上一批结果。` };
+    }
+  }
+  return null;
+}
+
 // ============================================================
 // 4. 数据源抓取
 // ============================================================
@@ -695,6 +744,7 @@ async function enrichGeo(ips) {
 // ============================================================
 async function runFullTest(env, ctx, opts = {}) {
   const cfg = await getConfig(env);
+  const previous = await getLatest(env);
   const startedAt = Date.now();
 
   // 1. 拉源
@@ -712,15 +762,7 @@ async function runFullTest(env, ctx, opts = {}) {
   }, cfg.probeConcurrency);
 
   // 3. 过滤：手动添加的要测速通过；池子里的全保留
-  let alive = probed.slice();
-  // 排序:tested + delay 小的优先,其余按 source 计数降序
-  alive.sort((a, b) => {
-    if (a.tested && b.tested) return a.delay - b.delay;
-    if (a.tested) return -1;
-    if (b.tested) return 1;
-
-    return (b.sources?.length || 0) - (a.sources?.length || 0);
-  });
+  let alive = applyStabilityScores(probed.slice(), previous);
 
   // 5. 应用国家黑名单（只对已知 country 的过滤）
   if (cfg.countryBlocklist && cfg.countryBlocklist.length) {
@@ -739,7 +781,6 @@ async function runFullTest(env, ctx, opts = {}) {
   }
 
   if (!alive.length) {
-    const previous = await getLatest(env);
     const errorPayload = {
       ...(previous || {}),
       ips: previous?.ips || [],
@@ -759,6 +800,30 @@ async function runFullTest(env, ctx, opts = {}) {
       sourceStats: agg.stats,
     });
     return { ...errorPayload, dnsSync: { ok: false, skipped: true, error: "no-usable-ips" } };
+  }
+
+  const qualityIssue = qualityGuard(alive, previous);
+  if (qualityIssue) {
+    const keptPayload = {
+      ...(previous || {}),
+      ips: previous?.ips || [],
+      sourceStats: agg.stats,
+      availabilityStats,
+      updatedAt: previous?.updatedAt || Date.now(),
+      elapsedMs: Date.now() - startedAt,
+      version: VERSION,
+      refreshError: qualityIssue.error,
+      refreshFailedAt: Date.now(),
+    };
+    await kvSet(env, "refresh:lastError", {
+      ok: false,
+      ...qualityIssue,
+      failedAt: keptPayload.refreshFailedAt,
+      previousCount: previous?.ips?.length || 0,
+      currentCount: alive.length,
+      sourceStats: agg.stats,
+    });
+    return { ...keptPayload, dnsSync: { ok: false, skipped: true, ...qualityIssue } };
   }
 
   // 7. 持久化
@@ -871,6 +936,28 @@ function getManagedDnsNames(env) {
   }
   return names;
 }
+
+async function resolveViaDoh(url) {
+  const r = await withTimeout(fetch(url, { headers: { accept: "application/dns-json" } }), 5000);
+  if (!r.ok) return [];
+  const j = await r.json();
+  return (j.Answer || []).filter(x => x.type === 1 && x.data).map(x => x.data);
+}
+async function verifyDnsRecords(results) {
+  const targets = results.filter(r => r?.name && r.ips?.length);
+  const checks = await pMap(targets, async (r) => {
+    const cfUrl = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(r.name)}&type=A`;
+    const googleUrl = `https://dns.google/resolve?name=${encodeURIComponent(r.name)}&type=A`;
+    const [cf, google] = await Promise.all([
+      resolveViaDoh(cfUrl).catch(() => []),
+      resolveViaDoh(googleUrl).catch(() => []),
+    ]);
+    const expected = new Set(r.ips);
+    const matched = Array.from(new Set([...cf, ...google])).filter(ip => expected.has(ip));
+    return { name: r.name, expected: r.ips.length, cloudflare: cf.length, google: google.length, matched: matched.length, ok: matched.length > 0 };
+  }, 3);
+  return { ok: checks.every(x => x.ok), checkedAt: Date.now(), checks };
+}
 async function batchDnsRecords(env, deletes, posts) {
   if (!deletes.length && !posts.length) return null;
   const body = {};
@@ -931,7 +1018,8 @@ async function syncAllDns(env, alive) {
         if (subset.length) results.push(await syncRecordFromExisting(env, name, subset, topN, byName.get(name) || []));
       }
     }
-    const summary = { ok: true, startedAt, finishedAt: Date.now(), elapsedMs: Date.now() - startedAt, topN, results };
+    const verification = await verifyDnsRecords(results).catch(e => ({ ok: false, error: String(e && e.message || e), checkedAt: Date.now(), checks: [] }));
+    const summary = { ok: true, startedAt, finishedAt: Date.now(), elapsedMs: Date.now() - startedAt, topN, results, verification };
     await kvSet(env, "dns:lastSync", summary);
     return results;
   } catch (e) {
@@ -1217,7 +1305,7 @@ function renderHome(data, visitor) {
 
   // 取每类 top 30；hostmonit 来的有真实 delay/loss/mbps/colo，会优先排在前面
   const sortFn = (a, b) => {
-    // 先 tested 优先（hostmonit 数据）
+    if ((b._score || 0) !== (a._score || 0)) return (b._score || 0) - (a._score || 0);
     if (a.tested && !b.tested) return -1;
     if (!a.tested && b.tested) return 1;
     if (a.tested && b.tested) return (a.delay || 9999) - (b.delay || 9999);
@@ -1241,8 +1329,20 @@ function renderHome(data, visitor) {
   const recommendedLabel = visitor.carrier ? `${carrierName(visitor.carrier)}线路` : "默认自动推荐";
   const subUrl = serviceHost ? `https://${serviceHost}/sub` : "/sub";
   const preferredUrl = serviceHost ? `https://${serviceHost}/api/preferred-ips` : "/api/preferred-ips";
-  const dnsOk = data.dnsSync?.ok || data.lastDnsSync?.ok;
-  const dnsText = dnsOk ? "DNS 同步正常" : "查看 /api/stats 获取同步状态";
+  const lastSync = data.lastDnsSync || null;
+  const dnsOk = data.dnsSync?.ok || lastSync?.ok;
+  const verifyOk = lastSync?.verification?.ok;
+  const dnsText = dnsOk ? (verifyOk ? "同步并验证正常" : "DNS 同步正常") : "查看 /api/stats 获取同步状态";
+  const syncRows = (lastSync?.results || []).filter(x => x?.name && !x.skipped);
+  const verifyRows = new Map((lastSync?.verification?.checks || []).map(x => [x.name, x]));
+  const renderSyncDetails = () => syncRows.length ? `<section class="syncbox">
+    <div class="sync-title">最近一次 DNS 同步</div>
+    <div class="sync-grid">${syncRows.map(r => {
+      const v = verifyRows.get(r.name);
+      const vText = v ? (v.ok ? `已生效 ${v.matched}/${v.expected}` : `待传播 ${v.matched}/${v.expected}`) : "未验证";
+      return `<div class="sync-item"><b>${r.name}</b><span>保留 ${r.kept || 0} · 新增 ${r.added || 0} · 删除 ${r.removed || 0} · ${vText}</span></div>`;
+    }).join("")}</div>
+  </section>` : "";
 
   const fmtDelay = (x) => x.delay != null ? `${x.delay}ms` : "—";
   const fmtSpeed = (x) => x.mbps != null ? `${x.mbps}M` : "—";
@@ -1254,6 +1354,7 @@ function renderHome(data, visitor) {
     <td class="cell-loss">${x.loss != null ? (x.loss * 100).toFixed(0) + "%" : "—"}</td>
     <td class="cell-delay">${fmtDelay(x)}</td>
     <td class="cell-speed">${fmtSpeed(x)}</td>
+    <td class="cell-score">${x._score != null ? x._score : "—"}</td>
     <td><button class="copybtn" data-copy="${x.ip}">📋</button></td>
   </tr>`;
 
@@ -1263,6 +1364,7 @@ function renderHome(data, visitor) {
         <th class="cell-loss">丢包</th>
         <th class="cell-delay">延迟</th>
         <th class="cell-speed">速度</th>
+        <th class="cell-score">稳定分</th>
         <th>复制</th>
       </tr></thead><tbody>${rows.map(renderRow).join("")}</tbody></table>`
     : `<div class="empty">⏳ 该分类暂无数据，等待下次刷新…</div>`;
@@ -1294,6 +1396,12 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
 .statusline{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 16px}
 .statuspill{background:var(--card);border:1px solid var(--bd);border-radius:999px;padding:7px 11px;color:var(--mut);font-size:12px}
 .statuspill b{color:var(--fg)}
+.syncbox{margin:0 0 16px;padding:14px;background:var(--card);border:1px solid var(--bd);border-radius:12px}
+.sync-title{font-size:13px;font-weight:700;margin-bottom:10px}
+.sync-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}
+.sync-item{padding:10px;border:1px solid var(--bd);border-radius:9px;background:#0d1117}
+.sync-item b{display:block;font-size:12px;margin-bottom:5px;color:#79c0ff;word-break:break-all}
+.sync-item span{font-size:11px;color:var(--mut)}
 .tabs{display:flex;gap:6px;margin-bottom:14px;overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:4px}
 .tab{flex-shrink:0;padding:9px 14px;background:var(--card);border:1px solid var(--bd);border-radius:8px;cursor:pointer;color:var(--mut);font-size:13px;white-space:nowrap}
 .tab.active{background:#1f6feb;border-color:#1f6feb;color:#fff;font-weight:600}
@@ -1344,6 +1452,7 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
   .cell-loss{text-align:center;min-width:30px}
   .cell-delay{min-width:46px}
   .cell-speed{min-width:42px;color:var(--ct)}
+  .cell-score{display:none}
   .badge{padding:2px 6px;font-size:10px}
   .iptbl .ip{font-size:11px}
   .tabs{margin-bottom:10px}
@@ -1394,6 +1503,7 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
     <div class="statuspill">移动 <b>${cm.length}</b></div>
     <div class="statuspill">通用 <b>${allNative.length}</b></div>
   </div>
+  ${renderSyncDetails()}
   <div class="tabs" id="tabs">
     <div class="tab active" data-tab="all">🌐 全部<span class="n">${all.length}</span></div>
     <div class="tab" data-tab="ct">📡 电信<span class="n">${ct.length}</span></div>

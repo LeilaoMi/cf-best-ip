@@ -102,3 +102,34 @@ DNS 同步按稳定分排序，而不是只看单次排序。
 - `auto/cf/ct/cu/cm.leilaomi.cc.cd` → DNS only A 记录，由 Worker 自动维护
 
 如果 `bestip.leilaomi.cc.cd` 使用 Cloudflare 托管，应避免让 DNS 同步逻辑触碰它。
+
+
+## 已实现的稳定性提升
+
+### 稳定分排序
+
+刷新后会为每个 IP 计算稳定分，排序时优先考虑：
+
+- 上一批是否出现过
+- 是否来自真实测速源
+- 来源数量
+- 延迟、丢包、速度
+
+目的不是每次追求绝对最快，而是减少 DNS 大换血，让客户端连接更稳定。
+
+### 质量下降保护
+
+如果上一批数据足够大，但本次结果明显缩水，Worker 会：
+
+1. 保留上一批 `ips:latest`
+2. 写入 `refresh:lastError`
+3. 跳过 DNS 同步
+
+触发条件包括：
+
+- 总池低于上一批 60%
+- 某个三网池低于上一批 40%
+
+### DNS 生效检查
+
+DNS 同步后会通过 Cloudflare DoH 和 Google DoH 检查托管域名是否已有期望 A 记录。结果写入 `dns:lastSync.verification`，并在首页“最近一次 DNS 同步”区域展示。
