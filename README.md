@@ -25,8 +25,8 @@ Cloudflare 在 [2024 年 12 月声明](https://www.landiannews.com/archives/1070
 | **聚合** | 每 6 小时 Cron 从 18 个社区源拉取候选 IP |
 | **校验** | 用 Cloudflare 官方 [`ips-v4`](https://www.cloudflare.com/ips-v4) 的 15 个 CIDR 段做位运算判定,**非 AS13335 段全部丢弃** |
 | **测速** | 主数据源 `hostmonit` 在国内三大运营商 VPS 实测延迟+丢包+速度,直接复用 |
-| **展示** | 在 `cfip.<你的域名>` 显示 5 个 tab:全部 / 电信 / 联通 / 移动 / 通用 |
-| **同步** | 自动写入 4 个子域 A 记录:`cf.` `ct.` `cu.` `cm.` |
+| **展示** | 在 `bestip.<你的域名>` 显示产品化控制台:推荐域名 / 状态 / 复制入口 / 全量 IP |
+| **同步** | 自动写入优选池 A 记录:`auto.` `cf.` `ct.` `cu.` `cm.` |
 | **通知** | Telegram(可选)|
 
 ---
@@ -66,8 +66,8 @@ CF 官方 CIDR 二次校验(只留 AS13335)
 │ 全部 30 / CT 10 / CU 10 / CM 10 / 通用 30  │
 └────────────────────────────────────────────┘
        ↓
-DNS 同步(diff-based,只动有变化的记录)
-cf.<域名> / ct. / cu. / cm. 各 top N
+DNS 同步(diff-based,只动托管白名单记录)
+auto.<域名> / cf.<域名> / ct. / cu. / cm. 各 top N
 ```
 
 ---
@@ -84,7 +84,9 @@ wrangler secret put REFRESH_TOKEN
 wrangler deploy
 ```
 
-部署前请把 `wrangler.toml` 里的 KV namespace id、`CF_ZONE_ID`、`CF_RECORD_NAME` 改成你自己的值。
+部署前请把 `wrangler.toml` 里的 KV namespace id、`CF_ZONE_ID`、`SERVICE_HOSTNAME`、`AUTO_RECORD_NAME`、`CF_RECORD_NAME` 改成你自己的值。
+
+建议域名角色分离：`SERVICE_HOSTNAME` 只作为 Worker 管理页/API 入口，例如 `bestip.example.com`；`AUTO_RECORD_NAME` / `CF_RECORD_NAME` / `ct.` / `cu.` / `cm.` 才作为 DNS only 的优选 IP 池。不要把 Worker 入口和优选 IP 池设成同一个域名。
 
 ### Cloudflare Dashboard / Git 部署（可选）
 
@@ -102,14 +104,16 @@ wrangler deploy
 | `KV` (binding) | KV namespace 绑定，变量名必须叫 `KV` | wrangler 创建后绑定 |
 | `CF_API_TOKEN` | CF API Token（Zone:DNS:Edit） | 在 [profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) 生成 |
 | `CF_ZONE_ID` | 你域名的 Zone ID | dashboard 域名概览页右下角 |
-| `CF_RECORD_NAME` | 主子域名，会同步成 A 记录 | `cf.example.com` |
+| `SERVICE_HOSTNAME` | Worker 管理页 / API 入口，不参与优选 IP DNS 同步 | `bestip.example.com` |
+| `AUTO_RECORD_NAME` | 默认推荐优选池，会同步成 A 记录 | `auto.example.com` |
+| `CF_RECORD_NAME` | 通用优选池，会同步成 A 记录 | `cf.example.com` |
 | `REFRESH_TOKEN` | 手动刷新 Bearer token | `openssl rand -hex 32` |
 
 ### 可选环境变量
 
 | 名 | 说明 |
 |---|---|
-| `CF_DNS_BY_CARRIER` | 设 `1` 启用三网分流（ct./cu./cm./cf. 四子域） |
+| `CF_DNS_BY_CARRIER` | 设 `1` 启用三网分流（ct./cu./cm. 加上 auto./cf.） |
 | `DNS_TOP_N` | 每子域最多写多少条 A 记录，默认 10 |
 | `ALLOW_PUBLIC_REFRESH` | 设 `1` 才允许无 token 手动刷新；不推荐公开使用 |
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | Telegram 通知 |
@@ -136,7 +140,7 @@ wrangler deploy
 ```bash
 curl -X POST \
   -H "Authorization: Bearer $REFRESH_TOKEN" \
-  https://cfip.example.com/api/refresh
+  https://bestip.example.com/api/refresh
 ```
 
 ---
@@ -145,7 +149,7 @@ curl -X POST \
 
 - **CIDR 判定**:`isCfNativeIp()` 把 CF 官方 15 个 CIDR 段预转成 `(network, mask)` 元组,每个 IP 做 1 次位与即判定,O(15) 常数时间。
 - **去重 key**:`(ip, port, carrier)` —— 同一 IP 在三网下可作 3 条独立记录(hostmonit 同 IP 同时为 CT 和 CM 最优时不会丢失数据)。
-- **diff-based DNS sync**：已存在且仍在 wanted 中的记录**不动**，只删多余/创建缺失，并把最近一次同步结果写入 KV 的 `dns:lastSync`，方便 `/api/stats` 和 `/api/dns/current` 排查。
+- **diff-based DNS sync**：已存在且仍在 wanted 中的记录**不动**，只删托管白名单记录中多余的 A 记录、创建缺失记录，并把最近一次同步结果写入 KV 的 `dns:lastSync`，方便 `/api/stats` 和 `/api/dns/current` 排查。
 - **Worker 平台限制**：Cloudflare Workers 禁止从 Worker 出口连接 CF 自家 IP（`connect()` 会失败），所以**本项目不在 Worker 内做 TCP 测速**，完全依赖 hostmonit 等后端测速数据。
 - **手动刷新保护**：`/api/refresh` 默认只接受 `POST + Bearer token`，避免公开端点被滥用去烧第三方源或 Cloudflare DNS API 配额。
 
@@ -155,7 +159,8 @@ curl -X POST \
 
 - 正常运行靠 Cron 自动刷新；公开页面上的手动刷新只给持有 `REFRESH_TOKEN` 的管理员使用。
 - 如果某个子域 A 记录少于 `DNS_TOP_N`，先看 `/api/dns/current` 的 `lastSync`：没有错误通常代表该运营商候选不足或被 DNS 黑名单过滤。
-- `proxy.<域名>`、`proxyip.<域名>`、旧版 `p01.<域名>` 这类遗留 A 记录会在 DNS 同步时自动清理。
+- 本项目只同步 `auto.`、`cf.`、`ct.`、`cu.`、`cm.` 这组托管白名单记录，不再自动清理 `proxy.`、`proxyip.`、`pNN.` 等可能被其他服务使用的历史记录。
+- 如果某次刷新没有拿到可用 IP，Worker 会保留上一批稳定结果，跳过 DNS 同步，避免把可用域名清空。
 
 ---
 

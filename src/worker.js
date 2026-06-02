@@ -738,6 +738,29 @@ async function runFullTest(env, ctx, opts = {}) {
     availabilityStats = r.stats;
   }
 
+  if (!alive.length) {
+    const previous = await getLatest(env);
+    const errorPayload = {
+      ...(previous || {}),
+      ips: previous?.ips || [],
+      sourceStats: agg.stats,
+      availabilityStats,
+      updatedAt: previous?.updatedAt || Date.now(),
+      elapsedMs: Date.now() - startedAt,
+      version: VERSION,
+      refreshError: "no-usable-ips",
+      refreshFailedAt: Date.now(),
+    };
+    await kvSet(env, "refresh:lastError", {
+      ok: false,
+      error: "no-usable-ips",
+      message: "本次刷新没有拿到可用 IP，已保留上一批稳定结果，未同步 DNS。",
+      failedAt: errorPayload.refreshFailedAt,
+      sourceStats: agg.stats,
+    });
+    return { ...errorPayload, dnsSync: { ok: false, skipped: true, error: "no-usable-ips" } };
+  }
+
   // 7. 持久化
   const payload = {
     ips: alive,
@@ -824,6 +847,30 @@ function buildWantedIps(ips, topN) {
   }
   return wanted;
 }
+function getRootFromRecord(recordName) {
+  return recordName && recordName.includes(".") ? recordName.split(".").slice(1).join(".") : "";
+}
+function getServiceHostname(env) {
+  const root = getRootFromRecord(env.CF_RECORD_NAME);
+  return env.SERVICE_HOSTNAME || (root ? `bestip.${root}` : "");
+}
+function getAutoRecordName(env) {
+  const root = getRootFromRecord(env.CF_RECORD_NAME);
+  return env.AUTO_RECORD_NAME || (root ? `auto.${root}` : "");
+}
+function getManagedDnsNames(env) {
+  const root = getRootFromRecord(env.CF_RECORD_NAME);
+  const names = [];
+  const add = (name) => { if (name && !names.includes(name)) names.push(name); };
+  add(getAutoRecordName(env));
+  add(env.CF_RECORD_NAME);
+  if (env.CF_DNS_BY_CARRIER === "1" && root) {
+    add(`ct.${root}`);
+    add(`cu.${root}`);
+    add(`cm.${root}`);
+  }
+  return names;
+}
 async function batchDnsRecords(env, deletes, posts) {
   if (!deletes.length && !posts.length) return null;
   const body = {};
@@ -862,30 +909,21 @@ async function syncAllDns(env, alive) {
     if (cfg.dnsRiskFilterEnabled) {
       pool = await applyRiskFilter(pool, cfg, Math.max(60, topN * 4));
     }
-    const root = env.CF_RECORD_NAME.split(".").slice(1).join(".");
+    const root = getRootFromRecord(env.CF_RECORD_NAME);
     const allRecords = await listAllARecords(env);
+    const managedNames = new Set(getManagedDnsNames(env));
     const byName = new Map();
     for (const r of allRecords) {
+      if (!managedNames.has(r.name)) continue;
       if (!byName.has(r.name)) byName.set(r.name, []);
       byName.get(r.name).push(r);
     }
 
-    const staleNames = new Set([`proxy.${root}`, `proxyip.${root}`]);
-    const probePattern = new RegExp(`^p\\d{2}\\.${root.replace(/\./g, "\\.")}$`);
-    const cleanupIds = [];
-    let staleRemoved = 0;
-    let probeRemoved = 0;
-    for (const r of allRecords) {
-      if (staleNames.has(r.name)) { cleanupIds.push(r.id); staleRemoved++; }
-      else if (probePattern.test(r.name)) { cleanupIds.push(r.id); probeRemoved++; }
-    }
-    if (cleanupIds.length) await batchDnsRecords(env, cleanupIds, []);
-    if (staleRemoved) results.push({ name: "stale-proxy", removed: staleRemoved, ips: [] });
-    if (probeRemoved) results.push({ name: "probe-slots", removed: probeRemoved, ips: [] });
-
+    const autoName = getAutoRecordName(env);
+    if (autoName) results.push(await syncRecordFromExisting(env, autoName, pool, topN, byName.get(autoName) || []));
     results.push(await syncRecordFromExisting(env, env.CF_RECORD_NAME, pool, topN, byName.get(env.CF_RECORD_NAME) || []));
 
-    if (env.CF_DNS_BY_CARRIER === "1") {
+    if (env.CF_DNS_BY_CARRIER === "1" && root) {
       const groups = { CT: "ct", CU: "cu", CM: "cm" };
       for (const [carrier, prefix] of Object.entries(groups)) {
         const name = `${prefix}.${root}`;
@@ -923,8 +961,8 @@ async function notify(env, payload) {
   for (const x of ips) { if (x.country) byCountry[x.country] = (byCountry[x.country] || 0) + 1; }
   const topCountries = Object.entries(byCountry).sort((a, b) => b[1] - a[1]).slice(0, 5);
   // 域名
-  const root = env.CF_RECORD_NAME ? env.CF_RECORD_NAME.split(".").slice(1).join(".") : "";
-  const homeUrl = root ? `https://cfip.${root}/` : "";
+  const serviceHostname = getServiceHostname(env);
+  const homeUrl = serviceHostname ? `https://${serviceHostname}/` : "";
   const lines = [
     `🚀 *cf-best-ip 测速完成*`,
     `时间: ${new Date(payload.updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}`,
@@ -1051,7 +1089,10 @@ async function handle(request, env, ctx) {
   const requesterColo = request.cf?.colo;
   const visitor = getVisitor(request);
   if (env.CF_RECORD_NAME && env.CF_RECORD_NAME.includes(".")) {
-    visitor.root = env.CF_RECORD_NAME.split(".").slice(1).join(".");
+    visitor.root = getRootFromRecord(env.CF_RECORD_NAME);
+    visitor.serviceHostname = getServiceHostname(env);
+    visitor.autoRecordName = getAutoRecordName(env);
+    visitor.cfRecordName = env.CF_RECORD_NAME;
   }
 
   if (request.method === "OPTIONS") {
@@ -1129,9 +1170,7 @@ async function handle(request, env, ctx) {
     if (!env.CF_API_TOKEN || !env.CF_ZONE_ID || !env.CF_RECORD_NAME) {
       return json({ ok: false, error: "DNS sync not configured" });
     }
-    const root = env.CF_RECORD_NAME.split(".").slice(1).join(".");
-    const main = env.CF_RECORD_NAME;
-    const names = [main, `ct.${root}`, `cu.${root}`, `cm.${root}`];
+    const names = getManagedDnsNames(env);
     const result = [];
     for (const n of names) {
       try {
@@ -1144,7 +1183,10 @@ async function handle(request, env, ctx) {
     return json({ ok: true, topN: Number(env.DNS_TOP_N || 10), lastSync: await kvGet(env, "dns:lastSync", null), dns: result });
   }
   // ---- 页面 ----
-  if (path === "/" || path === "/index.html") return html(renderHome(data, visitor));
+  if (path === "/" || path === "/index.html") {
+    const lastDnsSync = await kvGet(env, "dns:lastSync", null);
+    return html(renderHome({ ...data, lastDnsSync }, visitor));
+  }
 
   return new Response("Not Found", { status: 404 });
 }
@@ -1188,6 +1230,19 @@ function renderHome(data, visitor) {
   const all = ips.slice().sort(sortFn).slice(0, 30);
 
   const nativeCount = ips.length;
+  const root = visitor.root || "你的域名";
+  const autoHost = visitor.autoRecordName || `auto.${root}`;
+  const cfHost = visitor.cfRecordName || `cf.${root}`;
+  const ctHost = `ct.${root}`;
+  const cuHost = `cu.${root}`;
+  const cmHost = `cm.${root}`;
+  const serviceHost = visitor.serviceHostname || (visitor.root ? `bestip.${visitor.root}` : "");
+  const recommendedHost = visitor.carrier === "CT" ? ctHost : visitor.carrier === "CU" ? cuHost : visitor.carrier === "CM" ? cmHost : autoHost;
+  const recommendedLabel = visitor.carrier ? `${carrierName(visitor.carrier)}线路` : "默认自动推荐";
+  const subUrl = serviceHost ? `https://${serviceHost}/sub` : "/sub";
+  const preferredUrl = serviceHost ? `https://${serviceHost}/api/preferred-ips` : "/api/preferred-ips";
+  const dnsOk = data.dnsSync?.ok || data.lastDnsSync?.ok;
+  const dnsText = dnsOk ? "DNS 同步正常" : "查看 /api/stats 获取同步状态";
 
   const fmtDelay = (x) => x.delay != null ? `${x.delay}ms` : "—";
   const fmtSpeed = (x) => x.mbps != null ? `${x.mbps}M` : "—";
@@ -1230,6 +1285,15 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
 .hero-stats{display:flex;flex-wrap:wrap;gap:8px 24px;justify-content:center;font-size:12px;color:var(--mut)}
 .hero-stats b{color:var(--fg);font-size:16px;font-weight:600;margin-left:4px}
 .wrap{max-width:1100px;margin:0 auto;padding:16px}
+.recommend{margin:0 0 16px;padding:16px;background:linear-gradient(135deg,rgba(31,111,235,.18),rgba(63,185,80,.10));border:1px solid #2f6feb;border-radius:14px;display:grid;gap:14px;grid-template-columns:minmax(0,1.3fr) minmax(220px,.7fr)}
+.rec-kicker{font-size:12px;color:#9fb7ff;margin-bottom:6px}
+.rec-host{font-family:ui-monospace,monospace;font-size:24px;color:#fff;word-break:break-all;font-weight:700;margin-bottom:8px}
+.rec-desc{font-size:13px;color:var(--mut);line-height:1.7}
+.rec-actions{display:flex;flex-wrap:wrap;gap:8px;align-content:center;justify-content:flex-end}
+.rec-actions .copybtn{background:#1f6feb;border-color:#1f6feb;color:#fff;padding:8px 12px;font-size:12px}
+.statusline{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 16px}
+.statuspill{background:var(--card);border:1px solid var(--bd);border-radius:999px;padding:7px 11px;color:var(--mut);font-size:12px}
+.statuspill b{color:var(--fg)}
 .tabs{display:flex;gap:6px;margin-bottom:14px;overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:4px}
 .tab{flex-shrink:0;padding:9px 14px;background:var(--card);border:1px solid var(--bd);border-radius:8px;cursor:pointer;color:var(--mut);font-size:13px;white-space:nowrap}
 .tab.active{background:#1f6feb;border-color:#1f6feb;color:#fff;font-weight:600}
@@ -1268,6 +1332,9 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
   .hero-stats{gap:6px 16px;font-size:11px}
   .hero-stats b{font-size:14px}
   .wrap{padding:10px}
+  .recommend{grid-template-columns:1fr;padding:13px}
+  .rec-host{font-size:18px}
+  .rec-actions{justify-content:flex-start}
   .iptbl{font-size:12px;border-radius:8px}
   .iptbl th,.iptbl td{padding:8px 5px}
   .iptbl .num{width:26px}
@@ -1306,6 +1373,27 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
 </div>
 
 <div class="wrap">
+  <section class="recommend">
+    <div>
+      <div class="rec-kicker">推荐使用 · ${recommendedLabel}</div>
+      <div class="rec-host">${recommendedHost}</div>
+      <div class="rec-desc">新手优先复制这个域名；高级用户可按运营商选择 ct/cu/cm。管理页和 API 使用 ${serviceHost || "Worker 入口域名"}，不会再和优选 IP 池混用。</div>
+    </div>
+    <div class="rec-actions">
+      <button class="copybtn" data-copy="${recommendedHost}">复制推荐域名</button>
+      <button class="copybtn" data-copy="${subUrl}">复制订阅</button>
+      <button class="copybtn" data-copy="${preferredUrl}">复制 API</button>
+    </div>
+  </section>
+
+  <div class="statusline">
+    <div class="statuspill">刷新：<b>${updated}</b></div>
+    <div class="statuspill">DNS：<b>${dnsText}</b></div>
+    <div class="statuspill">电信 <b>${ct.length}</b></div>
+    <div class="statuspill">联通 <b>${cu.length}</b></div>
+    <div class="statuspill">移动 <b>${cm.length}</b></div>
+    <div class="statuspill">通用 <b>${allNative.length}</b></div>
+  </div>
   <div class="tabs" id="tabs">
     <div class="tab active" data-tab="all">🌐 全部<span class="n">${all.length}</span></div>
     <div class="tab" data-tab="ct">📡 电信<span class="n">${ct.length}</span></div>
@@ -1329,20 +1417,28 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
 
   <div class="subs">
     <div class="subcard">
-      <div class="sublabel"><span>📡 电信</span><button class="copybtn" data-copy="ct.${(visitor.root || "你的域名")}">复制域名</button></div>
-      <div class="subhost">ct.${(visitor.root || "你的域名")}</div>
+      <div class="sublabel"><span>📡 电信</span><button class="copybtn" data-copy="${ctHost}">复制域名</button></div>
+      <div class="subhost">${ctHost}</div>
     </div>
     <div class="subcard">
-      <div class="sublabel"><span>📶 联通</span><button class="copybtn" data-copy="cu.${(visitor.root || "你的域名")}">复制域名</button></div>
-      <div class="subhost">cu.${(visitor.root || "你的域名")}</div>
+      <div class="sublabel"><span>📶 联通</span><button class="copybtn" data-copy="${cuHost}">复制域名</button></div>
+      <div class="subhost">${cuHost}</div>
     </div>
     <div class="subcard">
-      <div class="sublabel"><span>📲 移动</span><button class="copybtn" data-copy="cm.${(visitor.root || "你的域名")}">复制域名</button></div>
-      <div class="subhost">cm.${(visitor.root || "你的域名")}</div>
+      <div class="sublabel"><span>📲 移动</span><button class="copybtn" data-copy="${cmHost}">复制域名</button></div>
+      <div class="subhost">${cmHost}</div>
     </div>
     <div class="subcard">
-      <div class="sublabel"><span>☁️ 主域</span><button class="copybtn" data-copy="cf.${(visitor.root || "你的域名")}">复制域名</button></div>
-      <div class="subhost">cf.${(visitor.root || "你的域名")}</div>
+      <div class="sublabel"><span>✨ 自动推荐</span><button class="copybtn" data-copy="${autoHost}">复制域名</button></div>
+      <div class="subhost">${autoHost}</div>
+    </div>
+    <div class="subcard">
+      <div class="sublabel"><span>☁️ 通用</span><button class="copybtn" data-copy="${cfHost}">复制域名</button></div>
+      <div class="subhost">${cfHost}</div>
+    </div>
+    <div class="subcard">
+      <div class="sublabel"><span>🔗 订阅</span><button class="copybtn" data-copy="${subUrl}">复制链接</button></div>
+      <div class="subhost">${subUrl}</div>
     </div>
     
   </div>

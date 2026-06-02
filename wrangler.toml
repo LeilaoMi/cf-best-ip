@@ -14,7 +14,9 @@ crons = ["0 */6 * * *"]
 # 非敏感变量(public,可见即可)
 [vars]
 CF_ZONE_ID        = "9aaafd1409adada280a4a6138cad50e4"
-CF_RECORD_NAME    = "cf.leilaomi.cc.cd"
+SERVICE_HOSTNAME  = "bestip.leilaomi.cc.cd" # Worker 管理页 / API 入口，不参与优选 IP DNS 同步
+AUTO_RECORD_NAME  = "auto.leilaomi.cc.cd"   # 默认推荐优选池
+CF_RECORD_NAME    = "cf.leilaomi.cc.cd"     # 通用优选池
 CF_DNS_BY_CARRIER = "1"   # "1" = 按运营商分子域同步 (ct./cu./cm.)
 DNS_TOP_N         = "10"
 # ALLOW_PUBLIC_REFRESH = "1" # 不推荐；仅在你明确接受公开刷新风险时启用
