@@ -208,20 +208,29 @@ function getVisitor(request) {
 // ============================================================
 // 2. 工具函数
 // ============================================================
+const SECURITY_HEADERS = {
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "same-origin",
+  "x-frame-options": "DENY",
+};
+const NO_STORE_HEADERS = { "cache-control": "no-store, max-age=0" };
+function responseHeaders(extra = {}) {
+  return { ...SECURITY_HEADERS, ...NO_STORE_HEADERS, ...extra };
+}
 function json(obj, init = {}) {
   return new Response(JSON.stringify(obj, null, 2), {
     status: init.status || 200,
-    headers: { "content-type": "application/json; charset=utf-8", "access-control-allow-origin": "*", ...(init.headers || {}) },
+    headers: responseHeaders({ "content-type": "application/json; charset=utf-8", "access-control-allow-origin": "*", ...(init.headers || {}) }),
   });
 }
 function text(body, init = {}) {
   return new Response(body, {
     status: init.status || 200,
-    headers: { "content-type": "text/plain; charset=utf-8", "access-control-allow-origin": "*", ...(init.headers || {}) },
+    headers: responseHeaders({ "content-type": "text/plain; charset=utf-8", "access-control-allow-origin": "*", ...(init.headers || {}) }),
   });
 }
 function html(body) {
-  return new Response(body, { headers: { "content-type": "text/html; charset=utf-8" } });
+  return new Response(body, { headers: responseHeaders({ "content-type": "text/html; charset=utf-8" }) });
 }
 function withTimeout(promise, ms) {
   return Promise.race([
@@ -579,6 +588,33 @@ function qualityGuard(alive, previous) {
     }
   }
   return null;
+}
+
+function sourceHealth(sourceStats = []) {
+  const total = sourceStats.length;
+  const failed = sourceStats.filter(x => x.error).length;
+  const empty = sourceStats.filter(x => !x.error && !x.count).length;
+  return { total, ok: Math.max(0, total - failed), failed, empty };
+}
+function staleInfo(updatedAt, maxAgeMs = 8 * 60 * 60 * 1000) {
+  const ageMs = updatedAt ? Date.now() - updatedAt : Infinity;
+  return { stale: ageMs > maxAgeMs, ageMs, maxAgeHours: Math.round(maxAgeMs / 3600000) };
+}
+function publicDiagnostics(data, lastDnsSync, lastError, env) {
+  const ips = data.ips || [];
+  return {
+    ok: true,
+    version: VERSION,
+    serviceHostname: getServiceHostname(env),
+    managedDnsNames: getManagedDnsNames(env),
+    total: ips.length,
+    byCarrier: countByCarrier(ips),
+    sourceHealth: sourceHealth(data.sourceStats || []),
+    stale: staleInfo(data.updatedAt),
+    updatedAt: data.updatedAt || 0,
+    lastDnsSync,
+    lastError,
+  };
 }
 
 // ============================================================
@@ -1211,7 +1247,24 @@ async function handle(request, env, ctx) {
   }
 
   if (request.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: { "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST,DELETE,OPTIONS", "access-control-allow-headers": "content-type,authorization" } });
+    return new Response(null, { status: 204, headers: responseHeaders({ "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST,DELETE,OPTIONS", "access-control-allow-headers": "content-type,authorization" }) });
+  }
+
+  if (path === "/robots.txt") {
+    return text("User-agent: *\nAllow: /$\nDisallow: /admin\nDisallow: /api/\nDisallow: /sub\nDisallow: /ips.txt\n");
+  }
+
+  if (path === "/health") {
+    const lastDnsSync = await kvGet(env, "dns:lastSync", null);
+    const info = staleInfo(data.updatedAt);
+    const ok = ips.length > 0 && !info.stale && lastDnsSync?.ok !== false;
+    return json({ ok, total: ips.length, stale: info.stale, ageMs: info.ageMs, updatedAt: data.updatedAt || 0, dnsOk: lastDnsSync?.ok ?? null }, { status: ok ? 200 : 503 });
+  }
+
+  if (path === "/api/diagnostics") {
+    const lastDnsSync = await kvGet(env, "dns:lastSync", null);
+    const lastError = await kvGet(env, "refresh:lastError", null);
+    return json(publicDiagnostics(data, lastDnsSync, lastError, env));
   }
 
   // ---- 订阅 ----
@@ -1244,6 +1297,9 @@ async function handle(request, env, ctx) {
       elapsedMs: data.elapsedMs,
       sourceStats: data.sourceStats,
       availabilityStats: data.availabilityStats,
+      sourceHealth: sourceHealth(data.sourceStats || []),
+      stale: staleInfo(data.updatedAt),
+      lastError: await kvGet(env, "refresh:lastError", null),
       lastDnsSync: await kvGet(env, "dns:lastSync", null),
       byCountry: by("country"),
       byColo: by("colo"),
@@ -1346,6 +1402,8 @@ function renderAdmin(data, visitor) {
   const lastError = data.lastError || null;
   const history = data.history || [];
   const sourceStats = data.sourceStats || [];
+  const health = sourceHealth(sourceStats);
+  const stale = staleInfo(data.updatedAt);
   const top = ips.slice(0, 20);
   const fmtTime = (ts) => ts ? new Date(ts).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "—";
   const syncRows = (lastSync?.results || []).filter(x => x?.name);
@@ -1361,7 +1419,7 @@ function renderAdmin(data, visitor) {
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>cf-best-ip 管理控制台</title><style>
 body{margin:0;background:#0a0d12;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1180px;margin:0 auto;padding:18px}.hero{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:16px}.hero h1{margin:0;font-size:26px}.mut{color:#8b949e;font-size:13px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-bottom:16px}.card,.panel{background:#11161d;border:1px solid #1f2630;border-radius:12px;padding:14px}.card b{display:block;margin-bottom:6px}.card span{color:#8b949e;font-size:12px;line-height:1.6}.actions{display:flex;flex-wrap:wrap;gap:8px}.btn{background:#1f6feb;color:#fff;border:0;border-radius:8px;padding:9px 12px;cursor:pointer}.btn.secondary{background:#222b36}.ok{color:#3fb950}.bad{color:#f85149}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #1f2630;text-align:left}th{color:#8b949e;font-weight:500}.section{margin:18px 0}.section h2{font-size:16px;margin:0 0 10px}.empty{color:#8b949e;padding:12px}.host{font-family:ui-monospace,monospace;color:#79c0ff;word-break:break-all}</style></head><body><div class="wrap">
 <div class="hero"><div><h1>cf-best-ip 管理控制台</h1><div class="mut">${serviceHost} · 最近刷新 ${fmtTime(data.updatedAt)}</div></div><div class="actions"><a class="btn secondary" href="/">返回首页</a><button class="btn" id="refresh">手动刷新</button></div></div>
-<div class="grid"><div class="card"><b>总节点</b><span>${ips.length} 个</span></div><div class="card"><b>DNS 状态</b><span>${lastSync?.ok ? '最近同步成功' : '暂无成功同步'} · ${lastSync?.verification?.ok ? '验证通过' : '等待验证/传播'}</span></div><div class="card"><b>最近错误</b><span>${lastError ? `${lastError.error || 'error'} · ${lastError.message || ''}` : '无记录'}</span></div><div class="card"><b>入口域名</b><span class="host">${hosts.join('<br>')}</span></div></div>
+<div class="grid"><div class="card"><b>总节点</b><span>${ips.length} 个${stale.stale ? ` · <span class="bad">数据超过 ${stale.maxAgeHours} 小时未刷新</span>` : ''}</span></div><div class="card"><b>DNS 状态</b><span>${lastSync?.ok ? '最近同步成功' : '暂无成功同步'} · ${lastSync?.verification?.ok ? '验证通过' : '等待验证/传播'}</span></div><div class="card"><b>数据源健康</b><span>正常 ${health.ok}/${health.total} · 失败 ${health.failed} · 空结果 ${health.empty}</span></div><div class="card"><b>最近错误</b><span>${lastError ? `${lastError.error || 'error'} · ${lastError.message || ''}` : '无记录'}</span></div><div class="card"><b>入口域名</b><span class="host">${hosts.join('<br>')}</span></div></div>
 <div class="section"><h2>DNS 同步详情</h2><div class="grid">${syncHtml}</div></div>
 <div class="section"><h2>7 天趋势</h2><div class="panel"><table><thead><tr><th>日期</th><th>总数</th><th>电信</th><th>联通</th><th>移动</th><th>通用</th></tr></thead><tbody>${histRows || '<tr><td colspan="6">暂无历史</td></tr>'}</tbody></table></div></div>
 <div class="section"><h2>稳定分 Top 20</h2><div class="panel"><table><thead><tr><th>#</th><th>IP</th><th>线路</th><th>国家</th><th>稳定分</th><th>延迟</th><th>来源</th></tr></thead><tbody>${topRows}</tbody></table></div></div>
@@ -1375,6 +1433,8 @@ function renderHome(data, visitor) {
   const ips = data.ips || [];
   const updated = data.updatedAt ? new Date(data.updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "（未运行）";
   const total = ips.length;
+  const health = sourceHealth(data.sourceStats || []);
+  const stale = staleInfo(data.updatedAt);
 
   // 取每类 top 30；hostmonit 来的有真实 delay/loss/mbps/colo，会优先排在前面
   const sortFn = (a, b) => {
@@ -1556,8 +1616,10 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
     <div>总节点 <b>${total}</b></div>
     <div>CF 自家 <b>${nativeCount}</b></div>
     
+    <div>数据源 <b>${health.ok}/${health.total}</b></div>
     <div>更新于 <b id="upd">${updated}</b></div>
   </div>
+  ${stale.stale ? `<div style="margin-top:12px;color:#f85149;font-size:13px">⚠️ 数据已超过 ${stale.maxAgeHours} 小时未刷新，请到 /admin 检查刷新状态</div>` : ""}
 </div>
 
 <div class="wrap">

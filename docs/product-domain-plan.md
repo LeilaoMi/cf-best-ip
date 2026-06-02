@@ -153,3 +153,20 @@ DNS 同步后会通过 Cloudflare DoH 和 Google DoH 检查托管域名是否已
 ### 使用指南
 
 首页已增加“怎么用”区域：新手用 `auto`，三网用户按 `ct/cu/cm`，高级用户用 `/sub` 或 `/api/preferred-ips`。
+
+
+### 健康检查与诊断
+
+新增：
+
+- `/health`：轻量探活，数据陈旧或 DNS 同步失败时返回非健康状态。
+- `/api/diagnostics`：导出诊断快照，包含节点数、三网分布、数据源健康、陈旧状态、DNS 同步和最近错误。
+- `/robots.txt`：允许首页，禁止 admin/API/订阅被索引。
+
+### 陈旧数据告警
+
+如果 `ips:latest.updatedAt` 距今超过 8 小时，首页和 `/admin` 会显示告警，便于发现 Cron 或数据源异常。
+
+### 响应头
+
+HTML/API 默认 `no-store`，并添加 `x-content-type-options`、`referrer-policy`、`x-frame-options`，避免缓存旧状态并提升基础安全性。
