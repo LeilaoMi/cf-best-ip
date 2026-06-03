@@ -37,7 +37,7 @@
 // ============================================================
 // 1. 常量 / 数据源 / 字典
 // ============================================================
-const VERSION = "3.5.2";
+const VERSION = "3.6.0";
 
 // ===== v2.3: Cloudflare 公开 IPv4 anycast CIDR (官方 ips-v4) =====
 // 用 IP 段精确判定 cf-native vs cf-proxy,不再依赖 source 元数据
@@ -144,7 +144,8 @@ const SOURCES = [
   // 030101.xyz 的 API 把 Cloudflare 数据中心 IP 段拉黑了，从 Worker 直接调会 403。
   // 但同作者把数据自动同步到了 github.com/ymyuuu/IPDB 仓库，raw 链路畅通。
   // ===== v3.2 DustinWin/BestCF 索引裡入 CMLiussss 全免费子域 + wetest 微测网 =====
-  { name: "CMLiussss/cm", url: "https://cf.090227.xyz/cmcc", type: "carrier", category: "cf-native" },
+  // addressesapi/* 与 CMLiussss/* 同属 090227.xyz 系列（不同子域），内容有重叠但不完全相同，都保留以提高覆盖率
+  { name: "CMLiussss/cm", url: "https://cf.090227.xyz/cmcc", type: "carrier", category: "cf-native", aliasOf: "addressesapi/cmcc" },
   { name: "CMLiussss/cu", url: "https://cf.090227.xyz/cu",   type: "carrier", category: "cf-native" },
   { name: "CMLiussss/ct", url: "https://cf.090227.xyz/ct",   type: "carrier", category: "cf-native" },
   { name: "wetest.vip/cloudflare", url: "https://www.wetest.vip/page/cloudflare/address_v4.html", type: "uouin_html", category: "cf-native" },
@@ -212,6 +213,7 @@ const SECURITY_HEADERS = {
   "x-content-type-options": "nosniff",
   "referrer-policy": "same-origin",
   "x-frame-options": "DENY",
+  "content-security-policy": "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src * data:; connect-src 'self'",
 };
 const NO_STORE_HEADERS = { "cache-control": "no-store, max-age=0" };
 function responseHeaders(extra = {}) {
@@ -754,40 +756,73 @@ async function aggregateSources() {
 // 5. 数据整理
 // ============================================================
 
-/** 通过 ip-api.com 批量补全 IP 的地理位置 */
+/** 通过 ipwho.is（HTTPS，免费无 key）批量补全 IP 的地理位置，ip-api.com 作 fallback */
 async function enrichGeo(ips) {
   if (!ips.length) return ips;
-  // 只查询 country 字段缺失的 IP（zip.cm.edu.kg 等源已自带国家代码）
   const needed = ips.filter(x => !x.country);
   if (!needed.length) return ips;
   const batchSize = 100;
   for (let i = 0; i < needed.length; i += batchSize) {
     const batch = needed.slice(i, i + batchSize);
+    // primary: ipwho.is（HTTPS，支持批量，无 key 限制）
+    let ok = false;
     try {
       const r = await withTimeout(
-        fetch("http://ip-api.com/batch?fields=status,country,countryCode,city,regionName,as,isp,query", {
+        fetch("https://ipwho.is/batch", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify(batch.map(x => ({ query: x.ip }))),
+          body: JSON.stringify(batch.map(x => x.ip)),
         }),
         12000,
       );
-      if (!r.ok) continue;
-      const arr = await r.json();
-      const byIp = new Map();
-      for (const it of arr) if (it && it.query) byIp.set(it.query, it);
-      for (const item of batch) {
-        const hit = byIp.get(item.ip);
-        if (hit && hit.status === "success") {
-          item.country = hit.countryCode || item.country;
-          item.countryName = hit.country || item.countryName;
-          item.region = hit.regionName || item.region;
-          item.city = hit.city || item.city;
-          item.asn = hit.as || item.asn;
-          item.isp = hit.isp || item.isp;
+      if (r.ok) {
+        const arr = await r.json();
+        const byIp = new Map();
+        for (const it of arr) {
+          if (it && it.ip && it.success !== false) byIp.set(it.ip, it);
         }
+        for (const item of batch) {
+          const hit = byIp.get(item.ip);
+          if (hit) {
+            item.country = hit.country_code || item.country;
+            item.countryName = hit.country || item.countryName;
+            item.region = hit.region || item.region;
+            item.city = hit.city || item.city;
+            item.asn = hit.connection?.asn ? `AS${hit.connection.asn}` : item.asn;
+            item.isp = hit.connection?.isp || item.isp;
+          }
+        }
+        ok = true;
       }
     } catch {}
+    // fallback: ip-api.com（HTTP，免费 100 次/分钟）
+    if (!ok) {
+      try {
+        const r = await withTimeout(
+          fetch("http://ip-api.com/batch?fields=status,country,countryCode,city,regionName,as,isp,query", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(batch.map(x => ({ query: x.ip }))),
+          }),
+          12000,
+        );
+        if (!r.ok) continue;
+        const arr = await r.json();
+        const byIp = new Map();
+        for (const it of arr) if (it && it.query) byIp.set(it.query, it);
+        for (const item of batch) {
+          const hit = byIp.get(item.ip);
+          if (hit && hit.status === "success") {
+            item.country = hit.countryCode || item.country;
+            item.countryName = hit.country || item.countryName;
+            item.region = hit.regionName || item.region;
+            item.city = hit.city || item.city;
+            item.asn = hit.as || item.asn;
+            item.isp = hit.isp || item.isp;
+          }
+        }
+      } catch {}
+    }
   }
   return ips;
 }
@@ -823,7 +858,8 @@ async function runFullTest(env, ctx, opts = {}) {
   }
 
   const enriched = await enrichGeo(alive);
-  alive = enriched.filter(x => x.country);
+  // 保留未识别国家的 IP（不丢弃，只把有国家的标记出来）
+  alive = enriched;
 
   // 6b. v2.1 cfnb：可用性二次检测（默认 off,需通过 KV config 打开 availabilityCheckEnabled）
   let availabilityStats = { skipped: true, total: alive.length, ok: alive.length };
@@ -1031,8 +1067,10 @@ async function syncRecordFromExisting(env, name, ips, topN, existing) {
   const final = [];
   const addFinal = (ip) => { if (ip && !final.includes(ip) && final.length < topN) final.push(ip); };
 
+  // 1) 优先保留仍在候选池中的旧记录（最稳定）
   for (const ip of existingContents) if (candidateSet.has(ip)) addFinal(ip);
 
+  // 2) 从新候选中补充，受 maxChanges 限制（控制单次最大变更比例）
   let addedNew = 0;
   for (const ip of candidatePool) {
     if (final.length >= topN) break;
@@ -1042,8 +1080,14 @@ async function syncRecordFromExisting(env, name, ips, topN, existing) {
     addedNew++;
   }
 
-  for (const ip of existingContents) addFinal(ip);
-  for (const ip of candidatePool) addFinal(ip);
+  // 3) 如果还没满 topN，继续从旧记录中补充（可能已不在候选池但仍可达）
+  if (final.length < topN) {
+    for (const ip of existingContents) { addFinal(ip); if (final.length >= topN) break; }
+  }
+  // 4) 最后从候选池中兜底补满
+  if (final.length < topN) {
+    for (const ip of candidatePool) { addFinal(ip); if (final.length >= topN) break; }
+  }
 
   const wanted = final.slice(0, topN);
   const wantedSet = new Set(wanted);
@@ -1096,6 +1140,9 @@ async function syncAllDns(env, alive) {
     const verification = await verifyDnsRecords(results).catch(e => ({ ok: false, error: String(e && e.message || e), checkedAt: Date.now(), checks: [] }));
     const summary = { ok: true, startedAt, finishedAt: Date.now(), elapsedMs: Date.now() - startedAt, topN, results, verification };
     await kvSet(env, "dns:lastSync", summary);
+    // 写入当日 DNS 同步历史（7 天 TTL）
+    const day = new Date().toISOString().slice(0, 10);
+    await kvSet(env, `dns:history:${day}`, summary, { expirationTtl: 60 * 60 * 24 * 7 });
     return results;
   } catch (e) {
     const summary = { ok: false, startedAt, finishedAt: Date.now(), elapsedMs: Date.now() - startedAt, topN, results, error: String(e && e.message || e) };
@@ -1272,17 +1319,25 @@ async function handle(request, env, ctx) {
   }
 
   if (path === "/health") {
-    const lastDnsSync = await kvGet(env, "dns:lastSync", null);
+    const [lastDnsSync] = await Promise.all([kvGet(env, "dns:lastSync", null)]);
     const info = staleInfo(data.updatedAt);
-    const ok = ips.length > 0 && !info.stale && lastDnsSync?.ok !== false;
-    return json({ ok, total: ips.length, stale: info.stale, ageMs: info.ageMs, updatedAt: data.updatedAt || 0, dnsOk: lastDnsSync?.ok ?? null }, { status: ok ? 200 : 503 });
+    const sh = sourceHealth(data.sourceStats || []);
+    const sourceOk = sh.total === 0 || sh.ok >= Math.ceil(sh.total * 0.4);
+    const ok = ips.length > 0 && !info.stale && lastDnsSync?.ok !== false && sourceOk;
+    return json({
+      ok, total: ips.length, stale: info.stale, ageMs: info.ageMs,
+      updatedAt: data.updatedAt || 0, dnsOk: lastDnsSync?.ok ?? null,
+      sourceHealth: { ok: sh.ok, total: sh.total, failed: sh.failed },
+    }, { status: ok ? 200 : 503 });
   }
 
   if (path === "/api/diagnostics") {
     const authError = requireAdminAuth(request, env);
     if (authError) return authError;
-    const lastDnsSync = await kvGet(env, "dns:lastSync", null);
-    const lastError = await kvGet(env, "refresh:lastError", null);
+    const [lastDnsSync, lastError] = await Promise.all([
+      kvGet(env, "dns:lastSync", null),
+      kvGet(env, "refresh:lastError", null),
+    ]);
     return json(publicDiagnostics(data, lastDnsSync, lastError, env));
   }
 
@@ -1308,6 +1363,10 @@ async function handle(request, env, ctx) {
       for (const x of ips) { const k = x[key] || "?"; m[k] = (m[k] || 0) + 1; }
       return Object.entries(m).map(([k, v]) => ({ key: k, count: v })).sort((a, b) => b.count - a.count);
     };
+    const [lastError, lastDnsSync] = await Promise.all([
+      kvGet(env, "refresh:lastError", null),
+      kvGet(env, "dns:lastSync", null),
+    ]);
     return json({
       ok: true,
       version: VERSION,
@@ -1318,8 +1377,8 @@ async function handle(request, env, ctx) {
       availabilityStats: data.availabilityStats,
       sourceHealth: sourceHealth(data.sourceStats || []),
       stale: staleInfo(data.updatedAt),
-      lastError: await kvGet(env, "refresh:lastError", null),
-      lastDnsSync: await kvGet(env, "dns:lastSync", null),
+      lastError,
+      lastDnsSync,
       byCountry: by("country"),
       byColo: by("colo"),
       byCarrier: by("carrier"),
@@ -1339,6 +1398,33 @@ async function handle(request, env, ctx) {
       if (snap) out.push({ date: d, count: snap.ips.length, byCarrier: countByCarrier(snap.ips), top1: snap.ips[0], updatedAt: snap.updatedAt });
     }
     return json({ days, history: out });
+  }
+
+  // ---- 配置管理（需 ADMIN_TOKEN）----
+  if (path === "/api/config") {
+    const authError = requireAdminAuth(request, env);
+    if (authError) return authError;
+    if (request.method === "GET") {
+      const cfg = await getConfig(env);
+      return json({ ok: true, config: cfg, defaults: DEFAULT_CFG });
+    }
+    if (request.method === "POST" || request.method === "PUT") {
+      try {
+        const body = await request.json();
+        const current = await getConfig(env);
+        const allowed = Object.keys(DEFAULT_CFG);
+        const patch = {};
+        for (const k of allowed) {
+          if (body[k] !== undefined) patch[k] = body[k];
+        }
+        const next = { ...current, ...patch };
+        await kvSet(env, "config", next);
+        return json({ ok: true, config: next });
+      } catch (e) {
+        return json({ ok: false, error: String(e && e.message || e) }, { status: 400 });
+      }
+    }
+    return json({ ok: false, error: "method-not-allowed" }, { status: 405 });
   }
 
   // ---- 受保护：手动刷新（60s 冷却）----
@@ -1538,6 +1624,10 @@ function renderHome(data, visitor) {
 <style>
 :root { --bg:#0a0d12; --card:#11161d; --bd:#1f2630; --fg:#e6edf3; --mut:#8b949e;
   --ct:#3fb950; --cu:#a371f7; --cm:#388bfd; --cf:#f9826c; --pr:#d29922; }
+@media (prefers-color-scheme: light) {
+  :root { --bg:#ffffff; --card:#f6f8fa; --bd:#eaeef2; --fg:#24292e; --mut:#586069;
+    --ct:#28a745; --cu:#6f42c1; --cm:#007bff; --cf:#fd7e14; --pr:#ffc107; }
+}
 *{box-sizing:border-box}
 body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0}
 .hero{padding:36px 16px;background:linear-gradient(180deg,#000 0%,#0a0d12 100%);text-align:center;border-bottom:1px solid var(--bd)}
@@ -1787,6 +1877,7 @@ function clientTestIp(ip) {
 }
 
 let clientTestQueue = [];
+let clientTestEnqueued = new Set();
 let clientTestActive = 0;
 const CLIENT_TEST_CONCURRENCY = 6;
 
@@ -1831,7 +1922,10 @@ function startClientTestsForActivePane() {
   const rows = pane.querySelectorAll('tr[data-tested="0"]');
   // 插到队列但避免重复
   rows.forEach(r => {
-    if (!clientTestQueue.includes(r)) clientTestQueue.push(r);
+    if (!clientTestEnqueued.has(r)) {
+      clientTestEnqueued.add(r);
+      clientTestQueue.push(r);
+    }
   });
   processClientTestQueue();
 }

@@ -15,3 +15,16 @@ jobs:
           body="$(curl -fsS --max-time 20 https://bestip.leilaomi.cc.cd/health)"
           echo "$body"
           echo "$body" | jq -e '.ok == true'
+      - name: Source health gate
+        if: always()
+        run: |
+          body="$(curl -fsS --max-time 20 https://bestip.leilaomi.cc.cd/health)"
+          ok=$(echo "$body" | jq -r '.sourceHealth.ok // 0')
+          total=$(echo "$body" | jq -r '.sourceHealth.total // 0')
+          failed=$(echo "$body" | jq -r '.sourceHealth.failed // 0')
+          echo "Sources: $ok/$total ok, $failed failed"
+          # Fail if more than 60% of sources failed
+          if [ "$total" -gt 0 ]; then
+            threshold=$(( total * 60 / 100 ))
+            [ "$failed" -le "$threshold" ] || { echo "::error::Too many sources failed: $failed/$total"; exit 1; }
+          fi

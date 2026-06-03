@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-orange)](https://workers.cloudflare.com/)
-[![Version](https://img.shields.io/badge/version-3.5.2-blue)]()
+[![Version](https://img.shields.io/badge/version-3.6.0-blue)]()
 
 > 在 Cloudflare Worker 上跑的 **CF 自家 IP 优选服务**:聚合社区主流数据源,经官方 CIDR 校验,按运营商 / 全局展示,自动同步到自定义子域 A 记录。
 
@@ -134,6 +134,7 @@ wrangler deploy
 | `/api/stats` | 池子统计 + 最近一次 DNS 同步结果 |
 | `/health` | 轻量健康检查，适合外部监控探活 |
 | `/api/diagnostics` | 诊断快照：节点数、三网分布、数据源健康、陈旧状态、DNS 同步、最近错误；需要 `ADMIN_TOKEN` |
+| `/api/config` | 运行时配置查看/修改（GET 读取 / POST 写入），需 `ADMIN_TOKEN` |
 | `/api/dns/current` | 当前 4 子域的 DNS 记录 + 最近一次同步结果 |
 | `/api/history?days=7` | 过去 N 天的快照 |
 | `/sub` | 纯文本订阅：`IP:port` 一行一条，可作 DDNS 用 |
@@ -163,6 +164,12 @@ curl -X POST \
 - **安全与缓存头**：HTML/API 响应默认 no-store，并带基础安全响应头；`/robots.txt` 避免索引 admin/API。
 - **Worker 平台限制**：Cloudflare Workers 禁止从 Worker 出口连接 CF 自家 IP（`connect()` 会失败），所以**本项目不在 Worker 内做 TCP 测速**，完全依赖 hostmonit 等后端测速数据。
 - **手动刷新保护**：`/api/refresh` 默认只接受 `POST + Bearer token`，避免公开端点被滥用去烧第三方源或 Cloudflare DNS API 配额。
+- **地理信息补全**：通过 ipwho.is（HTTPS，免费无 key）批量查询 IP 国家/城市/ASN，失败时自动回退到 ip-api.com；未识别国家的 IP 不会被丢弃。
+- **DNS 同步历史**：`dns:lastSync` 记录最近一次同步结果，`dns:history:YYYY-MM-DD` 保留 7 天快照，方便 `/api/history` 追踪。
+- **运行时配置管理**：`/api/config`（需 `ADMIN_TOKEN`）支持 GET 查看、POST 更新运行时配置（国家黑名单、DNS 黑名单、可用性检测开关等），无需重新部署。
+- **自适应深色/浅色主题**：首页自动跟随系统 `prefers-color-scheme`，暗色模式为默认，亮色模式自动切换配色。
+- **基础 CSP 安全头**：响应头包含 `content-security-policy`，限制 `default-src 'self'`、`script-src 'unsafe-inline'`、`img-src * data:`，防范 XSS。
+- **源去重标记**：部分数据源（如 `CMLiussss/*` 与 `addressesapi/*`）属于同一上游但子域不同，`aliasOf` 字段标记关联关系，前端可据此合并展示。
 
 ---
 
