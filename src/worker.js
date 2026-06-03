@@ -175,6 +175,7 @@ const SOURCES = [
   },
   // ===== v2.6 社区高星 CF native 源(纯 CF 段,大幅提升 cf-native 数量) =====
   { name: "joname1/BestCFip",           url: "https://raw.githubusercontent.com/joname1/BestCFip/main/ipv4.txt", type: "text", category: "cf-native" },
+  { name: "joname1/BestCFip/ipv6",      url: "https://raw.githubusercontent.com/joname1/BestCFip/main/ipv6.txt", type: "v6_text", category: "cf-native" },
   { name: "KafeMars/cloudflare_ips",    url: "https://raw.githubusercontent.com/KafeMars/best-ips-domains/main/cloudflare_ips.txt", type: "text", category: "cf-native" },
   { name: "KafeMars/US_IP4",            url: "https://raw.githubusercontent.com/KafeMars/best-ips-domains/main/US_IP4", type: "text", category: "cf-native" },
   { name: "KafeMars/HK_IP4",            url: "https://raw.githubusercontent.com/KafeMars/best-ips-domains/main/HK_IP4", type: "text", category: "cf-native" },
@@ -504,7 +505,7 @@ function parseLineAdaptive(line) {
     // 再抽国家
     country = extractCountryCode(tail);
   }
-  return { ip, port, carrier, country };
+  return { ip, port, carrier, country, family: ip.includes(":") ? "v6" : "v4" };
 }
 
 /**
@@ -739,6 +740,7 @@ async function fetchSource(src) {
             colo: x.colo && x.colo !== "Default" ? x.colo : undefined,
             node: x.node,
             tested: true,
+            family: "v4",
             category: "cf-native",
           });
         }
@@ -768,6 +770,18 @@ async function fetchSource(src) {
       return { name: src.name, ips };
     }
 
+    if (src.type === "v6_text") {
+      // IPv6 源：每行一个 [ipv6]:port#tag，去方括号和 # 后内容
+      for (const raw of body.split(/[\r\n]+/)) {
+        const line = raw.trim();
+        if (!line || line.startsWith("#")) continue;
+        const m = line.match(/^\[?([0-9a-fA-F:]+)\]?:(\d{1,5})/);
+        if (!m) continue;
+        ips.push({ ip: m[1], port: +m[2], carrier: null, family: "v6", category, sources: [src.name] });
+      }
+      return { name: src.name, ips };
+    }
+
     // v2.1：新源用 emoji/中文标签，需要自适应解析
     // v2.2：扩大自适应名单（IPDB/bestproxy 同样带 country 标签）
     const adaptiveSources = new Set([
@@ -784,13 +798,13 @@ async function fetchSource(src) {
       if (!line || line.startsWith("#") || line.startsWith("//")) continue;
       if (useAdaptive) {
         const parsed = parseLineAdaptive(line);
-        if (parsed) ips.push({ ...parsed, category, sources: [src.name] });
+        if (parsed) ips.push({ ...parsed, category: category, sources: [src.name], family: parsed.ip && parsed.ip.includes(":") ? "v6" : "v4" });
         continue;
       }
       const matches = line.match(/\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?(?:#[\w\-]+)?/g) || [];
       for (const mm of matches) {
         const parsed = parseLine(mm);
-        if (parsed) ips.push({ ...parsed, category, sources: [src.name] });
+        if (parsed) ips.push({ ...parsed, family: "v4", category, sources: [src.name] });
       }
     }
     return { name: src.name, ips };
@@ -1344,13 +1358,17 @@ function applyFilter(ips, params, requesterColo, cfg) {
   return out.slice(0, top);
 }
 
+function fmtAddr(x) {
+  const ip = x.family === "v6" || (x.ip || "").includes(":") ? `[${x.ip}]` : x.ip;
+  return `${ip}:${x.port}`;
+}
 function fmtSub(ips, withComment) {
   return ips.map(x => {
     const tag = [x.country, x.colo, x.carrier && carrierName(x.carrier)].filter(Boolean).join("-");
-    return withComment ? `${x.ip}:${x.port}#${tag || "CF"}` : `${x.ip}:${x.port}`;
+    return withComment ? `${fmtAddr(x)}#${tag || "CF"}` : fmtAddr(x);
   }).join("\n");
 }
-function fmtEDT(ips) { return ips.map(x => `${x.ip}:${x.port}`).join("\n"); }
+function fmtEDT(ips) { return ips.map(fmtAddr).join("\n"); }
 
 // ============================================================
 // 10. 鉴权
@@ -1688,19 +1706,19 @@ function renderHome(data, visitor) {
 <style>
 :root { --bg:#0a0d12; --card:#11161d; --bd:#1f2630; --fg:#e6edf3; --mut:#8b949e;
   --ct:#3fb950; --cu:#a371f7; --cm:#388bfd; --cf:#f9826c; --pr:#d29922;
-  --hero:#000; --hero-edge:#0a0d12; }
+  --hero:#000; --hero-edge:#0a0d12; --hero-fg:#ffffff; --hero-mut:#9aa4af; }
 @media (prefers-color-scheme: light) {
   :root { --bg:#ffffff; --card:#f6f8fa; --bd:#eaeef2; --fg:#24292e; --mut:#586069;
     --ct:#28a745; --cu:#6f42c1; --cm:#007bff; --cf:#fd7e14; --pr:#ffc107;
-    --hero:#f6f8fa; --hero-edge:#ffffff; }
+    --hero:#eef2f6; --hero-edge:#ffffff; --hero-fg:#1f2328; --hero-mut:#57606a; }
 }
 *{box-sizing:border-box}
 body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0}
 .hero{padding:36px 16px;background:linear-gradient(180deg,var(--hero) 0%,var(--hero-edge) 100%);text-align:center;border-bottom:1px solid var(--bd)}
-.hero h1{margin:0 0 8px;font-size:30px;letter-spacing:1px}
-.hero .sub{color:var(--mut);font-size:13px;margin-bottom:18px;line-height:1.7;padding:0 8px}
-.hero-stats{display:flex;flex-wrap:wrap;gap:8px 24px;justify-content:center;font-size:12px;color:var(--mut)}
-.hero-stats b{color:var(--fg);font-size:16px;font-weight:600;margin-left:4px}
+.hero h1{margin:0 0 8px;font-size:30px;letter-spacing:1px;color:var(--hero-fg)}
+.hero .sub{color:var(--hero-mut);font-size:13px;margin-bottom:18px;line-height:1.7;padding:0 8px}
+.hero-stats{display:flex;flex-wrap:wrap;gap:8px 24px;justify-content:center;font-size:12px;color:var(--hero-mut)}
+.hero-stats b{color:var(--hero-fg);font-size:16px;font-weight:600;margin-left:4px}
 .wrap{max-width:1100px;margin:0 auto;padding:16px}
 .recommend{margin:0 0 16px;padding:16px;background:linear-gradient(135deg,rgba(31,111,235,.18),rgba(63,185,80,.10));border:1px solid #2f6feb;border-radius:14px;display:grid;gap:14px;grid-template-columns:minmax(0,1.3fr) minmax(220px,.7fr)}
 .rec-kicker{font-size:12px;color:#9fb7ff;margin-bottom:6px}
