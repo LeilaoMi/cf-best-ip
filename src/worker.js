@@ -83,11 +83,60 @@ function ipToInt(ip) {
 }
 
 function isCfNativeIp(ip) {
+  if (ip == null) return false;
+  if (typeof ip === "string" && ip.includes(":")) return isCfNativeIpV6(ip);
   const v = ipToInt(ip);
   if (v == null) return false;
   for (const [net, mask] of CF_RANGES) {
     if ((v & mask) === net) return true;
   }
+  return false;
+}
+
+// ===== Cloudflare IPv6 CIDR (官方 ips-v6) =====
+const CF_IPV6_CIDRS = [
+  "2606:4700::/32",
+  "2803:f800::/32",
+  "2405:b500::/32",
+  "2405:8100::/32",
+  "2a06:98c0::/29",
+  "2c0f:f248::/32",
+];
+
+function ipv6ToBigInt(ip) {
+  const parts = ip.split(":");
+  let full = [];
+  if (parts.includes("")) {
+    const idx = parts.indexOf("");
+    const before = parts.slice(0, idx).filter(p => p !== "");
+    const after = parts.slice(idx + 1).filter(p => p !== "");
+    const zeros = 8 - before.length - after.length;
+    full = [...before, ...Array(zeros).fill("0"), ...after];
+  } else {
+    full = parts;
+  }
+  let v = 0n;
+  for (const p of full) {
+    v = (v << 16n) | BigInt(parseInt(p || "0", 16));
+  }
+  return v;
+}
+
+const CF_RANGES_V6 = CF_IPV6_CIDRS.map(c => {
+  const [addr, bits] = c.split("/");
+  const net = ipv6ToBigInt(addr);
+  const bitsN = BigInt(+bits);
+  const mask = bitsN === 0n ? 0n : (0xffffffffffffffffffffffffffffffffn << (128n - bitsN));
+  return [net & mask, mask];
+});
+
+function isCfNativeIpV6(ip) {
+  try {
+    const v = ipv6ToBigInt(ip);
+    for (const [net, mask] of CF_RANGES_V6) {
+      if ((v & mask) === net) return true;
+    }
+  } catch {}
   return false;
 }
 
@@ -302,7 +351,7 @@ function isAdminAuthorized(request, env) {
 }
 function requireAdminAuth(request, env) {
   if (isAdminAuthorized(request, env)) return null;
-  return json({ ok: false, error: "unauthorized", hint: "需要 Authorization: Bearer <ADMIN_TOKEN>，或通过 /admin 登录页面输入" }, { status: 401 });
+  return json({ ok: false, error: "unauthorized", hint: "需要 Authorization: Bearer <ADMIN_TOKEN>" }, { status: 401 });
 }
 function requireRefreshAuth(request, env) {
   if (request.method !== "POST") {
@@ -322,9 +371,11 @@ function requireRefreshAuth(request, env) {
 
 const IP_RE = /\b((?:25[0-5]|2[0-4]\d|[01]?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|[01]?\d?\d)){3})\b/g;
 
+const IPv6_RE = /(?<![\w:])([0-9a-fA-F:]{6,39})(?::(\d{1,5}))?(?:#([\w\-]+))?/;
+
 function parseLine(line) {
   const m = line.match(/(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?(?:#([\w\-]+))?/);
-  if (!m) return null;
+  if (m) {
   let carrier = null;
   let country = null;
   if (m[3]) {
@@ -335,7 +386,18 @@ function parseLine(line) {
       country = tag;
     }
   }
-  return { ip: m[1], port: m[2] ? +m[2] : 443, carrier, country };
+    return { ip: m[1], port: m[2] ? +m[2] : 443, carrier, country };
+  }
+  // IPv6 fallback
+  const v6 = line.match(IPv6_RE);
+  if (!v6) return null;
+  let carrier6 = null, country6 = null;
+  if (v6[3]) {
+    const tag = v6[3].toUpperCase().split("-")[0];
+    if (["CT","CU","CM","CMCC","CF"].includes(tag)) carrier6 = tag === "CMCC" ? "CM" : tag;
+    else if (/^[A-Z]{2}$/.test(tag)) country6 = tag;
+  }
+  return { ip: v6[1], port: v6[2] ? +v6[2] : 443, carrier: carrier6, country: country6 };
 }
 
 // ============================================================
@@ -1241,6 +1303,9 @@ function applyFilter(ips, params, requesterColo, cfg) {
   if (maxDelay) out = out.filter(x => x.delay != null && x.delay <= maxDelay);
   if (minMbps) out = out.filter(x => x.mbps != null && x.mbps >= minMbps);
   if (exclude.length) out = out.filter(x => !x.country || !exclude.includes(x.country));
+  const familyParam = (params.get("family") || "").toLowerCase();
+  if (familyParam === "v4") out = out.filter(x => !x.family || x.family === "v4");
+  else if (familyParam === "v6") out = out.filter(x => x.family === "v6");
 
   // 智能就近：按访问者 colo 推断的国家做优先级
   if (params.get("smart") === "1" && requesterColo) {
@@ -1501,7 +1566,7 @@ export default {
 // 14. HTML 模板
 // ============================================================
 function renderAdminLogin() {
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理控制台登录</title><style>body{margin:0;background:#0a0d12;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center;min-height:100vh}.card{width:min(420px,calc(100vw - 32px));background:#11161d;border:1px solid #1f2630;border-radius:14px;padding:20px}h1{font-size:22px;margin:0 0 10px}.mut{color:#8b949e;font-size:13px;line-height:1.7}input{width:100%;box-sizing:border-box;margin:14px 0 10px;padding:11px;border-radius:8px;border:1px solid #1f2630;background:#0d1117;color:#e6edf3}.btn{width:100%;background:#1f6feb;color:#fff;border:0;border-radius:8px;padding:11px;cursor:pointer}</style></head><body><div class="card"><h1>管理控制台</h1><div class="mut">请输入 ADMIN_TOKEN。Token 只保存在当前浏览器会话，不会写入服务器或 URL。</div><input id="token" type="password" placeholder="ADMIN_TOKEN"><button class="btn" id="go">进入</button><div id="err" style="color:#f85149;font-size:12px;margin-top:8px"></div></div><script>document.getElementById('go').onclick=async()=>{const t=document.getElementById('token').value.trim();if(!t)return;const btn=document.getElementById('go');const err=document.getElementById('err');btn.disabled=true;btn.textContent='验证中…';err.textContent='';try{const r=await fetch('/admin',{headers:{'Authorization':'Bearer '+t}});if(r.ok){sessionStorage.setItem('adminToken',t);const html=await r.text();document.open();document.write(html);document.close()}else{err.textContent='Token 无效，请重试';btn.disabled=false;btn.textContent='进入'}}catch(e){err.textContent=e.message;btn.disabled=false;btn.textContent='进入'}};document.getElementById('token').addEventListener('keydown',e=>{if(e.key==='Enter')document.getElementById('go').click()})</script></body></html>`;
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理控制台登录</title><style>body{margin:0;background:#0a0d12;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center;min-height:100vh}.card{width:min(420px,calc(100vw - 32px));background:#11161d;border:1px solid #1f2630;border-radius:14px;padding:20px}h1{font-size:22px;margin:0 0 10px}.mut{color:#8b949e;font-size:13px;line-height:1.7}input{width:100%;box-sizing:border-box;margin:14px 0 10px;padding:11px;border-radius:8px;border:1px solid #1f2630;background:#0d1117;color:#e6edf3}.btn{width:100%;background:#1f6feb;color:#fff;border:0;border-radius:8px;padding:11px;cursor:pointer}</style></head><body><div class="card"><h1>管理控制台</h1><div class="mut">请输入 ADMIN_TOKEN。Token 只保存在当前浏览器会话，不会写入服务器。</div><input id="token" type="password" placeholder="ADMIN_TOKEN"><button class="btn" id="go">进入</button></div><script>document.getElementById('go').onclick=async()=>{const t=document.getElementById('token').value.trim();if(!t)return;sessionStorage.setItem('adminToken',t);try{const r=await fetch('/admin',{headers:{'Authorization':'Bearer '+t}});if(r.ok){document.open();document.write(await r.text());document.close()}else{alert('认证失败，请检查 Token')}}catch(e){alert('请求失败: '+e.message)}};</script></body></html>`;
 }
 
 function renderAdmin(data, visitor) {
@@ -1536,28 +1601,7 @@ body{margin:0;background:#0a0d12;color:#e6edf3;font-family:-apple-system,BlinkMa
 <div class="section"><h2>稳定分 Top 20</h2><div class="panel"><table><thead><tr><th>#</th><th>IP</th><th>线路</th><th>国家</th><th>稳定分</th><th>延迟</th><th>来源</th></tr></thead><tbody>${topRows}</tbody></table></div></div>
 <div class="section"><h2>数据源健康</h2><div class="panel"><table><thead><tr><th>数据源</th><th>数量</th><th>状态</th></tr></thead><tbody>${sourceRows}</tbody></table></div></div>
 </div><script>
-document.getElementById('refresh').onclick=async(e)=>{
-  const btn=e.target;
-  const token=sessionStorage.getItem('adminToken')||prompt('输入 ADMIN_TOKEN');
-  if(!token)return;
-  sessionStorage.setItem('adminToken',token);
-  btn.disabled=true;
-  btn.textContent='刷新中…';
-  try{
-    const r=await fetch('/api/refresh',{method:'POST',headers:{authorization:'Bearer '+token}}).then(r=>r.json());
-    if(r.ok){
-      btn.textContent='完成';
-      setTimeout(()=>location.reload(),800);
-    }else{
-      if(r.error==='unauthorized')sessionStorage.removeItem('adminToken');
-      btn.textContent=r.hint||r.error||'失败';
-      setTimeout(()=>{btn.disabled=false;btn.textContent='手动刷新'},3000);
-    }
-  }catch(err){
-    btn.textContent=err.message;
-    btn.disabled=false;
-  }
-}
+document.getElementById('refresh').onclick=async(e)=>{const btn=e.target;const token=sessionStorage.getItem('adminToken')||prompt('输入 ADMIN_TOKEN');if(!token)return;sessionStorage.setItem('adminToken',token);btn.disabled=true;btn.textContent='刷新中…';try{const r=await fetch('/api/refresh',{method:'POST',headers:{authorization:'Bearer '+token}}).then(r=>r.json());if(r.ok){btn.textContent='完成';setTimeout(()=>location.reload(),800)}else{if(r.error==='unauthorized')sessionStorage.removeItem('adminToken');btn.textContent=r.hint||r.error||'失败';setTimeout(()=>{btn.disabled=false;btn.textContent='手动刷新'},3000)}}catch(err){btn.textContent=err.message;btn.disabled=false}}
 </script></body></html>`;
 }
 
@@ -1643,14 +1687,16 @@ function renderHome(data, visitor) {
 <meta name="description" content="电信、联通、移动 优质 Cloudflare 节点 IP,真实测速数据,每 6 小时自动刷新">
 <style>
 :root { --bg:#0a0d12; --card:#11161d; --bd:#1f2630; --fg:#e6edf3; --mut:#8b949e;
-  --ct:#3fb950; --cu:#a371f7; --cm:#388bfd; --cf:#f9826c; --pr:#d29922; }
+  --ct:#3fb950; --cu:#a371f7; --cm:#388bfd; --cf:#f9826c; --pr:#d29922;
+  --hero:#000; --hero-edge:#0a0d12; }
 @media (prefers-color-scheme: light) {
   :root { --bg:#ffffff; --card:#f6f8fa; --bd:#eaeef2; --fg:#24292e; --mut:#586069;
-    --ct:#28a745; --cu:#6f42c1; --cm:#007bff; --cf:#fd7e14; --pr:#ffc107; }
+    --ct:#28a745; --cu:#6f42c1; --cm:#007bff; --cf:#fd7e14; --pr:#ffc107;
+    --hero:#f6f8fa; --hero-edge:#ffffff; }
 }
 *{box-sizing:border-box}
 body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0}
-.hero{padding:36px 16px;background:linear-gradient(180deg,#000 0%,#0a0d12 100%);text-align:center;border-bottom:1px solid var(--bd)}
+.hero{padding:36px 16px;background:linear-gradient(180deg,var(--hero) 0%,var(--hero-edge) 100%);text-align:center;border-bottom:1px solid var(--bd)}
 .hero h1{margin:0 0 8px;font-size:30px;letter-spacing:1px}
 .hero .sub{color:var(--mut);font-size:13px;margin-bottom:18px;line-height:1.7;padding:0 8px}
 .hero-stats{display:flex;flex-wrap:wrap;gap:8px 24px;justify-content:center;font-size:12px;color:var(--mut)}
@@ -1965,15 +2011,14 @@ tabs.forEach(t => {
 // 倒计时 (下次 Cron: 每 6 小时整 UTC)
 function tickCountdown() {
   const now = new Date();
-  const totalMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
-  const slot = Math.ceil((totalMinutes + 0.001) / 360) * 360 + 15;
+  const totalMin = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const nextH = Math.ceil((totalMin - 14) / 360) * 6;
+  const nh = ((nextH % 24) + 24) % 24;
+  const nextMin = nh * 60 + 15;
+  const dayOffset = nextMin <= totalMin ? 1 : 0;
   const next = new Date(Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate(),
-    0,
-    slot,
-    0,
+    now.getUTCFullYear(), now.getUTCMonth(),
+    now.getUTCDate() + dayOffset, nh, 15, 0
   ));
   const s = Math.max(0, Math.floor((next - now) / 1000));
   const h = String(Math.floor(s / 3600)).padStart(2, '0');
