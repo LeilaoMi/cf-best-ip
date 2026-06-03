@@ -12,9 +12,9 @@ routes = [
 binding = "KV"
 id = "23c38685383d4d3f8a1391487482e0a9"
 
-# Cron Trigger - 每 6 小时拉一次源 + 同步 DNS
+# Cron Trigger - 每 6 小时拉一次源 + 同步 DNS（偏移 15 分钟避开 hostmonit 整点更新）
 [triggers]
-crons = ["0 */6 * * *"]
+crons = ["15 */6 * * *"]
 
 # 非敏感变量(public,可见即可)
 [vars]

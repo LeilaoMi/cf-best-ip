@@ -302,7 +302,7 @@ function isAdminAuthorized(request, env) {
 }
 function requireAdminAuth(request, env) {
   if (isAdminAuthorized(request, env)) return null;
-  return json({ ok: false, error: "unauthorized", hint: "需要 Authorization: Bearer <ADMIN_TOKEN>，或使用 /admin?token=<ADMIN_TOKEN> 首次进入" }, { status: 401 });
+  return json({ ok: false, error: "unauthorized", hint: "需要 Authorization: Bearer <ADMIN_TOKEN>，或通过 /admin 登录页面输入" }, { status: 401 });
 }
 function requireRefreshAuth(request, env) {
   if (request.method !== "POST") {
@@ -1501,7 +1501,7 @@ export default {
 // 14. HTML 模板
 // ============================================================
 function renderAdminLogin() {
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理控制台登录</title><style>body{margin:0;background:#0a0d12;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center;min-height:100vh}.card{width:min(420px,calc(100vw - 32px));background:#11161d;border:1px solid #1f2630;border-radius:14px;padding:20px}h1{font-size:22px;margin:0 0 10px}.mut{color:#8b949e;font-size:13px;line-height:1.7}input{width:100%;box-sizing:border-box;margin:14px 0 10px;padding:11px;border-radius:8px;border:1px solid #1f2630;background:#0d1117;color:#e6edf3}.btn{width:100%;background:#1f6feb;color:#fff;border:0;border-radius:8px;padding:11px;cursor:pointer}</style></head><body><div class="card"><h1>管理控制台</h1><div class="mut">请输入 ADMIN_TOKEN。Token 只保存在当前浏览器会话，不会写入服务器。</div><input id="token" type="password" placeholder="ADMIN_TOKEN"><button class="btn" id="go">进入</button></div><script>document.getElementById('go').onclick=()=>{const t=document.getElementById('token').value.trim();if(!t)return;sessionStorage.setItem('adminToken',t);location.href='/admin?token='+encodeURIComponent(t)};</script></body></html>`;
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理控制台登录</title><style>body{margin:0;background:#0a0d12;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center;min-height:100vh}.card{width:min(420px,calc(100vw - 32px));background:#11161d;border:1px solid #1f2630;border-radius:14px;padding:20px}h1{font-size:22px;margin:0 0 10px}.mut{color:#8b949e;font-size:13px;line-height:1.7}input{width:100%;box-sizing:border-box;margin:14px 0 10px;padding:11px;border-radius:8px;border:1px solid #1f2630;background:#0d1117;color:#e6edf3}.btn{width:100%;background:#1f6feb;color:#fff;border:0;border-radius:8px;padding:11px;cursor:pointer}</style></head><body><div class="card"><h1>管理控制台</h1><div class="mut">请输入 ADMIN_TOKEN。Token 只保存在当前浏览器会话，不会写入服务器或 URL。</div><input id="token" type="password" placeholder="ADMIN_TOKEN"><button class="btn" id="go">进入</button><div id="err" style="color:#f85149;font-size:12px;margin-top:8px"></div></div><script>document.getElementById('go').onclick=async()=>{const t=document.getElementById('token').value.trim();if(!t)return;const btn=document.getElementById('go');const err=document.getElementById('err');btn.disabled=true;btn.textContent='验证中…';err.textContent='';try{const r=await fetch('/admin',{headers:{'Authorization':'Bearer '+t}});if(r.ok){sessionStorage.setItem('adminToken',t);const html=await r.text();document.open();document.write(html);document.close()}else{err.textContent='Token 无效，请重试';btn.disabled=false;btn.textContent='进入'}}catch(e){err.textContent=e.message;btn.disabled=false;btn.textContent='进入'}};document.getElementById('token').addEventListener('keydown',e=>{if(e.key==='Enter')document.getElementById('go').click()})</script></body></html>`;
 }
 
 function renderAdmin(data, visitor) {
@@ -1536,8 +1536,28 @@ body{margin:0;background:#0a0d12;color:#e6edf3;font-family:-apple-system,BlinkMa
 <div class="section"><h2>稳定分 Top 20</h2><div class="panel"><table><thead><tr><th>#</th><th>IP</th><th>线路</th><th>国家</th><th>稳定分</th><th>延迟</th><th>来源</th></tr></thead><tbody>${topRows}</tbody></table></div></div>
 <div class="section"><h2>数据源健康</h2><div class="panel"><table><thead><tr><th>数据源</th><th>数量</th><th>状态</th></tr></thead><tbody>${sourceRows}</tbody></table></div></div>
 </div><script>
-const urlToken=new URLSearchParams(location.search).get('token');if(urlToken){sessionStorage.setItem('adminToken',urlToken);history.replaceState(null,'','/admin')}
-document.getElementById('refresh').onclick=async(e)=>{const btn=e.target;const token=sessionStorage.getItem('adminToken')||prompt('输入 ADMIN_TOKEN');if(!token)return;sessionStorage.setItem('adminToken',token);btn.disabled=true;btn.textContent='刷新中…';try{const r=await fetch('/api/refresh',{method:'POST',headers:{authorization:'Bearer '+token}}).then(r=>r.json());if(r.ok){btn.textContent='完成';setTimeout(()=>location.reload(),800)}else{if(r.error==='unauthorized')sessionStorage.removeItem('adminToken');btn.textContent=r.hint||r.error||'失败';setTimeout(()=>{btn.disabled=false;btn.textContent='手动刷新'},3000)}}catch(err){btn.textContent=err.message;btn.disabled=false}}
+document.getElementById('refresh').onclick=async(e)=>{
+  const btn=e.target;
+  const token=sessionStorage.getItem('adminToken')||prompt('输入 ADMIN_TOKEN');
+  if(!token)return;
+  sessionStorage.setItem('adminToken',token);
+  btn.disabled=true;
+  btn.textContent='刷新中…';
+  try{
+    const r=await fetch('/api/refresh',{method:'POST',headers:{authorization:'Bearer '+token}}).then(r=>r.json());
+    if(r.ok){
+      btn.textContent='完成';
+      setTimeout(()=>location.reload(),800);
+    }else{
+      if(r.error==='unauthorized')sessionStorage.removeItem('adminToken');
+      btn.textContent=r.hint||r.error||'失败';
+      setTimeout(()=>{btn.disabled=false;btn.textContent='手动刷新'},3000);
+    }
+  }catch(err){
+    btn.textContent=err.message;
+    btn.disabled=false;
+  }
+}
 </script></body></html>`;
 }
 
@@ -1945,12 +1965,15 @@ tabs.forEach(t => {
 // 倒计时 (下次 Cron: 每 6 小时整 UTC)
 function tickCountdown() {
   const now = new Date();
-  const u = now.getUTCHours();
-  const nh = Math.ceil((u + 0.001) / 6) * 6 % 24;
+  const totalMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const slot = Math.ceil((totalMinutes + 0.001) / 360) * 360 + 15;
   const next = new Date(Date.UTC(
-    now.getUTCFullYear(), now.getUTCMonth(),
-    now.getUTCDate() + (nh === 0 && u >= 18 ? 1 : 0),
-    nh, 0, 0
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    0,
+    slot,
+    0,
   ));
   const s = Math.max(0, Math.floor((next - now) / 1000));
   const h = String(Math.floor(s / 3600)).padStart(2, '0');

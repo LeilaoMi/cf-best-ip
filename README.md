@@ -198,6 +198,19 @@ cf-best-ip/
 
 MIT
 
+## 验证
+
+```bash
+node scripts/verify-worker.mjs
+```
+
+会检查：
+- `ipwho.is` HTTPS 替代
+- CSP 头
+- 管理登录不再依赖 URL token
+- Cron 偏移
+- 版本号
+
 ## 监控
 
 仓库包含 `.github/workflows/health-check.yml`，每 30 分钟请求 `https://bestip.leilaomi.cc.cd/health`，用于发现 Worker、Cron 或数据源异常。
