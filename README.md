@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-orange)](https://workers.cloudflare.com/)
-[![Version](https://img.shields.io/badge/version-3.8.2-blue)]()
+[![Version](https://img.shields.io/badge/version-3.8.3-blue)]()
 
 > 在 Cloudflare Worker 上跑的 **CF 自家 IP 优选服务**:聚合社区主流数据源,经官方 CIDR 校验,按运营商 / 全局展示,自动同步到自定义子域 A 记录。
 
@@ -105,6 +105,7 @@ wrangler deploy
 | `CF_API_TOKEN` | CF API Token（只给目标 Zone 的 DNS Edit 权限） | 在 [profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) 生成 |
 | `CF_ZONE_ID` | 你域名的 Zone ID | dashboard 域名概览页右下角 |
 | `SERVICE_HOSTNAME` | Worker 管理页 / API 入口，不参与优选 IP DNS 同步 | `bestip.example.com` |
+| `ROOT_DOMAIN` | 可选但推荐，显式限制 DNS 同步根域，防止配置错写到其它域 | `example.com` |
 | `AUTO_RECORD_NAME` | 默认推荐优选池，会同步成 A 记录 | `auto.example.com` |
 | `CF_RECORD_NAME` | 通用优选池，会同步成 A 记录 | `cf.example.com` |
 | `REFRESH_TOKEN` | 手动刷新 Bearer token | `openssl rand -hex 32` |
@@ -117,6 +118,7 @@ wrangler deploy
 | `CF_DNS_BY_CARRIER` | 设 `1` 启用三网分流（ct./cu./cm. 加上 auto./cf.） |
 | `DNS_TOP_N` | 每子域最多写多少条 A 记录，默认 10 |
 | `DNS_MAX_CHANGE_RATIO` | 每个域名单次最多替换比例，默认 0.3 |
+| `ALLOWED_HOSTS` | 可选，逗号分隔的页面/API 入口 host 白名单；`/health` 仍放行便于监控 |
 | `ALLOW_PUBLIC_REFRESH` | 设 `1` 才允许无 token 手动刷新；不推荐公开使用 |
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | Telegram 通知 |
 
@@ -135,7 +137,7 @@ wrangler deploy
 | `/health` | 轻量健康检查，返回 `status`、`reasons`、`lastErrorAt`、`criticalSourcesOk`，适合外部监控探活 |
 | `/api/diagnostics` | 诊断快照：节点数、三网分布、数据源健康、陈旧状态、DNS 同步、最近错误；需要 `ADMIN_TOKEN` |
 | `/api/config` | 运行时配置查看/修改/导入/导出（GET 默认脱敏；`raw=1`/`export=1` 支持导出，raw 需确认头；POST 可直接写 patch 或提交 `{config:{...}}` 导入），需 `Authorization: Bearer <ADMIN_TOKEN>` |
-| `/api/dns/current` | 当前托管子域的 DNS only A 记录 + 最近一次同步结果 |
+| `/api/dns/current` | 当前托管子域的 DNS only A 记录 + 最近一次同步结果；需要 `ADMIN_TOKEN` |
 | `/api/history?days=7` | 过去 N 天的快照 |
 | `/sub` | 订阅输出；公开缓存 300 秒降低重复抓取，支持 `format=plain/csv/jsonl` |
 | `/api/preferred-ips` | EDT 格式订阅（Karing 等客户端适用） |
@@ -185,6 +187,7 @@ curl -X POST \
 - **手动刷新保护**：`/api/refresh` 默认只接受 `POST + Bearer token`，并使用 `refresh:running` 运行锁阻止重复并发刷新。`ALLOW_PUBLIC_REFRESH=1` 仅建议临时调试；启用后首页和 `/api/stats` 会明确显示公开刷新风险。
 - **地理信息补全**：通过 ipwho.is（HTTPS，免费无 key）批量查询 IP 国家/城市/ASN，失败时自动回退到 ip-api.com；补全后会再次执行国家黑名单，未识别国家的 IP 不会被丢弃。
 - **DNS 同步历史**：`dns:lastSync` 记录最近一次同步结果，`dns:history:YYYY-MM-DD` 保留 7 天快照，方便 `/api/history` 追踪。
+- **域名边界保护**：推荐设置 `ROOT_DOMAIN`，所有托管 DNS 名称必须位于该根域下；可选 `ALLOWED_HOSTS` 限制页面/API 入口 host，降低误绑定域名风险。
 - **运行时配置管理**：`/api/config`（需 `Authorization: Bearer <ADMIN_TOKEN>`）支持 GET 查看、`export=1` 导出、POST 更新或导入运行时配置；GET 默认脱敏，`raw=1` 需要 `X-Config-Raw-Confirm: I_UNDERSTAND`，POST 会校验类型和范围，开启可用性/风险检测等危险项需要 `confirm: "I_UNDERSTAND"`。
 - **主题切换**：首页默认跟随系统 `prefers-color-scheme`，也可手动切换“深海 / 浅色 / 极光 / 琥珀”四种风格，选择会保存在浏览器本地。
 - **基础 CSP 安全头**：响应头包含 `content-security-policy`，限制 `default-src 'self'`、`script-src 'unsafe-inline'`、`img-src * data:`，防范 XSS。

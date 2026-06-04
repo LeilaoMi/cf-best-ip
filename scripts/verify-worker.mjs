@@ -23,6 +23,9 @@ const checks = [
   ['readme cf token least privilege', readme.includes('目标域名 Zone') && readme.includes('DNS Edit') && readme.includes('不要写进 `wrangler.toml`')],
   ['readme robots not access control', readme.includes('robots.txt') && readme.includes('不是访问控制')],
   ['readme dns only records', readme.includes('DNS only A 记录')],
+  ['root domain guard', source.includes('function getRootDomain') && source.includes('assertManagedDnsNamesAllowed') && readme.includes('ROOT_DOMAIN') && toml.includes('ROOT_DOMAIN')],
+  ['allowed hosts guard', source.includes('function requireAllowedHost') && source.includes('ALLOWED_HOSTS') && readme.includes('ALLOWED_HOSTS') && toml.includes('ALLOWED_HOSTS')],
+  ['dns current admin auth', source.includes('path === "/api/dns/current"') && source.includes('const authError = requireAdminAuth(request, env);') && readme.includes('/api/dns/current') && readme.includes('需要 `ADMIN_TOKEN`')],
   ['quality metadata', source.includes('function qualityForIp') && source.includes('testedBy=hostmonit') && source.includes('confidence')],
   ['post-geo country blocklist', source.includes('地理补全后再执行一次国家黑名单')],
   ['critical source health', source.includes('criticalSourcesOk') && source.includes('critical-source-failed')],
@@ -47,7 +50,7 @@ const checks = [
   ['readme security batch 1', readme.includes('refresh:running') && readme.includes('仅保存在当前 JS 内存') && readme.includes('导入运行时配置')],
   ['theme switcher', source.includes('data-theme-choice="system"') && source.includes('data-theme-choice="aurora"') && source.includes('cf-best-ip-theme')],
   ['readme theme switcher', readme.includes('深海 / 浅色 / 极光 / 琥珀')],
-  ['version 3.8.2', source.includes('const VERSION = "3.8.2"') && readme.includes('version-3.8.2-blue')],
+  ['version 3.8.3', source.includes('const VERSION = "3.8.3"') && readme.includes('version-3.8.3-blue')],
 ];
 for (const [name, ok] of checks) {
   if (!ok) throw new Error(`check failed: ${name}`);

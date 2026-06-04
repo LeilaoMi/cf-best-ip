@@ -1,6 +1,6 @@
 /**
  * ============================================================
- *  CF Best IP · Cloudflare 优选 IP Worker  (v3.8.2)
+ *  CF Best IP · Cloudflare 优选 IP Worker  (v3.8.3)
  *  https://github.com/LeilaoMi/cf-best-ip
  * ============================================================
  *
@@ -16,6 +16,8 @@
  *    CF_API_TOKEN              可选，同步 DNS 的 Cloudflare API Token (Zone:DNS:Edit)
  *    CF_ZONE_ID                可选，目标域名 Zone ID
  *    CF_RECORD_NAME            可选，主 A 记录名，例如 cf.example.com
+ *    ROOT_DOMAIN               可选，显式限制 DNS 同步根域，例如 example.com
+ *    ALLOWED_HOSTS             可选，逗号分隔的页面/API 入口 host 白名单
  *    CF_DNS_BY_CARRIER         可选，"1" 启用按运营商分别同步 (ct./cu./cm. 前缀)
  *    DNS_TOP_N                 可选，DNS 同步取前 N 个 IP，默认 10
  *    REFRESH_TOKEN             可选但强烈建议，手动刷新 /api/refresh 的 Bearer token
@@ -41,7 +43,7 @@ import { isCfNativeIp } from "./cidr.js";
 import { planDnsRecordSync } from "./dns.js";
 import { applyStabilityScores, countByCarrier, qualityGuard, sourceHealth } from "./scoring.js";
 
-const VERSION = "3.8.2";
+const VERSION = "3.8.3";
 
 const DEFAULT_CFG = {
   topN: 30,
@@ -272,6 +274,25 @@ function queryToken(request) {
 }
 function requestToken(request) {
   return bearerToken(request) || queryToken(request);
+}
+function getRequestHost(request) {
+  try { return normalizeHostname(new URL(request.url).host); }
+  catch { return ""; }
+}
+function getAllowedHosts(env) {
+  return String(env.ALLOWED_HOSTS || "")
+    .split(",")
+    .map(normalizeHostname)
+    .filter(Boolean);
+}
+function isAllowedHost(request, env) {
+  const allowed = getAllowedHosts(env);
+  if (!allowed.length) return true;
+  return allowed.includes(getRequestHost(request));
+}
+function requireAllowedHost(request, env) {
+  if (isAllowedHost(request, env)) return null;
+  return json({ ok: false, error: "host-not-allowed", host: getRequestHost(request) }, { status: 421 });
 }
 function adminToken(request) {
   return bearerToken(request);
@@ -1055,18 +1076,35 @@ async function listManagedARecords(env, names) {
 function getRootFromRecord(recordName) {
   return recordName && recordName.includes(".") ? recordName.split(".").slice(1).join(".") : "";
 }
+function normalizeHostname(name) {
+  return String(name || "").trim().toLowerCase().replace(/\.$/, "");
+}
+function getRootDomain(env) {
+  return normalizeHostname(env.ROOT_DOMAIN) || normalizeHostname(getRootFromRecord(env.CF_RECORD_NAME));
+}
+function isHostnameUnderRoot(name, root) {
+  name = normalizeHostname(name);
+  root = normalizeHostname(root);
+  return Boolean(name && root && (name === root || name.endsWith(`.${root}`)));
+}
+function assertManagedDnsNamesAllowed(env, names) {
+  const root = getRootDomain(env);
+  if (!root) throw new Error("ROOT_DOMAIN or CF_RECORD_NAME is required for DNS sync");
+  const invalid = (names || []).filter(name => !isHostnameUnderRoot(name, root));
+  if (invalid.length) throw new Error(`managed DNS name outside ROOT_DOMAIN ${root}: ${invalid.join(",")}`);
+}
 function getServiceHostname(env) {
-  const root = getRootFromRecord(env.CF_RECORD_NAME);
-  return env.SERVICE_HOSTNAME || (root ? `bestip.${root}` : "");
+  const root = getRootDomain(env);
+  return normalizeHostname(env.SERVICE_HOSTNAME) || (root ? `bestip.${root}` : "");
 }
 function getAutoRecordName(env) {
-  const root = getRootFromRecord(env.CF_RECORD_NAME);
-  return env.AUTO_RECORD_NAME || (root ? `auto.${root}` : "");
+  const root = getRootDomain(env);
+  return normalizeHostname(env.AUTO_RECORD_NAME) || (root ? `auto.${root}` : "");
 }
 function getManagedDnsNames(env) {
-  const root = getRootFromRecord(env.CF_RECORD_NAME);
+  const root = getRootDomain(env);
   const names = [];
-  const add = (name) => { if (name && !names.includes(name)) names.push(name); };
+  const add = (name) => { name = normalizeHostname(name); if (name && !names.includes(name)) names.push(name); };
   add(getAutoRecordName(env));
   add(env.CF_RECORD_NAME);
   if (env.CF_DNS_BY_CARRIER === "1" && root) {
@@ -1074,6 +1112,7 @@ function getManagedDnsNames(env) {
     add(`cu.${root}`);
     add(`cm.${root}`);
   }
+  assertManagedDnsNamesAllowed(env, names);
   return names;
 }
 
@@ -1135,7 +1174,7 @@ async function syncAllDns(env, alive) {
     if (cfg.dnsRiskFilterEnabled) {
       pool = await applyRiskFilter(pool, cfg, Math.max(60, topN * 4));
     }
-    const root = getRootFromRecord(env.CF_RECORD_NAME);
+    const root = getRootDomain(env);
     const managedNames = getManagedDnsNames(env);
     const byName = await listManagedARecords(env, managedNames);
 
@@ -1362,10 +1401,10 @@ async function handle(request, env, ctx) {
   const requesterColo = request.cf?.colo;
   const visitor = getVisitor(request);
   if (env.CF_RECORD_NAME && env.CF_RECORD_NAME.includes(".")) {
-    visitor.root = getRootFromRecord(env.CF_RECORD_NAME);
+    visitor.root = getRootDomain(env);
     visitor.serviceHostname = getServiceHostname(env);
     visitor.autoRecordName = getAutoRecordName(env);
-    visitor.cfRecordName = env.CF_RECORD_NAME;
+    visitor.cfRecordName = normalizeHostname(env.CF_RECORD_NAME);
   }
 
   if (request.method === "OPTIONS") {
@@ -1374,6 +1413,11 @@ async function handle(request, env, ctx) {
 
   if (path === "/robots.txt") {
     return text("User-agent: *\nAllow: /$\nDisallow: /admin\nDisallow: /api/\nDisallow: /sub\nDisallow: /ips.txt\n");
+  }
+
+  if (path !== "/health") {
+    const hostError = requireAllowedHost(request, env);
+    if (hostError) return hostError;
   }
 
   if (path === "/health") {
@@ -1545,6 +1589,8 @@ async function handle(request, env, ctx) {
   }
 
   if (path === "/api/dns/current") {
+    const authError = requireAdminAuth(request, env);
+    if (authError) return authError;
     if (!env.CF_API_TOKEN || !env.CF_ZONE_ID || !env.CF_RECORD_NAME) {
       return json({ ok: false, error: "DNS sync not configured" });
     }

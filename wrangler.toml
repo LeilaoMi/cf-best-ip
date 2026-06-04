@@ -20,6 +20,8 @@ crons = ["15 */6 * * *"]
 [vars]
 CF_ZONE_ID        = "9aaafd1409adada280a4a6138cad50e4"
 SERVICE_HOSTNAME  = "bestip.leilaomi.cc.cd" # Worker 管理页 / API 入口，不参与优选 IP DNS 同步
+ROOT_DOMAIN       = "leilaomi.cc.cd"        # 显式限制 DNS 同步根域，避免误写到其它 zone
+ALLOWED_HOSTS     = "bestip.leilaomi.cc.cd" # 页面/API 入口 host 白名单；/health 仍允许监控访问
 AUTO_RECORD_NAME  = "auto.leilaomi.cc.cd"   # 默认推荐优选池
 CF_RECORD_NAME    = "cf.leilaomi.cc.cd"     # 通用优选池
 CF_DNS_BY_CARRIER = "1"   # "1" = 按运营商分子域同步 (ct./cu./cm.)
