@@ -45,7 +45,9 @@ const checks = [
   ['admin tokens memory only', !source.includes('sessionStorage') && source.includes('__cfBestIpAdminToken') && source.includes('let refreshToken')],
   ['config import export', source.includes('params.get("export") === "1"') && source.includes('format: "cf-best-ip-config-v1"') && source.includes('imported: Boolean')],
   ['readme security batch 1', readme.includes('refresh:running') && readme.includes('仅保存在当前 JS 内存') && readme.includes('导入运行时配置')],
-  ['version 3.8.1', source.includes('const VERSION = "3.8.1"') && readme.includes('version-3.8.1-blue')],
+  ['theme switcher', source.includes('data-theme-choice="system"') && source.includes('data-theme-choice="aurora"') && source.includes('cf-best-ip-theme')],
+  ['readme theme switcher', readme.includes('深海 / 浅色 / 极光 / 琥珀')],
+  ['version 3.8.2', source.includes('const VERSION = "3.8.2"') && readme.includes('version-3.8.2-blue')],
 ];
 for (const [name, ok] of checks) {
   if (!ok) throw new Error(`check failed: ${name}`);

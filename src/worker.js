@@ -1,6 +1,6 @@
 /**
  * ============================================================
- *  CF Best IP · Cloudflare 优选 IP Worker  (v3.8.0)
+ *  CF Best IP · Cloudflare 优选 IP Worker  (v3.8.2)
  *  https://github.com/LeilaoMi/cf-best-ip
  * ============================================================
  *
@@ -41,7 +41,7 @@ import { isCfNativeIp } from "./cidr.js";
 import { planDnsRecordSync } from "./dns.js";
 import { applyStabilityScores, countByCarrier, qualityGuard, sourceHealth } from "./scoring.js";
 
-const VERSION = "3.8.1";
+const VERSION = "3.8.2";
 
 const DEFAULT_CFG = {
   topN: 30,
@@ -1766,6 +1766,18 @@ function renderHome(data, visitor) {
     --ct:#28a745; --cu:#6f42c1; --cm:#007bff; --cf:#fd7e14; --pr:#ffc107;
     --hero:#eef2f6; --hero-edge:#ffffff; --hero-fg:#1f2328; --hero-mut:#57606a; }
 }
+html[data-theme="dark"] { --bg:#0a0d12; --card:#11161d; --bd:#1f2630; --fg:#e6edf3; --mut:#8b949e;
+  --ct:#3fb950; --cu:#a371f7; --cm:#388bfd; --cf:#f9826c; --pr:#d29922;
+  --hero:#000; --hero-edge:#0a0d12; --hero-fg:#ffffff; --hero-mut:#9aa4af; }
+html[data-theme="light"] { --bg:#ffffff; --card:#f6f8fa; --bd:#eaeef2; --fg:#24292e; --mut:#586069;
+  --ct:#28a745; --cu:#6f42c1; --cm:#007bff; --cf:#fd7e14; --pr:#ffc107;
+  --hero:#eef2f6; --hero-edge:#ffffff; --hero-fg:#1f2328; --hero-mut:#57606a; }
+html[data-theme="aurora"] { --bg:#07111f; --card:#0e1b2d; --bd:#1d3a55; --fg:#ecfeff; --mut:#9fb7c8;
+  --ct:#2dd4bf; --cu:#c084fc; --cm:#38bdf8; --cf:#fb7185; --pr:#facc15;
+  --hero:#05101f; --hero-edge:#0b2434; --hero-fg:#ecfeff; --hero-mut:#a5f3fc; }
+html[data-theme="amber"] { --bg:#140f08; --card:#21180d; --bd:#3b2a16; --fg:#fff7ed; --mut:#c9ab82;
+  --ct:#84cc16; --cu:#d946ef; --cm:#38bdf8; --cf:#f97316; --pr:#f59e0b;
+  --hero:#090603; --hero-edge:#21180d; --hero-fg:#fff7ed; --hero-mut:#fed7aa; }
 *{box-sizing:border-box}
 body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0}
 .hero{padding:36px 16px;background:linear-gradient(180deg,var(--hero) 0%,var(--hero-edge) 100%);text-align:center;border-bottom:1px solid var(--bd)}
@@ -1773,6 +1785,9 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
 .hero .sub{color:var(--hero-mut);font-size:13px;margin-bottom:18px;line-height:1.7;padding:0 8px}
 .hero-stats{display:flex;flex-wrap:wrap;gap:8px 24px;justify-content:center;font-size:12px;color:var(--hero-mut)}
 .hero-stats b{color:var(--hero-fg);font-size:16px;font-weight:600;margin-left:4px}
+.theme-switch{display:flex;flex-wrap:wrap;justify-content:center;gap:7px;margin-top:18px}
+.themebtn{border:1px solid color-mix(in srgb,var(--hero-fg) 22%,transparent);background:color-mix(in srgb,var(--hero-fg) 8%,transparent);color:var(--hero-fg);border-radius:999px;padding:6px 10px;font-size:12px;cursor:pointer}
+.themebtn:hover,.themebtn.active{background:#1f6feb;border-color:#1f6feb;color:#fff}
 .wrap{max-width:1100px;margin:0 auto;padding:16px}
 .recommend{margin:0 0 16px;padding:16px;background:linear-gradient(135deg,rgba(31,111,235,.18),rgba(63,185,80,.10));border:1px solid #2f6feb;border-radius:14px;display:grid;gap:14px;grid-template-columns:minmax(0,1.3fr) minmax(220px,.7fr)}
 .rec-kicker{font-size:12px;color:#9fb7ff;margin-bottom:6px}
@@ -1881,6 +1896,13 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
   ${stale.stale ? `<div style="margin-top:12px;color:#f85149;font-size:13px">⚠️ 数据已超过 ${stale.maxAgeHours} 小时未刷新，请到 /admin 检查刷新状态</div>` : ""}
   ${health.criticalSourcesOk ? "" : `<div style="margin-top:12px;color:#d29922;font-size:13px">⚠️ 核心测速源异常，当前结果处于 degraded 状态</div>`}
   ${publicRefreshEnabled ? `<div class="public-refresh-warning" style="margin-top:12px;color:#f85149;font-size:13px">⚠️ 当前启用了公开刷新 ALLOW_PUBLIC_REFRESH=1，仅建议临时调试，线上不推荐。</div>` : ""}
+  <div class="theme-switch" aria-label="页面主题">
+    <button class="themebtn active" data-theme-choice="system" type="button">跟随系统</button>
+    <button class="themebtn" data-theme-choice="dark" type="button">深海</button>
+    <button class="themebtn" data-theme-choice="light" type="button">浅色</button>
+    <button class="themebtn" data-theme-choice="aurora" type="button">极光</button>
+    <button class="themebtn" data-theme-choice="amber" type="button">琥珀</button>
+  </div>
 </div>
 
 <div class="wrap">
@@ -1984,6 +2006,17 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
 <script>
 const tabs = document.querySelectorAll('.tab');
 const panes = document.querySelectorAll('.pane');
+const themeButtons = document.querySelectorAll('.themebtn');
+const themeKey = 'cf-best-ip-theme';
+function applyTheme(theme) {
+  const next = ['dark','light','aurora','amber'].includes(theme) ? theme : 'system';
+  if (next === 'system') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.dataset.theme = next;
+  themeButtons.forEach(btn => btn.classList.toggle('active', btn.dataset.themeChoice === next));
+  try { localStorage.setItem(themeKey, next); } catch {}
+}
+try { applyTheme(localStorage.getItem(themeKey) || 'system'); } catch { applyTheme('system'); }
+themeButtons.forEach(btn => btn.onclick = () => applyTheme(btn.dataset.themeChoice));
 tabs.forEach(t => t.onclick = () => {
   tabs.forEach(x => x.classList.remove('active'));
   t.classList.add('active');

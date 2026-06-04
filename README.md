@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-orange)](https://workers.cloudflare.com/)
-[![Version](https://img.shields.io/badge/version-3.8.1-blue)]()
+[![Version](https://img.shields.io/badge/version-3.8.2-blue)]()
 
 > 在 Cloudflare Worker 上跑的 **CF 自家 IP 优选服务**:聚合社区主流数据源,经官方 CIDR 校验,按运营商 / 全局展示,自动同步到自定义子域 A 记录。
 
@@ -186,7 +186,7 @@ curl -X POST \
 - **地理信息补全**：通过 ipwho.is（HTTPS，免费无 key）批量查询 IP 国家/城市/ASN，失败时自动回退到 ip-api.com；补全后会再次执行国家黑名单，未识别国家的 IP 不会被丢弃。
 - **DNS 同步历史**：`dns:lastSync` 记录最近一次同步结果，`dns:history:YYYY-MM-DD` 保留 7 天快照，方便 `/api/history` 追踪。
 - **运行时配置管理**：`/api/config`（需 `Authorization: Bearer <ADMIN_TOKEN>`）支持 GET 查看、`export=1` 导出、POST 更新或导入运行时配置；GET 默认脱敏，`raw=1` 需要 `X-Config-Raw-Confirm: I_UNDERSTAND`，POST 会校验类型和范围，开启可用性/风险检测等危险项需要 `confirm: "I_UNDERSTAND"`。
-- **自适应深色/浅色主题**：首页自动跟随系统 `prefers-color-scheme`，暗色模式为默认，亮色模式自动切换配色。
+- **主题切换**：首页默认跟随系统 `prefers-color-scheme`，也可手动切换“深海 / 浅色 / 极光 / 琥珀”四种风格，选择会保存在浏览器本地。
 - **基础 CSP 安全头**：响应头包含 `content-security-policy`，限制 `default-src 'self'`、`script-src 'unsafe-inline'`、`img-src * data:`，防范 XSS。
 - **源去重标记**：部分数据源（如 `CMLiussss/*` 与 `addressesapi/*`）属于同一上游但子域不同，`aliasOf/signal` 字段用于统计独立信号；`hostmonit` 标记为核心源，失败时 `/health` 会进入 degraded。
 
