@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-orange)](https://workers.cloudflare.com/)
-[![Version](https://img.shields.io/badge/version-3.6.0-blue)]()
+[![Version](https://img.shields.io/badge/version-3.8.0-blue)]()
 
 > 在 Cloudflare Worker 上跑的 **CF 自家 IP 优选服务**:聚合社区主流数据源,经官方 CIDR 校验,按运营商 / 全局展示,自动同步到自定义子域 A 记录。
 
@@ -24,10 +24,10 @@ Cloudflare 在 [2024 年 12 月声明](https://www.landiannews.com/archives/1070
 |---|---|
 | **聚合** | 每 6 小时 Cron 从 18 个社区源拉取候选 IP |
 | **校验** | 用 Cloudflare 官方 [`ips-v4`](https://www.cloudflare.com/ips-v4) 的 15 个 CIDR 段做位运算判定,**非 AS13335 段全部丢弃** |
-| **测速** | 主数据源 `hostmonit` 在国内三大运营商 VPS 实测延迟+丢包+速度,直接复用 |
+| **测速可信度** | 明确区分 `hostmonit` 来源实测与普通来源推荐；普通来源不冒充 Worker 实测 |
 | **展示** | 在 `bestip.<你的域名>` 显示产品化首页，`/admin` 提供管理控制台 |
-| **同步** | 自动写入优选池 A 记录:`auto.` `cf.` `ct.` `cu.` `cm.`，并验证公共 DNS 是否生效 |
-| **通知** | Telegram(可选)|
+| **同步** | 自动写入优选池 A 记录:`auto.` `cf.` `ct.` `cu.` `cm.`；按托管域名查询 DNS，减少大 Zone API 压力 |
+| **通知** | Telegram(可选)，失败会记录到 `notify:lastError` |
 
 ---
 
@@ -94,7 +94,7 @@ wrangler deploy
 2. Cloudflare Dashboard → Workers & Pages → 创建 Worker → 连接到 Git → 选你 fork 的仓库
 3. 绑定 KV namespace，变量名必须叫 `KV`
 4. 添加下方变量 / secret
-5. 在 Worker → Settings → Triggers → Cron `0 */6 * * *`
+5. 在 Worker → Settings → Triggers → Cron `15 */6 * * *`
 6. main 分支 push 后自动部署
 
 ### 必填环境变量
@@ -130,14 +130,14 @@ wrangler deploy
 |---|---|
 | `/` | 公开 IP 展示页（uouin 风格） |
 | `POST /api/refresh` | 触发一次重新抓取（60s 冷却），需要 `Authorization: Bearer <REFRESH_TOKEN>`，除非显式设置 `ALLOW_PUBLIC_REFRESH=1` |
-| `/api/ips` | JSON 全量列表，支持 `?carrier=CT/CU/CM&top=N` |
-| `/api/stats` | 池子统计 + 最近一次 DNS 同步结果 |
-| `/health` | 轻量健康检查，适合外部监控探活 |
+| `/api/ips` | JSON 全量列表，支持 `?carrier=CT/CU/CM&top=N`，每条带 `quality.testedBy/confidence` |
+| `/api/stats` | 池子统计 + 最近一次 DNS 同步结果 + `publicRefreshEnabled` / `notifyLastError` |
+| `/health` | 轻量健康检查，返回 `status`、`reasons`、`lastErrorAt`、`criticalSourcesOk`，适合外部监控探活 |
 | `/api/diagnostics` | 诊断快照：节点数、三网分布、数据源健康、陈旧状态、DNS 同步、最近错误；需要 `ADMIN_TOKEN` |
-| `/api/config` | 运行时配置查看/修改（GET 读取 / POST 写入），需 `ADMIN_TOKEN` |
+| `/api/config` | 运行时配置查看/修改（GET 默认脱敏 / `raw=1` 需确认头 / POST 写入需类型校验），需 `Authorization: Bearer <ADMIN_TOKEN>` |
 | `/api/dns/current` | 当前 4 子域的 DNS 记录 + 最近一次同步结果 |
 | `/api/history?days=7` | 过去 N 天的快照 |
-| `/sub` | 纯文本订阅：`IP:port` 一行一条，可作 DDNS 用 |
+| `/sub` | 纯文本订阅：`IP:port` 一行一条，可作 DDNS 用；公开缓存 300 秒降低重复抓取 |
 | `/api/preferred-ips` | EDT 格式订阅（Karing 等客户端适用） |
 
 手动刷新示例：
@@ -155,27 +155,27 @@ curl -X POST \
 - **CIDR 判定**:`isCfNativeIp()` 把 CF 官方 15 个 CIDR 段预转成 `(network, mask)` 元组,每个 IP 做 1 次位与即判定,O(15) 常数时间。
 - **去重 key**:`(ip, port, carrier)` —— 同一 IP 在三网下可作 3 条独立记录(hostmonit 同 IP 同时为 CT 和 CM 最优时不会丢失数据)。
 - **稳定分排序**：优先保留上一批出现过的 IP，并综合 tested、来源数、延迟、丢包、速度排序，减少 DNS 大换血。
-- **质量下降保护**：如果本次总池或三网池明显缩水，保留上一批稳定结果并跳过 DNS 同步，避免错误数据污染线上域名。
+- **质量下降保护**：如果本次总池、三网池、真实测速池明显缩水，或核心测速源异常导致线路池减少，保留上一批稳定结果并跳过 DNS 同步，避免错误数据污染线上域名。
 - **diff-based DNS sync**：已存在且仍在 wanted 中的记录**不动**，只删托管白名单记录中多余的 A 记录、创建缺失记录，并把最近一次同步结果写入 KV 的 `dns:lastSync`，方便 `/api/stats` 和 `/api/dns/current` 排查。
-- **DNS 生效验证**：同步后通过 Cloudflare / Google DoH 检查 `auto/cf/ct/cu/cm` 是否已解析到期望 IP，结果显示在首页、`/admin` 和 `/api/stats`。
+- **DNS 生效验证**：同步后通过 Cloudflare / Google DoH 检查 `auto/cf/ct/cu/cm` 是否已解析到期望 IP，结果显示在首页、`/admin` 和 `/api/stats`；`dns:lastSync.cfApiRequests` 会记录本次 DNS 查询/写入大致 API 请求量。
 - **变更阈值控制**：默认每个域名单次最多替换约 30% 记录，优先保留当前仍可用 A 记录，降低客户端连接波动。
 - **管理控制台**：`/admin` 需要 `ADMIN_TOKEN`，可查看 DNS 同步详情、最近错误、7 天趋势、稳定分 Top 20、数据源健康，并支持手动刷新。
 - **陈旧数据告警**：超过 8 小时未刷新时，首页、`/admin`、`/health`、`/api/diagnostics` 会明确提示。
 - **安全与缓存头**：HTML/API 响应默认 no-store，并带基础安全响应头；`/robots.txt` 避免索引 admin/API。
-- **Worker 平台限制**：Cloudflare Workers 禁止从 Worker 出口连接 CF 自家 IP（`connect()` 会失败），所以**本项目不在 Worker 内做 TCP 测速**，完全依赖 hostmonit 等后端测速数据。
-- **手动刷新保护**：`/api/refresh` 默认只接受 `POST + Bearer token`，避免公开端点被滥用去烧第三方源或 Cloudflare DNS API 配额。
-- **地理信息补全**：通过 ipwho.is（HTTPS，免费无 key）批量查询 IP 国家/城市/ASN，失败时自动回退到 ip-api.com；未识别国家的 IP 不会被丢弃。
+- **Worker 平台限制**：Cloudflare Workers 禁止从 Worker 出口连接 CF 自家 IP（`connect()` 会失败），所以**本项目不在 Worker 内做 TCP 测速**。`hostmonit 实测` 才代表来源带延迟/丢包/速度；`来源推荐未测` 只代表通过 CF CIDR、地理与稳定分过滤。页面客户端测速只自动测当前线路前 10 个，移动端降低并发，页面隐藏时暂停。
+- **手动刷新保护**：`/api/refresh` 默认只接受 `POST + Bearer token`。`ALLOW_PUBLIC_REFRESH=1` 仅建议临时调试；启用后首页和 `/api/stats` 会明确显示公开刷新风险。
+- **地理信息补全**：通过 ipwho.is（HTTPS，免费无 key）批量查询 IP 国家/城市/ASN，失败时自动回退到 ip-api.com；补全后会再次执行国家黑名单，未识别国家的 IP 不会被丢弃。
 - **DNS 同步历史**：`dns:lastSync` 记录最近一次同步结果，`dns:history:YYYY-MM-DD` 保留 7 天快照，方便 `/api/history` 追踪。
-- **运行时配置管理**：`/api/config`（需 `ADMIN_TOKEN`）支持 GET 查看、POST 更新运行时配置（国家黑名单、DNS 黑名单、可用性检测开关等），无需重新部署。
+- **运行时配置管理**：`/api/config`（需 `Authorization: Bearer <ADMIN_TOKEN>`）支持 GET 查看、POST 更新运行时配置；GET 默认脱敏，`raw=1` 需要 `X-Config-Raw-Confirm: I_UNDERSTAND`，POST 会校验类型和范围，开启可用性/风险检测等危险项需要 `confirm: "I_UNDERSTAND"`。
 - **自适应深色/浅色主题**：首页自动跟随系统 `prefers-color-scheme`，暗色模式为默认，亮色模式自动切换配色。
 - **基础 CSP 安全头**：响应头包含 `content-security-policy`，限制 `default-src 'self'`、`script-src 'unsafe-inline'`、`img-src * data:`，防范 XSS。
-- **源去重标记**：部分数据源（如 `CMLiussss/*` 与 `addressesapi/*`）属于同一上游但子域不同，`aliasOf` 字段标记关联关系，前端可据此合并展示。
+- **源去重标记**：部分数据源（如 `CMLiussss/*` 与 `addressesapi/*`）属于同一上游但子域不同，`aliasOf/signal` 字段用于统计独立信号；`hostmonit` 标记为核心源，失败时 `/health` 会进入 degraded。
 
 ---
 
 ## 运维建议
 
-- 正常运行靠 Cron 自动刷新；公开页面上的手动刷新只给持有 `REFRESH_TOKEN` 的管理员使用。
+- 正常运行靠 Cron 自动刷新；公开页面上的手动刷新只给持有 `REFRESH_TOKEN` 的管理员使用。管理接口只接受 `Authorization: Bearer ...`，不要把 token 放进 URL 查询参数。
 - 如果某个子域 A 记录少于 `DNS_TOP_N`，先看 `/api/dns/current` 的 `lastSync`：没有错误通常代表该运营商候选不足或被 DNS 黑名单过滤。
 - 本项目只同步 `auto.`、`cf.`、`ct.`、`cu.`、`cm.` 这组托管白名单记录，不再自动清理 `proxy.`、`proxyip.`、`pNN.` 等可能被其他服务使用的历史记录。
 - 如果某次刷新没有拿到可用 IP，或候选池相比上一批明显变差，Worker 会保留上一批稳定结果，跳过 DNS 同步，避免把可用域名清空或污染。
@@ -186,7 +186,10 @@ curl -X POST \
 
 ```
 cf-best-ip/
-├── src/worker.js   # 整个项目的全部代码 (~1580 行,单文件 Worker)
+├── src/worker.js   # Worker 入口（模块化，约 2K 行）
+├── src/cidr.js     # Cloudflare CIDR 判断纯逻辑
+├── src/scoring.js  # 节点质量保护与评分纯逻辑
+├── src/dns.js      # DNS diff 计划纯逻辑
 ├── wrangler.toml   # Cloudflare Workers 配置
 ├── README.md
 └── LICENSE         # MIT
@@ -201,15 +204,24 @@ MIT
 ## 验证
 
 ```bash
+node --test
 node scripts/verify-worker.mjs
 ```
 
 会检查：
 - `ipwho.is` HTTPS 替代
 - CSP 头
-- 管理登录不再依赖 URL token
+- 管理接口不再接受 URL token
 - Cron 偏移
+- README 关键说明与代码一致
+- 500 响应不暴露 stack
+- `/health` 包含 `status/reasons`
 - 版本号
+
+## 📖 延伸阅读
+
+- [docs/product-domain-plan.md](docs/product-domain-plan.md) — 产品域名架构规划
+- [docs/audit-2026-06-04.md](docs/audit-2026-06-04.md) — 改进建议审计（v3.6.0，58 条）
 
 ## 监控
 

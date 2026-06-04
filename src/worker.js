@@ -1,6 +1,6 @@
 /**
  * ============================================================
- *  CF Best IP · Cloudflare 优选 IP Worker  (v3.5.2)
+ *  CF Best IP · Cloudflare 优选 IP Worker  (v3.8.0)
  *  https://github.com/LeilaoMi/cf-best-ip
  * ============================================================
  *
@@ -37,108 +37,11 @@
 // ============================================================
 // 1. 常量 / 数据源 / 字典
 // ============================================================
-const VERSION = "3.6.0";
+import { isCfNativeIp } from "./cidr.js";
+import { planDnsRecordSync } from "./dns.js";
+import { applyStabilityScores, countByCarrier, qualityGuard, sourceHealth } from "./scoring.js";
 
-// ===== v2.3: Cloudflare 公开 IPv4 anycast CIDR (官方 ips-v4) =====
-// 用 IP 段精确判定 cf-native vs cf-proxy,不再依赖 source 元数据
-// 来源: https://www.cloudflare.com/ips-v4
-const CF_IPV4_CIDRS = [
-  "173.245.48.0/20",
-  "103.21.244.0/22",
-  "103.22.200.0/22",
-  "103.31.4.0/22",
-  "141.101.64.0/18",
-  "108.162.192.0/18",
-  "190.93.240.0/20",
-  "188.114.96.0/20",
-  "197.234.240.0/22",
-  "198.41.128.0/17",
-  "162.158.0.0/15",
-  "104.16.0.0/13",
-  "104.24.0.0/14",
-  "172.64.0.0/13",
-  "131.0.72.0/22",
-];
-
-// 预编译为 [network, mask] 整数对，方便 O(1) 段查
-const CF_RANGES = CF_IPV4_CIDRS.map(c => {
-  const [base, bits] = c.split("/");
-  const m = base.split(".").map(Number);
-  const baseInt = ((m[0] << 24) | (m[1] << 16) | (m[2] << 8) | m[3]) >>> 0;
-  const bitsN = +bits;
-  const mask = bitsN === 0 ? 0 : (0xffffffff << (32 - bitsN)) >>> 0;
-  return [baseInt & mask, mask];
-});
-
-function ipToInt(ip) {
-  const m = String(ip).split(".");
-  if (m.length !== 4) return null;
-  let v = 0;
-  for (let i = 0; i < 4; i++) {
-    const n = +m[i];
-    if (!Number.isInteger(n) || n < 0 || n > 255) return null;
-    v = ((v << 8) | n) >>> 0;
-  }
-  return v;
-}
-
-function isCfNativeIp(ip) {
-  if (ip == null) return false;
-  if (typeof ip === "string" && ip.includes(":")) return isCfNativeIpV6(ip);
-  const v = ipToInt(ip);
-  if (v == null) return false;
-  for (const [net, mask] of CF_RANGES) {
-    if ((v & mask) === net) return true;
-  }
-  return false;
-}
-
-// ===== Cloudflare IPv6 CIDR (官方 ips-v6) =====
-const CF_IPV6_CIDRS = [
-  "2606:4700::/32",
-  "2803:f800::/32",
-  "2405:b500::/32",
-  "2405:8100::/32",
-  "2a06:98c0::/29",
-  "2c0f:f248::/32",
-];
-
-function ipv6ToBigInt(ip) {
-  const parts = ip.split(":");
-  let full = [];
-  if (parts.includes("")) {
-    const idx = parts.indexOf("");
-    const before = parts.slice(0, idx).filter(p => p !== "");
-    const after = parts.slice(idx + 1).filter(p => p !== "");
-    const zeros = 8 - before.length - after.length;
-    full = [...before, ...Array(zeros).fill("0"), ...after];
-  } else {
-    full = parts;
-  }
-  let v = 0n;
-  for (const p of full) {
-    v = (v << 16n) | BigInt(parseInt(p || "0", 16));
-  }
-  return v;
-}
-
-const CF_RANGES_V6 = CF_IPV6_CIDRS.map(c => {
-  const [addr, bits] = c.split("/");
-  const net = ipv6ToBigInt(addr);
-  const bitsN = BigInt(+bits);
-  const mask = bitsN === 0n ? 0n : (0xffffffffffffffffffffffffffffffffn << (128n - bitsN));
-  return [net & mask, mask];
-});
-
-function isCfNativeIpV6(ip) {
-  try {
-    const v = ipv6ToBigInt(ip);
-    for (const [net, mask] of CF_RANGES_V6) {
-      if ((v & mask) === net) return true;
-    }
-  } catch {}
-  return false;
-}
+const VERSION = "3.8.0";
 
 const DEFAULT_CFG = {
   topN: 30,
@@ -172,6 +75,7 @@ const SOURCES = [
     method: "POST",
     body: { key: "o1zrmHAF" },
     category: "cf-native",
+    critical: true,
   },
   // ===== v2.6 社区高星 CF native 源(纯 CF 段,大幅提升 cf-native 数量) =====
   { name: "joname1/BestCFip",           url: "https://raw.githubusercontent.com/joname1/BestCFip/main/ipv4.txt", type: "text", category: "cf-native" },
@@ -225,6 +129,28 @@ const COUNTRY_FLAGS = {
 
 const CARRIER_LABEL = { CT: "电信", CU: "联通", CM: "移动", CMCC: "移动", CF: "通用", DEF: "通用" };
 
+function sourceMeta(name) {
+  return SOURCES.find(x => x.name === name) || null;
+}
+function sourceSignalName(src) {
+  return src?.aliasOf || src?.name || "unknown";
+}
+function qualityForIp(x) {
+  if (x.tested) return { testedBy: "hostmonit", confidence: "high" };
+  const sources = x.sources || [];
+  if (sources.length >= 2) return { testedBy: "source", confidence: "medium" };
+  return { testedBy: "source", confidence: "low" };
+}
+function withQuality(x) {
+  return { ...x, quality: x.quality || qualityForIp(x) };
+}
+function testedCount(ips = []) {
+  return ips.filter(x => x.tested || x.quality?.testedBy === "hostmonit").length;
+}
+function criticalSourceFailed(sourceStats = []) {
+  return sourceStats.some(x => x.critical && (x.error || !x.count));
+}
+
 // 中国大陆三大运营商 ASN（用于按访问者 IP 猜运营商）
 const CN_ASN_TO_CARRIER = {
   4134: "CT", 4812: "CT", 4847: "CT", 17621: "CT", 17623: "CT",
@@ -266,6 +192,7 @@ const SECURITY_HEADERS = {
   "content-security-policy": "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src * data:; connect-src 'self'",
 };
 const NO_STORE_HEADERS = { "cache-control": "no-store, max-age=0" };
+const SUB_CACHE_HEADERS = { "cache-control": "public, max-age=300" };
 function responseHeaders(extra = {}) {
   return { ...SECURITY_HEADERS, ...NO_STORE_HEADERS, ...extra };
 }
@@ -346,9 +273,12 @@ function queryToken(request) {
 function requestToken(request) {
   return bearerToken(request) || queryToken(request);
 }
+function adminToken(request) {
+  return bearerToken(request);
+}
 function isAdminAuthorized(request, env) {
   if (!env.ADMIN_TOKEN) return false;
-  return constantTimeEqual(requestToken(request), env.ADMIN_TOKEN);
+  return constantTimeEqual(adminToken(request), env.ADMIN_TOKEN);
 }
 function requireAdminAuth(request, env) {
   if (isAdminAuthorized(request, env)) return null;
@@ -613,6 +543,85 @@ async function getConfig(env) {
   const saved = await kvGet(env, "config", {});
   return { ...DEFAULT_CFG, ...saved };
 }
+
+const CONFIG_SCHEMA = {
+  topN: { type: "int", min: 1, max: 200 },
+  probeConcurrency: { type: "int", min: 1, max: 30 },
+  countryBlocklist: { type: "countryArray" },
+  availabilityCheckEnabled: { type: "bool", dangerousEnable: true },
+  availabilityCheckApi: { type: "url" },
+  availabilityCheckTimeoutMs: { type: "int", min: 1000, max: 15000 },
+  availabilityCheckConcurrency: { type: "int", min: 1, max: 30 },
+  dnsBlocklistEnabled: { type: "bool" },
+  dnsBlocklist: { type: "countryArray" },
+  dnsRiskFilterEnabled: { type: "bool", dangerousEnable: true },
+  dnsRiskMaxLevel: { type: "enum", values: RISK_LEVELS },
+  riskCheckApi: { type: "url" },
+  riskCheckTimeoutMs: { type: "int", min: 1000, max: 15000 },
+  perCountryMode: { type: "bool" },
+  perCountryTopN: { type: "int", min: 1, max: 20 },
+};
+
+const SENSITIVE_CONFIG_KEYS = new Set(["availabilityCheckApi", "riskCheckApi"]);
+
+function parseBoolConfig(value, key) {
+  if (typeof value === "boolean") return value;
+  if (value === "1") return true;
+  if (value === "0") return false;
+  throw new Error(`${key} must be boolean or "1"/"0"`);
+}
+function parseIntConfig(value, key, rule) {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(n) || n < rule.min || n > rule.max) {
+    throw new Error(`${key} must be an integer between ${rule.min} and ${rule.max}`);
+  }
+  return n;
+}
+function parseCountryArrayConfig(value, key) {
+  if (!Array.isArray(value)) throw new Error(`${key} must be an array`);
+  return value.map(x => {
+    const code = String(x || "").trim().toUpperCase();
+    if (!/^[A-Z]{2}$/.test(code)) throw new Error(`${key} contains invalid country code: ${x}`);
+    return code;
+  });
+}
+function parseUrlConfig(value, key) {
+  const url = String(value || "").trim();
+  if (!/^https:\/\//i.test(url)) throw new Error(`${key} must be an https URL`);
+  return url;
+}
+function sanitizeConfigPatch(body, current) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("request body must be an object");
+  const patch = {};
+  const changedKeys = [];
+  const dangerous = [];
+  for (const [key, rule] of Object.entries(CONFIG_SCHEMA)) {
+    if (body[key] === undefined) continue;
+    let value;
+    if (rule.type === "bool") value = parseBoolConfig(body[key], key);
+    else if (rule.type === "int") value = parseIntConfig(body[key], key, rule);
+    else if (rule.type === "countryArray") value = parseCountryArrayConfig(body[key], key);
+    else if (rule.type === "url") value = parseUrlConfig(body[key], key);
+    else if (rule.type === "enum") {
+      value = String(body[key] || "").trim();
+      if (!rule.values.includes(value)) throw new Error(`${key} must be one of: ${rule.values.join(", ")}`);
+    }
+    if (rule.dangerousEnable && value === true && current?.[key] !== true) dangerous.push(key);
+    patch[key] = value;
+    changedKeys.push(key);
+  }
+  if (dangerous.length && body.confirm !== "I_UNDERSTAND") {
+    throw new Error(`dangerous config requires confirm=I_UNDERSTAND: ${dangerous.join(",")}`);
+  }
+  return { patch, changedKeys, dangerousKeys: dangerous };
+}
+function redactConfig(cfg) {
+  const out = { ...cfg };
+  for (const key of SENSITIVE_CONFIG_KEYS) {
+    if (out[key]) out[key] = "***redacted***";
+  }
+  return out;
+}
 async function getLatest(env) {
   return (await kvGet(env, "ips:latest", { ips: [], updatedAt: 0, sourceStats: [] }));
 }
@@ -623,61 +632,6 @@ async function saveLatest(env, data) {
   await kvSet(env, `ips:history:${day}`, data, { expirationTtl: 60 * 60 * 24 * 30 });
 }
 
-function carrierKey(x) {
-  return x?.carrier === "CMCC" ? "CM" : (x?.carrier || "CF");
-}
-function countByCarrier(ips) {
-  const out = { CT: 0, CU: 0, CM: 0, CF: 0 };
-  for (const x of ips || []) {
-    const k = carrierKey(x);
-    out[out[k] == null ? "CF" : k]++;
-  }
-  return out;
-}
-function scoreIp(item, previousMap) {
-  const prev = previousMap.get(`${item.ip}:${carrierKey(item)}`) || previousMap.get(`${item.ip}:CF`);
-  let score = 0;
-  if (prev) score += 40;
-  if (item.tested) score += 30;
-  score += Math.min((item.sources?.length || 0) * 6, 30);
-  if (item.delay != null) score += Math.max(0, 30 - item.delay / 10);
-  if (item.loss != null) score += Math.max(0, 20 - item.loss * 100);
-  if (item.mbps != null) score += Math.min(item.mbps, 30) / 2;
-  return Math.round(score * 10) / 10;
-}
-function applyStabilityScores(ips, previous) {
-  const previousMap = new Map();
-  for (const x of previous?.ips || []) previousMap.set(`${x.ip}:${carrierKey(x)}`, x);
-  return ips.map(x => ({ ...x, _score: scoreIp(x, previousMap) })).sort((a, b) => {
-    if ((b._score || 0) !== (a._score || 0)) return (b._score || 0) - (a._score || 0);
-    if (a.tested && b.tested) return (a.delay || 9999) - (b.delay || 9999);
-    if (a.tested) return -1;
-    if (b.tested) return 1;
-    return (b.sources?.length || 0) - (a.sources?.length || 0);
-  });
-}
-function qualityGuard(alive, previous) {
-  const prevIps = previous?.ips || [];
-  if (prevIps.length < 50) return null;
-  if (alive.length < Math.floor(prevIps.length * 0.6)) {
-    return { error: "pool-shrank", message: `本次可用池 ${alive.length} 个，低于上一批 ${prevIps.length} 个的 60%，已保留上一批结果。` };
-  }
-  const prevBy = countByCarrier(prevIps);
-  const nextBy = countByCarrier(alive);
-  for (const k of ["CT", "CU", "CM"]) {
-    if (prevBy[k] >= 10 && nextBy[k] < Math.floor(prevBy[k] * 0.4)) {
-      return { error: "carrier-pool-shrank", message: `${carrierName(k)}池从 ${prevBy[k]} 个降到 ${nextBy[k]} 个，已保留上一批结果。` };
-    }
-  }
-  return null;
-}
-
-function sourceHealth(sourceStats = []) {
-  const total = sourceStats.length;
-  const failed = sourceStats.filter(x => x.error).length;
-  const empty = sourceStats.filter(x => !x.error && !x.count).length;
-  return { total, ok: Math.max(0, total - failed), failed, empty };
-}
 function staleInfo(updatedAt, maxAgeMs = 8 * 60 * 60 * 1000) {
   const ageMs = updatedAt ? Date.now() - updatedAt : Infinity;
   return { stale: ageMs > maxAgeMs, ageMs, maxAgeHours: Math.round(maxAgeMs / 3600000) };
@@ -818,13 +772,14 @@ async function aggregateSources() {
   const all = [];
   const stats = [];
   for (const r of results) {
-    stats.push({ name: r.name, count: r.ips.length, error: r.error });
+    const meta = sourceMeta(r.name);
+    stats.push({ name: r.name, count: r.ips.length, error: r.error, critical: !!meta?.critical, aliasOf: meta?.aliasOf || null, signal: sourceSignalName(meta) });
     all.push(...r.ips);
   }
   // 合并去重，按 ip:port 维度
   const uniq = uniqBy(all, x => `${x.ip}:${x.port}:${x.carrier || ""}`);
   // v3.0: 严格只保留落在 CF 官方 CIDR 段的 IP,反代 IP 完全丢弃
-  const cfOnly = uniq.filter(x => isCfNativeIp(x.ip));
+  const cfOnly = uniq.filter(x => isCfNativeIp(x.ip)).map(withQuality);
   return { ips: cfOnly, stats };
 }
 
@@ -866,6 +821,8 @@ async function enrichGeo(ips) {
             item.city = hit.city || item.city;
             item.asn = hit.connection?.asn ? `AS${hit.connection.asn}` : item.asn;
             item.isp = hit.connection?.isp || item.isp;
+            item.geoSource = "ipwho.is";
+            item.geoTrusted = true;
           }
         }
         ok = true;
@@ -895,6 +852,8 @@ async function enrichGeo(ips) {
             item.city = hit.city || item.city;
             item.asn = hit.as || item.asn;
             item.isp = hit.isp || item.isp;
+            item.geoSource = "ip-api.com";
+            item.geoTrusted = false;
           }
         }
       } catch {}
@@ -930,12 +889,17 @@ async function runFullTest(env, ctx, opts = {}) {
 
   // 5. 应用国家黑名单（只对已知 country 的过滤）
   if (cfg.countryBlocklist && cfg.countryBlocklist.length) {
-    alive = alive.filter(x => !x.country || !cfg.countryBlocklist.includes(x.country));
+    alive = alive.filter(x => !x.country || x.geoTrusted === false || !cfg.countryBlocklist.includes(x.country));
   }
 
   const enriched = await enrichGeo(alive);
   // 保留未识别国家的 IP（不丢弃，只把有国家的标记出来）
   alive = enriched;
+  // 地理补全后再执行一次国家黑名单；HTTP fallback geoTrusted=false 只用于展示，不参与拦截决策。
+  if (cfg.countryBlocklist && cfg.countryBlocklist.length) {
+    alive = alive.filter(x => !x.country || x.geoTrusted === false || !cfg.countryBlocklist.includes(x.country));
+  }
+  alive = alive.map(withQuality);
 
   // 6b. v2.1 cfnb：可用性二次检测（默认 off,需通过 KV config 打开 availabilityCheckEnabled）
   let availabilityStats = { skipped: true, total: alive.length, ok: alive.length };
@@ -967,7 +931,7 @@ async function runFullTest(env, ctx, opts = {}) {
     return { ...errorPayload, dnsSync: { ok: false, skipped: true, error: "no-usable-ips" } };
   }
 
-  const qualityIssue = qualityGuard(alive, previous);
+  const qualityIssue = qualityGuard(alive, previous, agg.stats, carrierName);
   if (qualityIssue) {
     const keptPayload = {
       ...(previous || {}),
@@ -1066,16 +1030,27 @@ async function listAllARecords(env) {
   }
   return all;
 }
-function buildWantedIps(ips, topN) {
-  const wanted = [];
-  const seen = new Set();
-  for (const x of ips) {
-    if (!x?.ip || seen.has(x.ip)) continue;
-    seen.add(x.ip);
-    wanted.push(x.ip);
-    if (wanted.length >= topN) break;
+async function listManagedARecords(env, names) {
+  const byName = new Map();
+  const unique = [...new Set((names || []).filter(Boolean))];
+  if (!unique.length) return byName;
+  if (unique.length > 12) {
+    const managed = new Set(unique);
+    const allRecords = await listAllARecords(env);
+    for (const r of allRecords) {
+      if (!managed.has(r.name)) continue;
+      if (!byName.has(r.name)) byName.set(r.name, []);
+      byName.get(r.name).push(r);
+    }
+    byName.cfApiRequests = 1;
+    return byName;
   }
-  return wanted;
+  const rows = await pMap(unique, async name => ({ name, records: await listRecords(env, name) }), 4);
+  for (const row of rows) {
+    if (row?.name) byName.set(row.name, Array.isArray(row.records) ? row.records : []);
+  }
+  byName.cfApiRequests = unique.length;
+  return byName;
 }
 function getRootFromRecord(recordName) {
   return recordName && recordName.includes(".") ? recordName.split(".").slice(1).join(".") : "";
@@ -1134,48 +1109,17 @@ async function batchDnsRecords(env, deletes, posts) {
   });
 }
 async function syncRecordFromExisting(env, name, ips, topN, existing) {
-  if (!ips.length) return { skipped: true, name };
-  const ratio = Math.min(Math.max(Number(env.DNS_MAX_CHANGE_RATIO || 0.3), 0.05), 1);
-  const maxChanges = existing.length ? Math.max(1, Math.floor(topN * ratio)) : topN;
-  const candidatePool = buildWantedIps(ips, Math.max(topN * 3, topN));
-  const candidateSet = new Set(candidatePool);
-  const existingContents = existing.map(r => r.content);
-  const final = [];
-  const addFinal = (ip) => { if (ip && !final.includes(ip) && final.length < topN) final.push(ip); };
-
-  // 1) 优先保留仍在候选池中的旧记录（最稳定）
-  for (const ip of existingContents) if (candidateSet.has(ip)) addFinal(ip);
-
-  // 2) 从新候选中补充，受 maxChanges 限制（控制单次最大变更比例）
-  let addedNew = 0;
-  for (const ip of candidatePool) {
-    if (final.length >= topN) break;
-    if (existingContents.includes(ip)) continue;
-    if (addedNew >= maxChanges && existing.length) break;
-    addFinal(ip);
-    addedNew++;
-  }
-
-  // 3) 如果还没满 topN，继续从旧记录中补充（可能已不在候选池但仍可达）
-  if (final.length < topN) {
-    for (const ip of existingContents) { addFinal(ip); if (final.length >= topN) break; }
-  }
-  // 4) 最后从候选池中兜底补满
-  if (final.length < topN) {
-    for (const ip of candidatePool) { addFinal(ip); if (final.length >= topN) break; }
-  }
-
-  const wanted = final.slice(0, topN);
-  const wantedSet = new Set(wanted);
-  const existingMap = new Map(existing.map(r => [r.content, r.id]));
-  const deletes = [];
-  for (const r of existing) if (!wantedSet.has(r.content)) deletes.push(r.id);
-  const posts = [];
-  for (const ip of wanted) {
-    if (!existingMap.has(ip)) posts.push({ type: "A", name, content: ip, ttl: 60, proxied: false });
-  }
-  await batchDnsRecords(env, deletes, posts);
-  return { name, ips: wanted, kept: existing.length - deletes.length, added: posts.length, removed: deletes.length, maxChanges };
+  const plan = planDnsRecordSync(name, ips, topN, existing, env.DNS_MAX_CHANGE_RATIO || 0.3);
+  if (plan.skipped) return plan;
+  await batchDnsRecords(env, plan.deletes, plan.posts);
+  return {
+    name,
+    ips: plan.ips,
+    kept: plan.kept,
+    added: plan.added,
+    removed: plan.removed,
+    maxChanges: plan.maxChanges,
+  };
 }
 async function syncAllDns(env, alive) {
   const startedAt = Date.now();
@@ -1192,14 +1136,8 @@ async function syncAllDns(env, alive) {
       pool = await applyRiskFilter(pool, cfg, Math.max(60, topN * 4));
     }
     const root = getRootFromRecord(env.CF_RECORD_NAME);
-    const allRecords = await listAllARecords(env);
-    const managedNames = new Set(getManagedDnsNames(env));
-    const byName = new Map();
-    for (const r of allRecords) {
-      if (!managedNames.has(r.name)) continue;
-      if (!byName.has(r.name)) byName.set(r.name, []);
-      byName.get(r.name).push(r);
-    }
+    const managedNames = getManagedDnsNames(env);
+    const byName = await listManagedARecords(env, managedNames);
 
     const autoName = getAutoRecordName(env);
     if (autoName) results.push(await syncRecordFromExisting(env, autoName, pool, topN, byName.get(autoName) || []));
@@ -1214,7 +1152,7 @@ async function syncAllDns(env, alive) {
       }
     }
     const verification = await verifyDnsRecords(results).catch(e => ({ ok: false, error: String(e && e.message || e), checkedAt: Date.now(), checks: [] }));
-    const summary = { ok: true, startedAt, finishedAt: Date.now(), elapsedMs: Date.now() - startedAt, topN, results, verification };
+    const summary = { ok: true, startedAt, finishedAt: Date.now(), elapsedMs: Date.now() - startedAt, topN, cfApiRequests: byName.cfApiRequests || results.length, results, verification };
     await kvSet(env, "dns:lastSync", summary);
     // 写入当日 DNS 同步历史（7 天 TTL）
     const day = new Date().toISOString().slice(0, 10);
@@ -1264,11 +1202,19 @@ async function notify(env, payload) {
   ].filter(Boolean);
   const md = lines.join("\n");
   if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID) {
-    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text: md, parse_mode: "Markdown", disable_web_page_preview: true }),
     });
+    let result = null;
+    try { result = await r.json(); } catch {}
+    if (!r.ok || result?.ok === false) {
+      const error = result?.description || r.statusText || `HTTP ${r.status}`;
+      await kvSet(env, "notify:lastError", { ok: false, error, failedAt: Date.now() });
+      throw new Error(`Telegram notify failed: ${error}`);
+    }
+    await kvSet(env, "notify:lastStatus", { ok: true, sentAt: Date.now() });
   }
 }
 
@@ -1368,6 +1314,35 @@ function fmtSub(ips, withComment) {
     return withComment ? `${fmtAddr(x)}#${tag || "CF"}` : fmtAddr(x);
   }).join("\n");
 }
+function csvCell(v) {
+  const s = String(v ?? "");
+  return /[",\n]/.test(s) ? `"${s.replaceAll('"', '""')}"` : s;
+}
+function fmtSubCsv(ips) {
+  const rows = [["ip", "port", "carrier", "country", "colo", "delay", "loss", "mbps", "score", "testedBy", "confidence"]];
+  for (const x of ips) {
+    const q = x.quality || qualityForIp(x);
+    rows.push([x.ip, x.port || 443, x.carrier || "CF", x.country || "", x.colo || "", x.delay ?? "", x.loss ?? "", x.mbps ?? "", x._score ?? "", q.testedBy, q.confidence]);
+  }
+  return rows.map(row => row.map(csvCell).join(",")).join("\n");
+}
+function fmtSubJsonl(ips) {
+  return ips.map(x => {
+    const q = x.quality || qualityForIp(x);
+    return JSON.stringify({
+      ip: x.ip,
+      port: x.port || 443,
+      carrier: x.carrier || "CF",
+      country: x.country || null,
+      colo: x.colo || null,
+      delay: x.delay ?? null,
+      loss: x.loss ?? null,
+      mbps: x.mbps ?? null,
+      score: x._score ?? null,
+      quality: q,
+    });
+  }).join("\n");
+}
 function fmtEDT(ips) { return ips.map(fmtAddr).join("\n"); }
 
 // ============================================================
@@ -1402,15 +1377,26 @@ async function handle(request, env, ctx) {
   }
 
   if (path === "/health") {
-    const [lastDnsSync] = await Promise.all([kvGet(env, "dns:lastSync", null)]);
+    const [lastDnsSync, lastError] = await Promise.all([
+      kvGet(env, "dns:lastSync", null),
+      kvGet(env, "refresh:lastError", null),
+    ]);
     const info = staleInfo(data.updatedAt);
     const sh = sourceHealth(data.sourceStats || []);
     const sourceOk = sh.total === 0 || sh.ok >= Math.ceil(sh.total * 0.4);
-    const ok = ips.length > 0 && !info.stale && lastDnsSync?.ok !== false && sourceOk;
+    const reasons = [];
+    if (!ips.length) reasons.push("empty-pool");
+    if (info.stale) reasons.push("stale");
+    if (lastDnsSync?.ok === false) reasons.push("dns-failed");
+    if (!sourceOk) reasons.push("source-health-low");
+    if (!sh.criticalSourcesOk) reasons.push("critical-source-failed");
+    const ok = reasons.length === 0;
+    const status = ok ? "ok" : (ips.length > 0 ? "degraded" : "down");
     return json({
-      ok, total: ips.length, stale: info.stale, ageMs: info.ageMs,
+      ok, status, reasons, total: ips.length, stale: info.stale, ageMs: info.ageMs,
       updatedAt: data.updatedAt || 0, dnsOk: lastDnsSync?.ok ?? null,
-      sourceHealth: { ok: sh.ok, total: sh.total, failed: sh.failed },
+      sourceHealth: { ok: sh.ok, total: sh.total, failed: sh.failed, criticalSourcesOk: sh.criticalSourcesOk, independentSignals: sh.independentSignals },
+      lastErrorAt: lastError?.failedAt || null,
     }, { status: ok ? 200 : 503 });
   }
 
@@ -1427,7 +1413,14 @@ async function handle(request, env, ctx) {
   // ---- 订阅 ----
   if (path === "/sub" || path === "/sub.txt" || path === "/api/ips.txt" || path === "/ips.txt") {
     const filtered = applyFilter(ips, params, requesterColo, cfg);
-    return text(fmtSub(filtered, params.get("comment") !== "0"));
+    const format = (params.get("format") || "plain").toLowerCase();
+    if (format === "csv") {
+      return text(fmtSubCsv(filtered), { headers: { ...SUB_CACHE_HEADERS, "content-type": "text/csv; charset=utf-8" } });
+    }
+    if (format === "jsonl") {
+      return text(fmtSubJsonl(filtered), { headers: { ...SUB_CACHE_HEADERS, "content-type": "application/x-ndjson; charset=utf-8" } });
+    }
+    return text(fmtSub(filtered, params.get("comment") !== "0"), { headers: SUB_CACHE_HEADERS });
   }
   if (path === "/api/preferred-ips") {
     return text(fmtEDT(applyFilter(ips, params, requesterColo, cfg)));
@@ -1436,7 +1429,14 @@ async function handle(request, env, ctx) {
   // ---- JSON 列表 ----
   if (path === "/api/ips") {
     const filtered = applyFilter(ips, params, requesterColo, cfg);
-    return json({ ok: true, total: ips.length, returned: filtered.length, updatedAt: data.updatedAt, ips: filtered });
+    return json({
+      ok: true,
+      total: ips.length,
+      returned: filtered.length,
+      updatedAt: data.updatedAt,
+      qualityNote: "testedBy=hostmonit 表示来源实测；testedBy=source 表示来源推荐，非本 Worker TCP 实测。",
+      ips: filtered.map(withQuality),
+    });
   }
 
   // ---- 维度统计 ----
@@ -1459,6 +1459,8 @@ async function handle(request, env, ctx) {
       sourceStats: data.sourceStats,
       availabilityStats: data.availabilityStats,
       sourceHealth: sourceHealth(data.sourceStats || []),
+      qualityStats: { tested: testedCount(ips), sourceOnly: Math.max(0, ips.length - testedCount(ips)) },
+      publicRefreshEnabled: env.ALLOW_PUBLIC_REFRESH === "1",
       stale: staleInfo(data.updatedAt),
       lastError,
       lastDnsSync,
@@ -1489,20 +1491,20 @@ async function handle(request, env, ctx) {
     if (authError) return authError;
     if (request.method === "GET") {
       const cfg = await getConfig(env);
-      return json({ ok: true, config: cfg, defaults: DEFAULT_CFG });
+      const raw = params.get("raw") === "1";
+      if (raw && request.headers.get("x-config-raw-confirm") !== "I_UNDERSTAND") {
+        return json({ ok: false, error: "raw-config-confirm-required", hint: "Set X-Config-Raw-Confirm: I_UNDERSTAND" }, { status: 400 });
+      }
+      return json({ ok: true, config: raw ? cfg : redactConfig(cfg), defaults: raw ? DEFAULT_CFG : redactConfig(DEFAULT_CFG), redacted: !raw });
     }
     if (request.method === "POST" || request.method === "PUT") {
       try {
         const body = await request.json();
         const current = await getConfig(env);
-        const allowed = Object.keys(DEFAULT_CFG);
-        const patch = {};
-        for (const k of allowed) {
-          if (body[k] !== undefined) patch[k] = body[k];
-        }
+        const { patch, changedKeys, dangerousKeys } = sanitizeConfigPatch(body, current);
         const next = { ...current, ...patch };
         await kvSet(env, "config", next);
-        return json({ ok: true, config: next });
+        return json({ ok: true, config: redactConfig(next), changedKeys, dangerousKeys });
       } catch (e) {
         return json({ ok: false, error: String(e && e.message || e) }, { status: 400 });
       }
@@ -1558,7 +1560,9 @@ async function handle(request, env, ctx) {
   // ---- 页面 ----
   if (path === "/" || path === "/index.html") {
     const lastDnsSync = await kvGet(env, "dns:lastSync", null);
-    return html(renderHome({ ...data, lastDnsSync }, visitor));
+    const pageData = { ...data, lastDnsSync, publicRefreshEnabled: env.ALLOW_PUBLIC_REFRESH === "1" };
+    if (params.get("plain") === "1") return html(renderPlainHome(pageData, visitor));
+    return html(renderHome(pageData, visitor));
   }
 
   return new Response("Not Found", { status: 404 });
@@ -1570,7 +1574,11 @@ async function handle(request, env, ctx) {
 export default {
   async fetch(request, env, ctx) {
     try { return await handle(request, env, ctx); }
-    catch (e) { return json({ ok: false, error: String(e && e.message || e), stack: e?.stack }, { status: 500 }); }
+    catch (e) {
+      const requestId = crypto.randomUUID();
+      console.error("unhandled-error", requestId, e?.stack || e);
+      return json({ ok: false, error: "internal-error", requestId }, { status: 500 });
+    }
   },
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runFullTest(env, ctx));
@@ -1610,17 +1618,36 @@ function renderAdmin(data, visitor) {
     return `<div class="card"><b>${r.name}</b><span>保留 ${r.kept || 0} · 新增 ${r.added || 0} · 删除 ${r.removed || 0} · 上限 ${r.maxChanges || "—"} · ${vText}</span></div>`;
   }).join("") : '<div class="empty">暂无 DNS 同步记录</div>';
   const histRows = history.map(h => `<tr><td>${h.date}</td><td>${h.count}</td><td>${h.byCarrier?.CT || 0}</td><td>${h.byCarrier?.CU || 0}</td><td>${h.byCarrier?.CM || 0}</td><td>${h.byCarrier?.CF || 0}</td></tr>`).join("");
+  const trendSvg = (() => {
+    const rows = history.slice().reverse();
+    if (!rows.length) return '<div class="empty">暂无趋势数据</div>';
+    const max = Math.max(1, ...rows.map(x => x.count || 0));
+    const points = rows.map((x, i) => {
+      const px = rows.length === 1 ? 20 : 20 + i * (260 / (rows.length - 1));
+      const py = 90 - ((x.count || 0) / max) * 70;
+      return `${px},${py}`;
+    }).join(' ');
+    const labels = rows.map((x, i) => `<text x="${rows.length === 1 ? 20 : 20 + i * (260 / (rows.length - 1))}" y="112" text-anchor="middle">${x.date.slice(5)}</text>`).join('');
+    return `<svg viewBox="0 0 300 120" role="img" aria-label="7天节点数量趋势"><polyline points="${points}" fill="none" stroke="#3fb950" stroke-width="3"/>${rows.map((x, i) => { const px = rows.length === 1 ? 20 : 20 + i * (260 / (rows.length - 1)); const py = 90 - ((x.count || 0) / max) * 70; return `<circle cx="${px}" cy="${py}" r="3" fill="#3fb950"><title>${x.date}: ${x.count}</title></circle>`; }).join('')}<line x1="20" y1="90" x2="280" y2="90" stroke="#30363d"/>${labels}</svg>`;
+  })();
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>cf-best-ip 管理控制台</title><style>
 body{margin:0;background:#0a0d12;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1180px;margin:0 auto;padding:18px}.hero{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:16px}.hero h1{margin:0;font-size:26px}.mut{color:#8b949e;font-size:13px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-bottom:16px}.card,.panel{background:#11161d;border:1px solid #1f2630;border-radius:12px;padding:14px}.card b{display:block;margin-bottom:6px}.card span{color:#8b949e;font-size:12px;line-height:1.6}.actions{display:flex;flex-wrap:wrap;gap:8px}.btn{background:#1f6feb;color:#fff;border:0;border-radius:8px;padding:9px 12px;cursor:pointer}.btn.secondary{background:#222b36}.ok{color:#3fb950}.bad{color:#f85149}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #1f2630;text-align:left}th{color:#8b949e;font-weight:500}.section{margin:18px 0}.section h2{font-size:16px;margin:0 0 10px}.empty{color:#8b949e;padding:12px}.host{font-family:ui-monospace,monospace;color:#79c0ff;word-break:break-all}</style></head><body><div class="wrap">
 <div class="hero"><div><h1>cf-best-ip 管理控制台</h1><div class="mut">${serviceHost} · 最近刷新 ${fmtTime(data.updatedAt)}</div></div><div class="actions"><a class="btn secondary" href="/">返回首页</a><button class="btn" id="refresh">手动刷新</button></div></div>
 <div class="grid"><div class="card"><b>总节点</b><span>${ips.length} 个${stale.stale ? ` · <span class="bad">数据超过 ${stale.maxAgeHours} 小时未刷新</span>` : ''}</span></div><div class="card"><b>DNS 状态</b><span>${lastSync?.ok ? '最近同步成功' : '暂无成功同步'} · ${lastSync?.verification?.ok ? '验证通过' : '等待验证/传播'}</span></div><div class="card"><b>数据源健康</b><span>正常 ${health.ok}/${health.total} · 失败 ${health.failed} · 空结果 ${health.empty}</span></div><div class="card"><b>最近错误</b><span>${lastError ? `${lastError.error || 'error'} · ${lastError.message || ''}` : '无记录'}</span></div><div class="card"><b>入口域名</b><span class="host">${hosts.join('<br>')}</span></div></div>
 <div class="section"><h2>DNS 同步详情</h2><div class="grid">${syncHtml}</div></div>
-<div class="section"><h2>7 天趋势</h2><div class="panel"><table><thead><tr><th>日期</th><th>总数</th><th>电信</th><th>联通</th><th>移动</th><th>通用</th></tr></thead><tbody>${histRows || '<tr><td colspan="6">暂无历史</td></tr>'}</tbody></table></div></div>
+<div class="section"><h2>7 天趋势</h2><div class="panel">${trendSvg}<table><thead><tr><th>日期</th><th>总数</th><th>电信</th><th>联通</th><th>移动</th><th>通用</th></tr></thead><tbody>${histRows || '<tr><td colspan="6">暂无历史</td></tr>'}</tbody></table></div></div>
 <div class="section"><h2>稳定分 Top 20</h2><div class="panel"><table><thead><tr><th>#</th><th>IP</th><th>线路</th><th>国家</th><th>稳定分</th><th>延迟</th><th>来源</th></tr></thead><tbody>${topRows}</tbody></table></div></div>
 <div class="section"><h2>数据源健康</h2><div class="panel"><table><thead><tr><th>数据源</th><th>数量</th><th>状态</th></tr></thead><tbody>${sourceRows}</tbody></table></div></div>
 </div><script>
 document.getElementById('refresh').onclick=async(e)=>{const btn=e.target;const token=sessionStorage.getItem('adminToken')||prompt('输入 ADMIN_TOKEN');if(!token)return;sessionStorage.setItem('adminToken',token);btn.disabled=true;btn.textContent='刷新中…';try{const r=await fetch('/api/refresh',{method:'POST',headers:{authorization:'Bearer '+token}}).then(r=>r.json());if(r.ok){btn.textContent='完成';setTimeout(()=>location.reload(),800)}else{if(r.error==='unauthorized')sessionStorage.removeItem('adminToken');btn.textContent=r.hint||r.error||'失败';setTimeout(()=>{btn.disabled=false;btn.textContent='手动刷新'},3000)}}catch(err){btn.textContent=err.message;btn.disabled=false}}
 </script></body></html>`;
+}
+
+function renderPlainHome(data, visitor) {
+  const ips = (data.ips || []).slice(0, 50);
+  const updated = data.updatedAt ? new Date(data.updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "未运行";
+  const root = visitor.root || "你的域名";
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CloudFlare 优选 IP 极简页</title><style>body{font-family:ui-monospace,monospace;margin:16px;line-height:1.6}a{color:#0969da}pre{white-space:pre-wrap}</style></head><body><h1>CloudFlare 优选 IP 极简页</h1><p>更新：${updated} · 总数：${data.ips?.length || 0}</p><p>推荐域名：auto.${root} / ct.${root} / cu.${root} / cm.${root}</p><p><a href="/">返回完整页面</a> · <a href="/sub?format=csv">CSV</a> · <a href="/sub?format=jsonl">JSONL</a></p><pre>${ips.map(x => `${fmtAddr(x)} ${x.carrier || "CF"} ${x.country || ""} ${x.delay != null ? x.delay + "ms" : ""}`).join("\n")}</pre></body></html>`;
 }
 
 function renderHome(data, visitor) {
@@ -1629,6 +1656,8 @@ function renderHome(data, visitor) {
   const total = ips.length;
   const health = sourceHealth(data.sourceStats || []);
   const stale = staleInfo(data.updatedAt);
+  const publicRefreshEnabled = data.publicRefreshEnabled === true;
+  const measuredCount = testedCount(ips);
 
   // 取每类 top 30；hostmonit 来的有真实 delay/loss/mbps/colo，会优先排在前面
   const sortFn = (a, b) => {
@@ -1673,6 +1702,12 @@ function renderHome(data, visitor) {
 
   const fmtDelay = (x) => x.delay != null ? `${x.delay}ms` : "—";
   const fmtSpeed = (x) => x.mbps != null ? `${x.mbps}M` : "—";
+  const fmtQuality = (x) => {
+    const q = x.quality || qualityForIp(x);
+    if (q.testedBy === "hostmonit") return "hostmonit 实测";
+    if (q.confidence === "medium") return "多源推荐未测";
+    return "来源推荐未测";
+  };
 
   const renderRow = (x, i) => `<tr data-ip="${x.ip}" data-tested="${x.delay != null ? 1 : 0}">
     <td class="num">${i + 1}</td>
@@ -1681,6 +1716,7 @@ function renderHome(data, visitor) {
     <td class="cell-loss">${x.loss != null ? (x.loss * 100).toFixed(0) + "%" : "—"}</td>
     <td class="cell-delay">${fmtDelay(x)}</td>
     <td class="cell-speed">${fmtSpeed(x)}</td>
+    <td class="cell-quality">${fmtQuality(x)}</td>
     <td class="cell-score">${x._score != null ? x._score : "—"}</td>
     <td><button class="copybtn" data-copy="${x.ip}">📋</button></td>
   </tr>`;
@@ -1691,6 +1727,7 @@ function renderHome(data, visitor) {
         <th class="cell-loss">丢包</th>
         <th class="cell-delay">延迟</th>
         <th class="cell-speed">速度</th>
+        <th class="cell-quality">测速来源</th>
         <th class="cell-score">稳定分</th>
         <th>复制</th>
       </tr></thead><tbody>${rows.map(renderRow).join("")}</tbody></table>`
@@ -1729,6 +1766,9 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
 .statusline{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 16px}
 .statuspill{background:var(--card);border:1px solid var(--bd);border-radius:999px;padding:7px 11px;color:var(--mut);font-size:12px}
 .statuspill b{color:var(--fg)}
+.netgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}
+.netitem{background:#0d1117;border:1px solid var(--bd);border-radius:9px;padding:10px;font-size:12px}
+.netitem b{display:block;color:var(--fg);margin-bottom:4px}.netitem span{color:var(--mut)}
 .syncbox{margin:0 0 16px;padding:14px;background:var(--card);border:1px solid var(--bd);border-radius:12px}
 .sync-title{font-size:13px;font-weight:700;margin-bottom:10px}
 .sync-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}
@@ -1791,6 +1831,7 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
   .cell-loss{text-align:center;min-width:30px}
   .cell-delay{min-width:46px}
   .cell-speed{min-width:42px;color:var(--ct)}
+  .cell-quality{display:none}
   .cell-score{display:none}
   .badge{padding:2px 6px;font-size:10px}
   .iptbl .ip{font-size:11px}
@@ -1811,15 +1852,18 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
 
 <div class="hero">
   <h1>☁️ CloudFlare 优选 IP</h1>
-  <p class="sub">电信、联通、移动 优质 Cloudflare 节点 IP<br>聚合 ${SOURCES.length} 个公开源 · 全部经 CF 官方 CIDR 段二次校验 · 真实测速数据 · 每 6 小时自动刷新</p>
+  <p class="sub">电信、联通、移动 优质 Cloudflare 节点 IP<br>聚合 ${SOURCES.length} 个公开源 · 全部经 CF 官方 CIDR 段二次校验 · 明确区分来源实测/来源推荐 · 每 6 小时自动刷新</p>
   <div class="hero-stats">
     <div>总节点 <b>${total}</b></div>
     <div>CF 自家 <b>${nativeCount}</b></div>
     
     <div>数据源 <b>${health.ok}/${health.total}</b></div>
+    <div>实测节点 <b>${measuredCount}</b></div>
     <div>更新于 <b id="upd">${updated}</b></div>
   </div>
   ${stale.stale ? `<div style="margin-top:12px;color:#f85149;font-size:13px">⚠️ 数据已超过 ${stale.maxAgeHours} 小时未刷新，请到 /admin 检查刷新状态</div>` : ""}
+  ${health.criticalSourcesOk ? "" : `<div style="margin-top:12px;color:#d29922;font-size:13px">⚠️ 核心测速源异常，当前结果处于 degraded 状态</div>`}
+  ${publicRefreshEnabled ? `<div class="public-refresh-warning" style="margin-top:12px;color:#f85149;font-size:13px">⚠️ 当前启用了公开刷新 ALLOW_PUBLIC_REFRESH=1，仅建议临时调试，线上不推荐。</div>` : ""}
 </div>
 
 <div class="wrap">
@@ -1843,8 +1887,18 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
     <div class="statuspill">联通 <b>${cu.length}</b></div>
     <div class="statuspill">移动 <b>${cm.length}</b></div>
     <div class="statuspill">通用 <b>${allNative.length}</b></div>
+    <div class="statuspill">实测 <b>${measuredCount}</b></div>
   </div>
   ${renderSyncDetails()}
+  <section class="syncbox"><div class="sync-title">我的网络信息</div><div class="netgrid">
+    <div class="netitem"><b>${visitor.country || "未知"}${visitor.city ? " · " + visitor.city : ""}</b><span>访问国家/城市</span></div>
+    <div class="netitem"><b>${visitor.asn || "未知"}</b><span>ASN</span></div>
+    <div class="netitem"><b>${visitor.asOrg || "未知"}</b><span>运营商组织</span></div>
+    <div class="netitem"><b>${visitor.carrier ? carrierName(visitor.carrier) : "未识别"}</b><span>推荐线路：${recommendedLabel}</span></div>
+    <div class="netitem"><b>${visitor.colo || "未知"}</b><span>Cloudflare 入口机房</span></div>
+  </div></section>
+  <section class="syncbox"><div class="sync-title">测速可信度说明</div><div style="font-size:12px;color:var(--mut);line-height:1.7">` +
+  `hostmonit 实测` + ` 表示来源包含延迟/丢包/速度；` + `来源推荐未测` + ` 表示本 Worker 只做 CF CIDR 和地理过滤，不做 TCP 测速。表格里的 ms* 是你的浏览器临时连接耗时，不等于业务可用性保证。</div></section>
   <div class="tabs" id="tabs">
     <div class="tab active" data-tab="all">🌐 全部<span class="n">${all.length}</span></div>
     <div class="tab" data-tab="ct">📡 电信<span class="n">${ct.length}</span></div>
@@ -1963,7 +2017,11 @@ function clientTestIp(ip) {
 let clientTestQueue = [];
 let clientTestEnqueued = new Set();
 let clientTestActive = 0;
-const CLIENT_TEST_CONCURRENCY = 6;
+function getClientTestConcurrency() {
+  const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || '');
+  return isMobile ? 2 : 6;
+}
+const MAX_CLIENT_TEST_ROWS = 10;
 
 function colorForDelay(ms) {
   if (ms < 100) return '#3fb950';
@@ -1972,7 +2030,9 @@ function colorForDelay(ms) {
 }
 
 async function processClientTestQueue() {
-  while (clientTestQueue.length && clientTestActive < CLIENT_TEST_CONCURRENCY) {
+  if (document.hidden) return;
+  const limit = getClientTestConcurrency();
+  while (clientTestQueue.length && clientTestActive < limit) {
     const row = clientTestQueue.shift();
     if (!row || row.dataset.tested === '1') continue;
     clientTestActive++;
@@ -2003,7 +2063,7 @@ function startClientTestsForActivePane() {
   if (!activeTab) return;
   const pane = document.getElementById('pane-' + activeTab.dataset.tab);
   if (!pane) return;
-  const rows = pane.querySelectorAll('tr[data-tested="0"]');
+  const rows = Array.from(pane.querySelectorAll('tr[data-tested="0"]')).slice(0, MAX_CLIENT_TEST_ROWS);
   // 插到队列但避免重复
   rows.forEach(r => {
     if (!clientTestEnqueued.has(r)) {
@@ -2016,6 +2076,7 @@ function startClientTestsForActivePane() {
 
 // 页面加载后启动(当前 active tab)
 window.addEventListener('load', () => setTimeout(startClientTestsForActivePane, 500));
+window.addEventListener('visibilitychange', () => { if (!document.hidden) processClientTestQueue(); });
 
 // 切 tab 时动启新 pane 的测试
 tabs.forEach(t => {

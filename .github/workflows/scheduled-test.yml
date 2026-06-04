@@ -14,4 +14,5 @@ jobs:
         with:
           node-version: 20
       - run: node -c src/worker.js
+      - run: node --test
       - run: node scripts/verify-worker.mjs
