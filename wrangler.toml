@@ -34,6 +34,7 @@ API_IPS_RATE_LIMIT = "60" # /api/ips 每 IP 每分钟限额；设 "0" 关闭
 # 敏感变量请用 secret 命令注入:
 #   wrangler secret put CF_API_TOKEN          # Cloudflare Zone:DNS:Edit
 #   wrangler secret put REFRESH_TOKEN         # 手动刷新 /api/refresh 的 Bearer token
+#   wrangler secret put ADMIN_TOKEN           # /admin、/api/config、/api/diagnostics 等管理接口 Bearer token
 #   wrangler secret put TELEGRAM_BOT_TOKEN    # 可选
 
 [[durable_objects.bindings]]

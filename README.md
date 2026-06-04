@@ -88,6 +88,34 @@ wrangler deploy
 
 建议域名角色分离：`SERVICE_HOSTNAME` 只作为 Worker 管理页/API 入口，例如 `bestip.example.com`；`AUTO_RECORD_NAME` / `CF_RECORD_NAME` / `ct.` / `cu.` / `cm.` 才作为 DNS only 的优选 IP 池。不要把 Worker 入口和优选 IP 池设成同一个域名。
 
+### 当前仓库部署状态（LeilaoMi / leilaomi.cc.cd）
+
+当前 `main` 分支对应线上版本 **3.9.0**，已部署到 Cloudflare Worker `cf-best-ip`：
+
+| 项 | 当前值 |
+|---|---|
+| Worker 入口 | `https://bestip.leilaomi.cc.cd` |
+| Worker 自定义域 | `bestip.leilaomi.cc.cd` |
+| Cron | `15 */6 * * *`（每 6 小时，偏移 15 分钟） |
+| DNS 同步根域 | `leilaomi.cc.cd` |
+| 默认优选池 | `auto.leilaomi.cc.cd` |
+| 通用优选池 | `cf.leilaomi.cc.cd` |
+| 三网分流 | 已启用：`ct.` / `cu.` / `cm.` |
+| IPv6 DNS 同步 | 默认关闭：`CF_DNS_IPV6=0` |
+| `/api/ips` 限流 | 默认每 IP 每分钟 60 次 |
+| 公开刷新 | 已关闭：`ALLOW_PUBLIC_REFRESH` 未启用 |
+
+最近一次线上验证结果：
+
+```text
+/health      ok=true, status=ok, total=331, dnsOk=true
+/api/stats   ok=true, version=3.9.0, publicRefreshEnabled=false
+/api/ips     HTTP 200, returned=20, total=331
+/            HTTP 200, CSP nonce 生效，script-src 已无 unsafe-inline
+```
+
+> 这些值是当前仓库配置与最近一次部署验证状态；如果 fork 到自己的域名，请按上面的部署步骤替换为自己的 Zone、KV、域名和 secret。
+
 ### Cloudflare Dashboard / Git 部署（可选）
 
 1. Fork 本仓库
