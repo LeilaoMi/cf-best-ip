@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-orange)](https://workers.cloudflare.com/)
-[![Version](https://img.shields.io/badge/version-3.8.0-blue)]()
+[![Version](https://img.shields.io/badge/version-3.8.1-blue)]()
 
 > 在 Cloudflare Worker 上跑的 **CF 自家 IP 优选服务**:聚合社区主流数据源,经官方 CIDR 校验,按运营商 / 全局展示,自动同步到自定义子域 A 记录。
 
@@ -134,7 +134,7 @@ wrangler deploy
 | `/api/stats` | 池子统计 + 最近一次 DNS 同步结果 + `publicRefreshEnabled` / `notifyLastError` |
 | `/health` | 轻量健康检查，返回 `status`、`reasons`、`lastErrorAt`、`criticalSourcesOk`，适合外部监控探活 |
 | `/api/diagnostics` | 诊断快照：节点数、三网分布、数据源健康、陈旧状态、DNS 同步、最近错误；需要 `ADMIN_TOKEN` |
-| `/api/config` | 运行时配置查看/修改（GET 默认脱敏 / `raw=1` 需确认头 / POST 写入需类型校验），需 `Authorization: Bearer <ADMIN_TOKEN>` |
+| `/api/config` | 运行时配置查看/修改/导入/导出（GET 默认脱敏；`raw=1`/`export=1` 支持导出，raw 需确认头；POST 可直接写 patch 或提交 `{config:{...}}` 导入），需 `Authorization: Bearer <ADMIN_TOKEN>` |
 | `/api/dns/current` | 当前托管子域的 DNS only A 记录 + 最近一次同步结果 |
 | `/api/history?days=7` | 过去 N 天的快照 |
 | `/sub` | 订阅输出；公开缓存 300 秒降低重复抓取，支持 `format=plain/csv/jsonl` |
@@ -182,10 +182,10 @@ curl -X POST \
 - **陈旧数据告警**：超过 8 小时未刷新时，首页、`/admin`、`/health`、`/api/diagnostics` 会明确提示。
 - **安全与缓存头**：HTML/API 响应默认 no-store，并带基础安全响应头；`/robots.txt` 避免索引 admin/API。
 - **Worker 平台限制**：Cloudflare Workers 禁止从 Worker 出口连接 CF 自家 IP（`connect()` 会失败），所以**本项目不在 Worker 内做 TCP 测速**。`hostmonit 实测` 才代表来源带延迟/丢包/速度；`来源推荐未测` 只代表通过 CF CIDR、地理与稳定分过滤。页面客户端测速只自动测当前线路前 10 个，移动端降低并发，页面隐藏时暂停。
-- **手动刷新保护**：`/api/refresh` 默认只接受 `POST + Bearer token`。`ALLOW_PUBLIC_REFRESH=1` 仅建议临时调试；启用后首页和 `/api/stats` 会明确显示公开刷新风险。
+- **手动刷新保护**：`/api/refresh` 默认只接受 `POST + Bearer token`，并使用 `refresh:running` 运行锁阻止重复并发刷新。`ALLOW_PUBLIC_REFRESH=1` 仅建议临时调试；启用后首页和 `/api/stats` 会明确显示公开刷新风险。
 - **地理信息补全**：通过 ipwho.is（HTTPS，免费无 key）批量查询 IP 国家/城市/ASN，失败时自动回退到 ip-api.com；补全后会再次执行国家黑名单，未识别国家的 IP 不会被丢弃。
 - **DNS 同步历史**：`dns:lastSync` 记录最近一次同步结果，`dns:history:YYYY-MM-DD` 保留 7 天快照，方便 `/api/history` 追踪。
-- **运行时配置管理**：`/api/config`（需 `Authorization: Bearer <ADMIN_TOKEN>`）支持 GET 查看、POST 更新运行时配置；GET 默认脱敏，`raw=1` 需要 `X-Config-Raw-Confirm: I_UNDERSTAND`，POST 会校验类型和范围，开启可用性/风险检测等危险项需要 `confirm: "I_UNDERSTAND"`。
+- **运行时配置管理**：`/api/config`（需 `Authorization: Bearer <ADMIN_TOKEN>`）支持 GET 查看、`export=1` 导出、POST 更新或导入运行时配置；GET 默认脱敏，`raw=1` 需要 `X-Config-Raw-Confirm: I_UNDERSTAND`，POST 会校验类型和范围，开启可用性/风险检测等危险项需要 `confirm: "I_UNDERSTAND"`。
 - **自适应深色/浅色主题**：首页自动跟随系统 `prefers-color-scheme`，暗色模式为默认，亮色模式自动切换配色。
 - **基础 CSP 安全头**：响应头包含 `content-security-policy`，限制 `default-src 'self'`、`script-src 'unsafe-inline'`、`img-src * data:`，防范 XSS。
 - **源去重标记**：部分数据源（如 `CMLiussss/*` 与 `addressesapi/*`）属于同一上游但子域不同，`aliasOf/signal` 字段用于统计独立信号；`hostmonit` 标记为核心源，失败时 `/health` 会进入 degraded。
@@ -194,7 +194,7 @@ curl -X POST \
 
 ## 运维建议
 
-- 正常运行靠 Cron 自动刷新；公开页面上的手动刷新只给持有 `REFRESH_TOKEN` 的管理员使用。管理接口只接受 `Authorization: Bearer ...`，不要把 token 放进 URL 查询参数。
+- 正常运行靠 Cron 自动刷新；公开页面上的手动刷新只给持有 `REFRESH_TOKEN` 的管理员使用。管理接口只接受 `Authorization: Bearer ...`，不要把 token 放进 URL 查询参数；页面侧 token 仅保存在当前 JS 内存，不写入 `sessionStorage`。
 - `CF_API_TOKEN` 只给目标域名 Zone 的 DNS Edit 权限，不要给 Account 全局权限，也不要写进 `wrangler.toml`；只能通过 Cloudflare secret 配置。
 - `robots.txt` 只能减少搜索引擎索引，不是访问控制；真正敏感的接口必须依赖 Bearer token 鉴权。
 - 如果某个子域 A 记录少于 `DNS_TOP_N`，先看 `/api/dns/current` 的 `lastSync`：没有错误通常代表该运营商候选不足或被 DNS 黑名单过滤。

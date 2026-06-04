@@ -41,7 +41,11 @@ const checks = [
   ['stage5 plain homepage', source.includes('function renderPlainHome') && source.includes('params.get("plain") === "1"')],
   ['stage5 network card', source.includes('我的网络信息') && source.includes('visitor.asn') && source.includes('visitor.colo')],
   ['stage5 admin trend svg', source.includes('trendSvg') && source.includes('7天节点数量趋势')],
-  ['version 3.8.0', source.includes('const VERSION = "3.8.0"') && readme.includes('version-3.8.0-blue')],
+  ['refresh running lock', source.includes('refresh:running') && source.includes('refresh-running')],
+  ['admin tokens memory only', !source.includes('sessionStorage') && source.includes('__cfBestIpAdminToken') && source.includes('let refreshToken')],
+  ['config import export', source.includes('params.get("export") === "1"') && source.includes('format: "cf-best-ip-config-v1"') && source.includes('imported: Boolean')],
+  ['readme security batch 1', readme.includes('refresh:running') && readme.includes('仅保存在当前 JS 内存') && readme.includes('导入运行时配置')],
+  ['version 3.8.1', source.includes('const VERSION = "3.8.1"') && readme.includes('version-3.8.1-blue')],
 ];
 for (const [name, ok] of checks) {
   if (!ok) throw new Error(`check failed: ${name}`);

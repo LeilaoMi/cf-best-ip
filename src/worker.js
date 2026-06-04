@@ -41,7 +41,7 @@ import { isCfNativeIp } from "./cidr.js";
 import { planDnsRecordSync } from "./dns.js";
 import { applyStabilityScores, countByCarrier, qualityGuard, sourceHealth } from "./scoring.js";
 
-const VERSION = "3.8.0";
+const VERSION = "3.8.1";
 
 const DEFAULT_CFG = {
   topN: 30,
@@ -1495,16 +1495,21 @@ async function handle(request, env, ctx) {
       if (raw && request.headers.get("x-config-raw-confirm") !== "I_UNDERSTAND") {
         return json({ ok: false, error: "raw-config-confirm-required", hint: "Set X-Config-Raw-Confirm: I_UNDERSTAND" }, { status: 400 });
       }
-      return json({ ok: true, config: raw ? cfg : redactConfig(cfg), defaults: raw ? DEFAULT_CFG : redactConfig(DEFAULT_CFG), redacted: !raw });
+      const payload = { ok: true, config: raw ? cfg : redactConfig(cfg), defaults: raw ? DEFAULT_CFG : redactConfig(DEFAULT_CFG), redacted: !raw };
+      if (params.get("export") === "1") {
+        return json({ ...payload, exportedAt: Date.now(), format: "cf-best-ip-config-v1" });
+      }
+      return json(payload);
     }
     if (request.method === "POST" || request.method === "PUT") {
       try {
         const body = await request.json();
         const current = await getConfig(env);
-        const { patch, changedKeys, dangerousKeys } = sanitizeConfigPatch(body, current);
+        const input = body?.config && typeof body.config === "object" && !Array.isArray(body.config) ? { ...body.config, confirm: body.confirm } : body;
+        const { patch, changedKeys, dangerousKeys } = sanitizeConfigPatch(input, current);
         const next = { ...current, ...patch };
         await kvSet(env, "config", next);
-        return json({ ok: true, config: redactConfig(next), changedKeys, dangerousKeys });
+        return json({ ok: true, config: redactConfig(next), changedKeys, dangerousKeys, imported: Boolean(body?.config) });
       } catch (e) {
         return json({ ok: false, error: String(e && e.message || e) }, { status: 400 });
       }
@@ -1522,9 +1527,21 @@ async function handle(request, env, ctx) {
     if (remain > 0) {
       return json({ ok: false, error: "rate-limited", retryAfter: remain, hint: `请 ${remain} 秒后再试` }, { status: 429 });
     }
-    await env.KV?.put("refresh:cooldown", String(Date.now()), { expirationTtl: 120 });
-    const result = await runFullTest(env, ctx, { waitForDns: true });
-    return json({ ok: true, count: result.ips.length, elapsedMs: result.elapsedMs, dnsSync: result.dnsSync, sourceStats: result.sourceStats });
+    const runningRaw = await env.KV?.get("refresh:running");
+    const runningAt = runningRaw ? Number(runningRaw) : 0;
+    if (runningAt && Date.now() - runningAt < 5 * 60 * 1000) {
+      return json({ ok: false, error: "refresh-running", hint: "已有刷新任务正在运行，请稍后再试" }, { status: 409 });
+    }
+    await env.KV?.put("refresh:cooldown", String(Date.now()), { expirationTtl: 300 });
+    await env.KV?.put("refresh:running", String(Date.now()), { expirationTtl: 300 });
+    try {
+      const result = await runFullTest(env, ctx, { waitForDns: true });
+      await env.KV?.delete("refresh:running");
+      return json({ ok: true, count: result.ips.length, elapsedMs: result.elapsedMs, dnsSync: result.dnsSync, sourceStats: result.sourceStats });
+    } catch (e) {
+      await env.KV?.delete("refresh:running");
+      throw e;
+    }
   }
 
   if (path === "/api/dns/current") {
@@ -1592,7 +1609,7 @@ export default {
 // 14. HTML 模板
 // ============================================================
 function renderAdminLogin() {
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理控制台登录</title><style>body{margin:0;background:#0a0d12;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center;min-height:100vh}.card{width:min(420px,calc(100vw - 32px));background:#11161d;border:1px solid #1f2630;border-radius:14px;padding:20px}h1{font-size:22px;margin:0 0 10px}.mut{color:#8b949e;font-size:13px;line-height:1.7}input{width:100%;box-sizing:border-box;margin:14px 0 10px;padding:11px;border-radius:8px;border:1px solid #1f2630;background:#0d1117;color:#e6edf3}.btn{width:100%;background:#1f6feb;color:#fff;border:0;border-radius:8px;padding:11px;cursor:pointer}</style></head><body><div class="card"><h1>管理控制台</h1><div class="mut">请输入 ADMIN_TOKEN。Token 只保存在当前浏览器会话，不会写入服务器。</div><input id="token" type="password" placeholder="ADMIN_TOKEN"><button class="btn" id="go">进入</button></div><script>document.getElementById('go').onclick=async()=>{const t=document.getElementById('token').value.trim();if(!t)return;sessionStorage.setItem('adminToken',t);try{const r=await fetch('/admin',{headers:{'Authorization':'Bearer '+t}});if(r.ok){document.open();document.write(await r.text());document.close()}else{alert('认证失败，请检查 Token')}}catch(e){alert('请求失败: '+e.message)}};</script></body></html>`;
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理控制台登录</title><style>body{margin:0;background:#0a0d12;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center;min-height:100vh}.card{width:min(420px,calc(100vw - 32px));background:#11161d;border:1px solid #1f2630;border-radius:14px;padding:20px}h1{font-size:22px;margin:0 0 10px}.mut{color:#8b949e;font-size:13px;line-height:1.7}input{width:100%;box-sizing:border-box;margin:14px 0 10px;padding:11px;border-radius:8px;border:1px solid #1f2630;background:#0d1117;color:#e6edf3}.btn{width:100%;background:#1f6feb;color:#fff;border:0;border-radius:8px;padding:11px;cursor:pointer}</style></head><body><div class="card"><h1>管理控制台</h1><div class="mut">请输入 ADMIN_TOKEN。Token 只保存在当前浏览器会话，不会写入服务器。</div><input id="token" type="password" placeholder="ADMIN_TOKEN"><button class="btn" id="go">进入</button></div><script>globalThis.__cfBestIpAdminToken='';document.getElementById('go').onclick=async()=>{const t=document.getElementById('token').value.trim();if(!t)return;globalThis.__cfBestIpAdminToken=t;try{const r=await fetch('/admin',{headers:{'Authorization':'Bearer '+t}});if(r.ok){document.open();document.write(await r.text());document.close();globalThis.__cfBestIpAdminToken=t}else{globalThis.__cfBestIpAdminToken='';alert('认证失败，请检查 Token')}}catch(e){alert('请求失败: '+e.message)}};</script></body></html>`;
 }
 
 function renderAdmin(data, visitor) {
@@ -1639,7 +1656,7 @@ body{margin:0;background:#0a0d12;color:#e6edf3;font-family:-apple-system,BlinkMa
 <div class="section"><h2>稳定分 Top 20</h2><div class="panel"><table><thead><tr><th>#</th><th>IP</th><th>线路</th><th>国家</th><th>稳定分</th><th>延迟</th><th>来源</th></tr></thead><tbody>${topRows}</tbody></table></div></div>
 <div class="section"><h2>数据源健康</h2><div class="panel"><table><thead><tr><th>数据源</th><th>数量</th><th>状态</th></tr></thead><tbody>${sourceRows}</tbody></table></div></div>
 </div><script>
-document.getElementById('refresh').onclick=async(e)=>{const btn=e.target;const token=sessionStorage.getItem('adminToken')||prompt('输入 ADMIN_TOKEN');if(!token)return;sessionStorage.setItem('adminToken',token);btn.disabled=true;btn.textContent='刷新中…';try{const r=await fetch('/api/refresh',{method:'POST',headers:{authorization:'Bearer '+token}}).then(r=>r.json());if(r.ok){btn.textContent='完成';setTimeout(()=>location.reload(),800)}else{if(r.error==='unauthorized')sessionStorage.removeItem('adminToken');btn.textContent=r.hint||r.error||'失败';setTimeout(()=>{btn.disabled=false;btn.textContent='手动刷新'},3000)}}catch(err){btn.textContent=err.message;btn.disabled=false}}
+let adminToken=globalThis.__cfBestIpAdminToken||'';document.getElementById('refresh').onclick=async(e)=>{const btn=e.target;const token=adminToken||prompt('输入 ADMIN_TOKEN');if(!token)return;adminToken=token;globalThis.__cfBestIpAdminToken=token;btn.disabled=true;btn.textContent='刷新中…';try{const r=await fetch('/api/refresh',{method:'POST',headers:{authorization:'Bearer '+token}}).then(r=>r.json());if(r.ok){btn.textContent='完成';setTimeout(()=>location.reload(),800)}else{if(r.error==='unauthorized'){adminToken='';globalThis.__cfBestIpAdminToken=''}btn.textContent=r.hint||r.error||'失败';setTimeout(()=>{btn.disabled=false;btn.textContent='手动刷新'},3000)}}catch(err){btn.textContent=err.message;btn.disabled=false}}
 </script></body></html>`;
 }
 
@@ -2108,17 +2125,18 @@ function tickCountdown() {
 tickCountdown();
 setInterval(tickCountdown, 1000);
 
+let refreshToken = '';
 document.getElementById('manualRefresh').onclick = async (e) => {
   const btn = e.target;
-  const token = sessionStorage.getItem('refreshToken') || prompt('输入 REFRESH_TOKEN（只保存在当前浏览器会话）');
+  const token = refreshToken || prompt('输入 REFRESH_TOKEN（仅保存在当前页面内存）');
   if (!token) return;
-  sessionStorage.setItem('refreshToken', token);
+  refreshToken = token;
   btn.disabled = true; btn.textContent = '⏳ 抓取中…';
   try {
     const r = await fetch('/api/refresh', { method: 'POST', headers: { authorization: 'Bearer ' + token } }).then(r => r.json());
     if (r.ok) { btn.textContent = '✓ 完成，刷新页面'; setTimeout(() => location.reload(), 800); }
     else {
-      if (r.error === 'unauthorized') sessionStorage.removeItem('refreshToken');
+      if (r.error === 'unauthorized') refreshToken = '';
       btn.textContent = '✗ ' + (r.hint || r.error || '失败');
       setTimeout(() => { btn.disabled = false; btn.textContent = '🔐 手动刷新'; }, 3000);
     }
