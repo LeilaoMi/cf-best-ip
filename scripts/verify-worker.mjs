@@ -10,6 +10,7 @@ const scheduledWorkflow = fs.readFileSync(new URL('../.github/workflows/schedule
 const checks = [
   ['has ipwho.is https', source.includes('https://ipwho.is/batch')],
   ['has csp header', source.includes('content-security-policy')],
+  ['csp nonce', source.includes('function makeNonce') && source.includes('script-src ${scriptSrc}') && source.includes('<script nonce=')],
   ['admin api no query token', source.includes('function adminToken(request)') && source.includes('return bearerToken(request);')],
   ['config sanitizer', source.includes('function sanitizeConfigPatch') && source.includes('dangerous config requires confirm=I_UNDERSTAND')],
   ['config raw confirm', source.includes('x-config-raw-confirm')],
@@ -32,6 +33,9 @@ const checks = [
   ['source alias signal stats', source.includes('sourceSignalName') && source.includes('independentSignals')],
   ['sub cache headers', source.includes('SUB_CACHE_HEADERS') && source.includes('public, max-age=300')],
   ['dns managed query request count', source.includes('function listManagedARecords') && source.includes('cfApiRequests')],
+  ['api ips access guard', source.includes('function requireApiIpsAccess') && source.includes('API_IPS_REQUIRE_TOKEN') && toml.includes('API_IPS_RATE_LIMIT') && readme.includes('API_IPS_REQUIRE_TOKEN')],
+  ['optional aaaa sync', source.includes('CF_DNS_IPV6') && source.includes('AAAA') && toml.includes('CF_DNS_IPV6') && readme.includes('CF_DNS_IPV6')],
+  ['durable refresh lock', source.includes('export class RefreshLock') && source.includes('env.REFRESH_LOCK') && toml.includes('REFRESH_LOCK') && readme.includes('Durable Object 刷新锁')],
   ['notify error persistence', source.includes('notify:lastError') && source.includes('Telegram notify failed')],
   ['public refresh warning', source.includes('publicRefreshEnabled') && source.includes('public-refresh-warning')],
   ['client test resource guard', source.includes('getClientTestConcurrency') && source.includes('MAX_CLIENT_TEST_ROWS') && source.includes('document.hidden')],
@@ -50,7 +54,7 @@ const checks = [
   ['readme security batch 1', readme.includes('refresh:running') && readme.includes('仅保存在当前 JS 内存') && readme.includes('导入运行时配置')],
   ['theme switcher', source.includes('data-theme-choice="system"') && source.includes('data-theme-choice="aurora"') && source.includes('cf-best-ip-theme')],
   ['readme theme switcher', readme.includes('深海 / 浅色 / 极光 / 琥珀')],
-  ['version 3.8.3', source.includes('const VERSION = "3.8.3"') && readme.includes('version-3.8.3-blue')],
+  ['version 3.9.0', source.includes('const VERSION = "3.9.0"') && readme.includes('version-3.9.0-blue')],
 ];
 for (const [name, ok] of checks) {
   if (!ok) throw new Error(`check failed: ${name}`);

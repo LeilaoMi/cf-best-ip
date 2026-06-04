@@ -20,6 +20,9 @@
  *    ALLOWED_HOSTS             可选，逗号分隔的页面/API 入口 host 白名单
  *    CF_DNS_BY_CARRIER         可选，"1" 启用按运营商分别同步 (ct./cu./cm. 前缀)
  *    DNS_TOP_N                 可选，DNS 同步取前 N 个 IP，默认 10
+ *    CF_DNS_IPV6                可选，设 "1" 同步 AAAA 记录（默认关闭）
+ *    API_IPS_REQUIRE_TOKEN      可选，设 "1" 后 /api/ips 需要 Bearer token
+ *    API_IPS_RATE_LIMIT         可选，/api/ips 每 IP 每分钟限额，默认 60
  *    REFRESH_TOKEN             可选但强烈建议，手动刷新 /api/refresh 的 Bearer token
  *    ALLOW_PUBLIC_REFRESH      可选，设 "1" 才允许无 token 手动刷新（不推荐）
  *    TELEGRAM_BOT_TOKEN /
@@ -43,7 +46,7 @@ import { isCfNativeIp } from "./cidr.js";
 import { planDnsRecordSync } from "./dns.js";
 import { applyStabilityScores, countByCarrier, qualityGuard, sourceHealth } from "./scoring.js";
 
-const VERSION = "3.8.3";
+const VERSION = "3.9.0";
 
 const DEFAULT_CFG = {
   topN: 30,
@@ -191,12 +194,15 @@ const SECURITY_HEADERS = {
   "x-content-type-options": "nosniff",
   "referrer-policy": "same-origin",
   "x-frame-options": "DENY",
-  "content-security-policy": "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src * data:; connect-src 'self'",
 };
 const NO_STORE_HEADERS = { "cache-control": "no-store, max-age=0" };
 const SUB_CACHE_HEADERS = { "cache-control": "public, max-age=300" };
-function responseHeaders(extra = {}) {
-  return { ...SECURITY_HEADERS, ...NO_STORE_HEADERS, ...extra };
+function cspHeader(nonce) {
+  const scriptSrc = nonce ? `'nonce-${nonce}'` : "'self'";
+  return `default-src 'self'; script-src ${scriptSrc}; style-src 'unsafe-inline'; img-src * data:; connect-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'`;
+}
+function responseHeaders(extra = {}, opts = {}) {
+  return { ...SECURITY_HEADERS, "content-security-policy": cspHeader(opts.nonce), ...NO_STORE_HEADERS, ...extra };
 }
 function json(obj, init = {}) {
   return new Response(JSON.stringify(obj, null, 2), {
@@ -210,8 +216,14 @@ function text(body, init = {}) {
     headers: responseHeaders({ "content-type": "text/plain; charset=utf-8", "access-control-allow-origin": "*", ...(init.headers || {}) }),
   });
 }
-function html(body) {
-  return new Response(body, { headers: responseHeaders({ "content-type": "text/html; charset=utf-8" }) });
+function makeNonce() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return btoa(String.fromCharCode(...bytes));
+}
+function html(body, nonce = makeNonce()) {
+  const rendered = typeof body === "function" ? body(nonce) : body;
+  return new Response(rendered, { headers: responseHeaders({ "content-type": "text/html; charset=utf-8" }, { nonce }) });
 }
 function withTimeout(promise, ms) {
   return Promise.race([
@@ -318,6 +330,27 @@ function requireRefreshAuth(request, env) {
   if (!constantTimeEqual(token, env.REFRESH_TOKEN)) {
     return json({ ok: false, error: "unauthorized", hint: "需要 Authorization: Bearer <REFRESH_TOKEN> 或 <ADMIN_TOKEN>" }, { status: 401 });
   }
+  return null;
+}
+function isApiIpsAuthorized(request, env) {
+  const token = bearerToken(request);
+  if (env.ADMIN_TOKEN && constantTimeEqual(token, env.ADMIN_TOKEN)) return true;
+  return Boolean(env.API_IPS_TOKEN && constantTimeEqual(token, env.API_IPS_TOKEN));
+}
+async function requireApiIpsAccess(request, env) {
+  if (env.API_IPS_REQUIRE_TOKEN === "1" && !isApiIpsAuthorized(request, env)) {
+    return json({ ok: false, error: "unauthorized", hint: "需要 Authorization: Bearer <API_IPS_TOKEN> 或 <ADMIN_TOKEN>" }, { status: 401 });
+  }
+  if (env.API_IPS_RATE_LIMIT === "0" || !env.KV) return null;
+  const limit = Math.max(1, Number(env.API_IPS_RATE_LIMIT || 60));
+  const now = Math.floor(Date.now() / 60000);
+  const ip = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown";
+  const key = `rate:api_ips:${now}:${ip}`;
+  const count = Number(await env.KV.get(key) || 0) + 1;
+  if (count > limit && !isApiIpsAuthorized(request, env)) {
+    return json({ ok: false, error: "rate-limited", retryAfter: 60 }, { status: 429, headers: { "retry-after": "60" } });
+  }
+  await env.KV.put(key, String(count), { expirationTtl: 120 });
   return null;
 }
 
@@ -1034,15 +1067,15 @@ async function cfApiJson(env, path, init = {}) {
   }
   return j || { success: true, result: null };
 }
-async function listRecords(env, name) {
-  const j = await cfApiJson(env, `/zones/${env.CF_ZONE_ID}/dns_records?type=A&name=${encodeURIComponent(name)}&per_page=100`);
+async function listRecords(env, name, type = "A") {
+  const j = await cfApiJson(env, `/zones/${env.CF_ZONE_ID}/dns_records?type=${encodeURIComponent(type)}&name=${encodeURIComponent(name)}&per_page=100`);
   return j.result || [];
 }
-async function listAllARecords(env) {
+async function listAllRecords(env, type = "A") {
   const all = [];
   let page = 1;
   while (true) {
-    const j = await cfApiJson(env, `/zones/${env.CF_ZONE_ID}/dns_records?type=A&per_page=100&page=${page}`);
+    const j = await cfApiJson(env, `/zones/${env.CF_ZONE_ID}/dns_records?type=${encodeURIComponent(type)}&per_page=100&page=${page}`);
     const rows = j.result || [];
     all.push(...rows);
     const info = j.result_info || {};
@@ -1051,13 +1084,13 @@ async function listAllARecords(env) {
   }
   return all;
 }
-async function listManagedARecords(env, names) {
+async function listManagedRecords(env, names, type = "A") {
   const byName = new Map();
   const unique = [...new Set((names || []).filter(Boolean))];
   if (!unique.length) return byName;
   if (unique.length > 12) {
     const managed = new Set(unique);
-    const allRecords = await listAllARecords(env);
+    const allRecords = await listAllRecords(env, type);
     for (const r of allRecords) {
       if (!managed.has(r.name)) continue;
       if (!byName.has(r.name)) byName.set(r.name, []);
@@ -1066,12 +1099,15 @@ async function listManagedARecords(env, names) {
     byName.cfApiRequests = 1;
     return byName;
   }
-  const rows = await pMap(unique, async name => ({ name, records: await listRecords(env, name) }), 4);
+  const rows = await pMap(unique, async name => ({ name, records: await listRecords(env, name, type) }), 4);
   for (const row of rows) {
     if (row?.name) byName.set(row.name, Array.isArray(row.records) ? row.records : []);
   }
   byName.cfApiRequests = unique.length;
   return byName;
+}
+async function listManagedARecords(env, names) {
+  return listManagedRecords(env, names, "A");
 }
 function getRootFromRecord(recordName) {
   return recordName && recordName.includes(".") ? recordName.split(".").slice(1).join(".") : "";
@@ -1120,20 +1156,21 @@ async function resolveViaDoh(url) {
   const r = await withTimeout(fetch(url, { headers: { accept: "application/dns-json" } }), 5000);
   if (!r.ok) return [];
   const j = await r.json();
-  return (j.Answer || []).filter(x => x.type === 1 && x.data).map(x => x.data);
+  return (j.Answer || []).filter(x => (x.type === 1 || x.type === 28) && x.data).map(x => x.data);
 }
 async function verifyDnsRecords(results) {
   const targets = results.filter(r => r?.name && r.ips?.length);
   const checks = await pMap(targets, async (r) => {
-    const cfUrl = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(r.name)}&type=A`;
-    const googleUrl = `https://dns.google/resolve?name=${encodeURIComponent(r.name)}&type=A`;
+    const type = r.type || "A";
+    const cfUrl = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(r.name)}&type=${encodeURIComponent(type)}`;
+    const googleUrl = `https://dns.google/resolve?name=${encodeURIComponent(r.name)}&type=${encodeURIComponent(type)}`;
     const [cf, google] = await Promise.all([
       resolveViaDoh(cfUrl).catch(() => []),
       resolveViaDoh(googleUrl).catch(() => []),
     ]);
     const expected = new Set(r.ips);
     const matched = Array.from(new Set([...cf, ...google])).filter(ip => expected.has(ip));
-    return { name: r.name, expected: r.ips.length, cloudflare: cf.length, google: google.length, matched: matched.length, ok: matched.length > 0 };
+    return { name: r.name, type, expected: r.ips.length, cloudflare: cf.length, google: google.length, matched: matched.length, ok: matched.length > 0 };
   }, 3);
   return { ok: checks.every(x => x.ok), checkedAt: Date.now(), checks };
 }
@@ -1147,12 +1184,13 @@ async function batchDnsRecords(env, deletes, posts) {
     body: JSON.stringify(body),
   });
 }
-async function syncRecordFromExisting(env, name, ips, topN, existing) {
-  const plan = planDnsRecordSync(name, ips, topN, existing, env.DNS_MAX_CHANGE_RATIO || 0.3);
-  if (plan.skipped) return plan;
+async function syncRecordFromExisting(env, name, ips, topN, existing, type = "A") {
+  const plan = planDnsRecordSync(name, ips, topN, existing, env.DNS_MAX_CHANGE_RATIO || 0.3, type);
+  if (plan.skipped) return { ...plan, type };
   await batchDnsRecords(env, plan.deletes, plan.posts);
   return {
     name,
+    type,
     ips: plan.ips,
     kept: plan.kept,
     added: plan.added,
@@ -1177,21 +1215,32 @@ async function syncAllDns(env, alive) {
     const root = getRootDomain(env);
     const managedNames = getManagedDnsNames(env);
     const byName = await listManagedARecords(env, managedNames);
+    let cfApiRequests = Number(byName.cfApiRequests || 0);
 
     const autoName = getAutoRecordName(env);
-    if (autoName) results.push(await syncRecordFromExisting(env, autoName, pool, topN, byName.get(autoName) || []));
-    results.push(await syncRecordFromExisting(env, env.CF_RECORD_NAME, pool, topN, byName.get(env.CF_RECORD_NAME) || []));
+    if (autoName) results.push(await syncRecordFromExisting(env, autoName, pool.filter(x => !(x.ip || "").includes(":")), topN, byName.get(autoName) || [], "A"));
+    results.push(await syncRecordFromExisting(env, env.CF_RECORD_NAME, pool.filter(x => !(x.ip || "").includes(":")), topN, byName.get(env.CF_RECORD_NAME) || [], "A"));
 
     if (env.CF_DNS_BY_CARRIER === "1" && root) {
       const groups = { CT: "ct", CU: "cu", CM: "cm" };
       for (const [carrier, prefix] of Object.entries(groups)) {
         const name = `${prefix}.${root}`;
-        const subset = pool.filter(x => x.carrier === carrier);
-        if (subset.length) results.push(await syncRecordFromExisting(env, name, subset, topN, byName.get(name) || []));
+        const subset = pool.filter(x => x.carrier === carrier && !(x.ip || "").includes(":"));
+        if (subset.length) results.push(await syncRecordFromExisting(env, name, subset, topN, byName.get(name) || [], "A"));
+      }
+    }
+    if (env.CF_DNS_IPV6 === "1") {
+      const v6Pool = pool.filter(x => (x.ip || "").includes(":"));
+      if (v6Pool.length) {
+        const byNameV6 = await listManagedRecords(env, managedNames, "AAAA");
+        cfApiRequests += Number(byNameV6.cfApiRequests || 0);
+        if (autoName) results.push(await syncRecordFromExisting(env, autoName, v6Pool, topN, byNameV6.get(autoName) || [], "AAAA"));
+        results.push(await syncRecordFromExisting(env, env.CF_RECORD_NAME, v6Pool, topN, byNameV6.get(env.CF_RECORD_NAME) || [], "AAAA"));
       }
     }
     const verification = await verifyDnsRecords(results).catch(e => ({ ok: false, error: String(e && e.message || e), checkedAt: Date.now(), checks: [] }));
-    const summary = { ok: true, startedAt, finishedAt: Date.now(), elapsedMs: Date.now() - startedAt, topN, cfApiRequests: byName.cfApiRequests || results.length, results, verification };
+    const writeRequests = results.filter(r => !r.skipped).length;
+    const summary = { ok: true, startedAt, finishedAt: Date.now(), elapsedMs: Date.now() - startedAt, topN, cfApiRequests: cfApiRequests + writeRequests, ipv6Enabled: env.CF_DNS_IPV6 === "1", results, verification };
     await kvSet(env, "dns:lastSync", summary);
     // 写入当日 DNS 同步历史（7 天 TTL）
     const day = new Date().toISOString().slice(0, 10);
@@ -1472,6 +1521,8 @@ async function handle(request, env, ctx) {
 
   // ---- JSON 列表 ----
   if (path === "/api/ips") {
+    const accessError = await requireApiIpsAccess(request, env);
+    if (accessError) return accessError;
     const filtered = applyFilter(ips, params, requesterColo, cfg);
     return json({
       ok: true,
@@ -1571,19 +1622,25 @@ async function handle(request, env, ctx) {
     if (remain > 0) {
       return json({ ok: false, error: "rate-limited", retryAfter: remain, hint: `请 ${remain} 秒后再试` }, { status: 429 });
     }
-    const runningRaw = await env.KV?.get("refresh:running");
+    const doLock = await acquireRefreshLock(env);
+    if (doLock?.locked) {
+      return json({ ok: false, error: "refresh-running", retryAfter: doLock.retryAfter || 60, hint: "已有刷新任务正在运行，请稍后再试" }, { status: 409 });
+    }
+    const runningRaw = doLock ? null : await env.KV?.get("refresh:running");
     const runningAt = runningRaw ? Number(runningRaw) : 0;
     if (runningAt && Date.now() - runningAt < 5 * 60 * 1000) {
       return json({ ok: false, error: "refresh-running", hint: "已有刷新任务正在运行，请稍后再试" }, { status: 409 });
     }
     await env.KV?.put("refresh:cooldown", String(Date.now()), { expirationTtl: 300 });
-    await env.KV?.put("refresh:running", String(Date.now()), { expirationTtl: 300 });
+    if (!doLock) await env.KV?.put("refresh:running", String(Date.now()), { expirationTtl: 300 });
     try {
       const result = await runFullTest(env, ctx, { waitForDns: true });
-      await env.KV?.delete("refresh:running");
+      if (!doLock) await env.KV?.delete("refresh:running");
+      await doLock?.release?.();
       return json({ ok: true, count: result.ips.length, elapsedMs: result.elapsedMs, dnsSync: result.dnsSync, sourceStats: result.sourceStats });
     } catch (e) {
-      await env.KV?.delete("refresh:running");
+      if (!doLock) await env.KV?.delete("refresh:running");
+      await doLock?.release?.();
       throw e;
     }
   }
@@ -1608,7 +1665,7 @@ async function handle(request, env, ctx) {
   }
   if (path === "/admin") {
     const authError = requireAdminAuth(request, env);
-    if (authError) return html(renderAdminLogin());
+    if (authError) return html(renderAdminLogin);
     const lastDnsSync = await kvGet(env, "dns:lastSync", null);
     const lastError = await kvGet(env, "refresh:lastError", null);
     const history = [];
@@ -1617,7 +1674,7 @@ async function handle(request, env, ctx) {
       const snap = await kvGet(env, `ips:history:${d}`);
       if (snap) history.push({ date: d, count: snap.ips.length, byCarrier: countByCarrier(snap.ips), updatedAt: snap.updatedAt });
     }
-    return html(renderAdmin({ ...data, lastDnsSync, lastError, history }, visitor));
+    return html((nonce) => renderAdmin({ ...data, lastDnsSync, lastError, history }, visitor, nonce));
   }
 
   // ---- 页面 ----
@@ -1625,7 +1682,7 @@ async function handle(request, env, ctx) {
     const lastDnsSync = await kvGet(env, "dns:lastSync", null);
     const pageData = { ...data, lastDnsSync, publicRefreshEnabled: env.ALLOW_PUBLIC_REFRESH === "1" };
     if (params.get("plain") === "1") return html(renderPlainHome(pageData, visitor));
-    return html(renderHome(pageData, visitor));
+    return html((nonce) => renderHome(pageData, visitor, nonce));
   }
 
   return new Response("Not Found", { status: 404 });
@@ -1634,6 +1691,39 @@ async function handle(request, env, ctx) {
 // ============================================================
 // 12. 入口
 // ============================================================
+export class RefreshLock {
+  constructor(state) {
+    this.state = state;
+  }
+  async fetch(request) {
+    const url = new URL(request.url);
+    const ttlMs = Math.max(1, Number(url.searchParams.get("ttlMs") || 300000));
+    if (request.method === "DELETE") {
+      await this.state.storage.delete("runningAt");
+      return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+    }
+    if (request.method !== "POST") {
+      return new Response(JSON.stringify({ ok: false, error: "method-not-allowed" }), { status: 405, headers: { "content-type": "application/json" } });
+    }
+    const now = Date.now();
+    const runningAt = await this.state.storage.get("runningAt");
+    if (runningAt && now - Number(runningAt) < ttlMs) {
+      return new Response(JSON.stringify({ ok: false, error: "refresh-running", runningAt, retryAfter: Math.ceil((ttlMs - (now - Number(runningAt))) / 1000) }), { status: 409, headers: { "content-type": "application/json" } });
+    }
+    await this.state.storage.put("runningAt", now);
+    return new Response(JSON.stringify({ ok: true, runningAt: now }), { headers: { "content-type": "application/json" } });
+  }
+}
+async function acquireRefreshLock(env) {
+  if (!env.REFRESH_LOCK) return null;
+  const id = env.REFRESH_LOCK.idFromName("global");
+  const stub = env.REFRESH_LOCK.get(id);
+  const r = await stub.fetch("https://refresh-lock/lock?ttlMs=300000", { method: "POST" });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok || body.ok === false) return { locked: true, ...body };
+  return { locked: false, release: () => stub.fetch("https://refresh-lock/lock", { method: "DELETE" }).catch(() => {}) };
+}
+
 export default {
   async fetch(request, env, ctx) {
     try { return await handle(request, env, ctx); }
@@ -1654,11 +1744,11 @@ export default {
 // ============================================================
 // 14. HTML 模板
 // ============================================================
-function renderAdminLogin() {
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理控制台登录</title><style>body{margin:0;background:#0a0d12;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center;min-height:100vh}.card{width:min(420px,calc(100vw - 32px));background:#11161d;border:1px solid #1f2630;border-radius:14px;padding:20px}h1{font-size:22px;margin:0 0 10px}.mut{color:#8b949e;font-size:13px;line-height:1.7}input{width:100%;box-sizing:border-box;margin:14px 0 10px;padding:11px;border-radius:8px;border:1px solid #1f2630;background:#0d1117;color:#e6edf3}.btn{width:100%;background:#1f6feb;color:#fff;border:0;border-radius:8px;padding:11px;cursor:pointer}</style></head><body><div class="card"><h1>管理控制台</h1><div class="mut">请输入 ADMIN_TOKEN。Token 只保存在当前浏览器会话，不会写入服务器。</div><input id="token" type="password" placeholder="ADMIN_TOKEN"><button class="btn" id="go">进入</button></div><script>globalThis.__cfBestIpAdminToken='';document.getElementById('go').onclick=async()=>{const t=document.getElementById('token').value.trim();if(!t)return;globalThis.__cfBestIpAdminToken=t;try{const r=await fetch('/admin',{headers:{'Authorization':'Bearer '+t}});if(r.ok){document.open();document.write(await r.text());document.close();globalThis.__cfBestIpAdminToken=t}else{globalThis.__cfBestIpAdminToken='';alert('认证失败，请检查 Token')}}catch(e){alert('请求失败: '+e.message)}};</script></body></html>`;
+function renderAdminLogin(nonce) {
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理控制台登录</title><style>body{margin:0;background:#0a0d12;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center;min-height:100vh}.card{width:min(420px,calc(100vw - 32px));background:#11161d;border:1px solid #1f2630;border-radius:14px;padding:20px}h1{font-size:22px;margin:0 0 10px}.mut{color:#8b949e;font-size:13px;line-height:1.7}input{width:100%;box-sizing:border-box;margin:14px 0 10px;padding:11px;border-radius:8px;border:1px solid #1f2630;background:#0d1117;color:#e6edf3}.btn{width:100%;background:#1f6feb;color:#fff;border:0;border-radius:8px;padding:11px;cursor:pointer}</style></head><body><div class="card"><h1>管理控制台</h1><div class="mut">请输入 ADMIN_TOKEN。Token 只保存在当前浏览器会话，不会写入服务器。</div><input id="token" type="password" placeholder="ADMIN_TOKEN"><button class="btn" id="go">进入</button></div><script nonce="${nonce}">globalThis.__cfBestIpAdminToken='';document.getElementById('go').onclick=async()=>{const t=document.getElementById('token').value.trim();if(!t)return;globalThis.__cfBestIpAdminToken=t;try{const r=await fetch('/admin',{headers:{'Authorization':'Bearer '+t}});if(r.ok){document.open();document.write(await r.text());document.close();globalThis.__cfBestIpAdminToken=t}else{globalThis.__cfBestIpAdminToken='';alert('认证失败，请检查 Token')}}catch(e){alert('请求失败: '+e.message)}};</script></body></html>`;
 }
 
-function renderAdmin(data, visitor) {
+function renderAdmin(data, visitor, nonce) {
   const ips = (data.ips || []).slice().sort((a, b) => (b._score || 0) - (a._score || 0));
   const serviceHost = visitor.serviceHostname || "bestip.leilaomi.cc.cd";
   const root = visitor.root || "leilaomi.cc.cd";
@@ -1701,7 +1791,7 @@ body{margin:0;background:#0a0d12;color:#e6edf3;font-family:-apple-system,BlinkMa
 <div class="section"><h2>7 天趋势</h2><div class="panel">${trendSvg}<table><thead><tr><th>日期</th><th>总数</th><th>电信</th><th>联通</th><th>移动</th><th>通用</th></tr></thead><tbody>${histRows || '<tr><td colspan="6">暂无历史</td></tr>'}</tbody></table></div></div>
 <div class="section"><h2>稳定分 Top 20</h2><div class="panel"><table><thead><tr><th>#</th><th>IP</th><th>线路</th><th>国家</th><th>稳定分</th><th>延迟</th><th>来源</th></tr></thead><tbody>${topRows}</tbody></table></div></div>
 <div class="section"><h2>数据源健康</h2><div class="panel"><table><thead><tr><th>数据源</th><th>数量</th><th>状态</th></tr></thead><tbody>${sourceRows}</tbody></table></div></div>
-</div><script>
+</div><script nonce="${nonce}">
 let adminToken=globalThis.__cfBestIpAdminToken||'';document.getElementById('refresh').onclick=async(e)=>{const btn=e.target;const token=adminToken||prompt('输入 ADMIN_TOKEN');if(!token)return;adminToken=token;globalThis.__cfBestIpAdminToken=token;btn.disabled=true;btn.textContent='刷新中…';try{const r=await fetch('/api/refresh',{method:'POST',headers:{authorization:'Bearer '+token}}).then(r=>r.json());if(r.ok){btn.textContent='完成';setTimeout(()=>location.reload(),800)}else{if(r.error==='unauthorized'){adminToken='';globalThis.__cfBestIpAdminToken=''}btn.textContent=r.hint||r.error||'失败';setTimeout(()=>{btn.disabled=false;btn.textContent='手动刷新'},3000)}}catch(err){btn.textContent=err.message;btn.disabled=false}}
 </script></body></html>`;
 }
@@ -1713,7 +1803,7 @@ function renderPlainHome(data, visitor) {
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CloudFlare 优选 IP 极简页</title><style>body{font-family:ui-monospace,monospace;margin:16px;line-height:1.6}a{color:#0969da}pre{white-space:pre-wrap}</style></head><body><h1>CloudFlare 优选 IP 极简页</h1><p>更新：${updated} · 总数：${data.ips?.length || 0}</p><p>推荐域名：auto.${root} / ct.${root} / cu.${root} / cm.${root}</p><p><a href="/">返回完整页面</a> · <a href="/sub?format=csv">CSV</a> · <a href="/sub?format=jsonl">JSONL</a></p><pre>${ips.map(x => `${fmtAddr(x)} ${x.carrier || "CF"} ${x.country || ""} ${x.delay != null ? x.delay + "ms" : ""}`).join("\n")}</pre></body></html>`;
 }
 
-function renderHome(data, visitor) {
+function renderHome(data, visitor, nonce) {
   const ips = data.ips || [];
   const updated = data.updatedAt ? new Date(data.updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "（未运行）";
   const total = ips.length;
@@ -2049,7 +2139,7 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSyst
   </div>
 </div>
 
-<script>
+<script nonce="${nonce}">
 const tabs = document.querySelectorAll('.tab');
 const panes = document.querySelectorAll('.pane');
 const themeButtons = document.querySelectorAll('.themebtn');

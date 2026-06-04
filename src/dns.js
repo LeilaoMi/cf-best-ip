@@ -10,8 +10,8 @@ export function buildWantedIps(ips, topN) {
   return wanted;
 }
 
-export function planDnsRecordSync(name, ips, topN, existing, maxChangeRatio = 0.3) {
-  if (!ips?.length) return { skipped: true, name };
+export function planDnsRecordSync(name, ips, topN, existing, maxChangeRatio = 0.3, type = "A") {
+  if (!ips?.length) return { skipped: true, name, type };
   const current = Array.isArray(existing) ? existing : [];
   const ratio = Math.min(Math.max(Number(maxChangeRatio || 0.3), 0.05), 1);
   const maxChanges = current.length ? Math.max(1, Math.floor(topN * ratio)) : topN;
@@ -47,7 +47,7 @@ export function planDnsRecordSync(name, ips, topN, existing, maxChangeRatio = 0.
   for (const r of current) if (!wantedSet.has(r.content)) deletes.push(r.id);
   const posts = [];
   for (const ip of wanted) {
-    if (!existingMap.has(ip)) posts.push({ type: "A", name, content: ip, ttl: 60, proxied: false });
+    if (!existingMap.has(ip)) posts.push({ type, name, content: ip, ttl: 60, proxied: false });
   }
-  return { name, ips: wanted, deletes, posts, kept: current.length - deletes.length, added: posts.length, removed: deletes.length, maxChanges };
+  return { name, type, ips: wanted, deletes, posts, kept: current.length - deletes.length, added: posts.length, removed: deletes.length, maxChanges };
 }

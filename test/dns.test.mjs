@@ -23,7 +23,21 @@ test("planDnsRecordSync creates topN posts when no existing records", () => {
   assert.deepEqual(plan.deletes, []);
   assert.deepEqual(plan.ips, ["104.16.0.1", "104.16.0.2"]);
   assert.equal(plan.posts.length, 2);
+  assert.equal(plan.posts[0].type, "A");
   assert.equal(plan.posts[0].proxied, false);
+});
+
+test("planDnsRecordSync supports AAAA records", () => {
+  const plan = planDnsRecordSync(
+    "cf.example.com",
+    [{ ip: "2606:4700::1" }, { ip: "2606:4700::2" }],
+    2,
+    [],
+    0.3,
+    "AAAA",
+  );
+  assert.equal(plan.type, "AAAA");
+  assert.deepEqual(plan.posts.map(x => x.type), ["AAAA", "AAAA"]);
 });
 
 test("planDnsRecordSync preserves current candidates and respects max changes", () => {
@@ -65,5 +79,6 @@ test("planDnsRecordSync skips empty candidate list", () => {
   assert.deepEqual(planDnsRecordSync("cf.example.com", [], 2, []), {
     skipped: true,
     name: "cf.example.com",
+    type: "A",
   });
 });

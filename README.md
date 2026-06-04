@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-orange)](https://workers.cloudflare.com/)
-[![Version](https://img.shields.io/badge/version-3.8.3-blue)]()
+[![Version](https://img.shields.io/badge/version-3.9.0-blue)]()
 
 > 在 Cloudflare Worker 上跑的 **CF 自家 IP 优选服务**:聚合社区主流数据源,经官方 CIDR 校验,按运营商 / 全局展示,自动同步到自定义子域 A 记录。
 
@@ -26,7 +26,7 @@ Cloudflare 在 [2024 年 12 月声明](https://www.landiannews.com/archives/1070
 | **校验** | 用 Cloudflare 官方 [`ips-v4`](https://www.cloudflare.com/ips-v4) 的 15 个 CIDR 段做位运算判定,**非 AS13335 段全部丢弃** |
 | **测速可信度** | 明确区分 `hostmonit` 来源实测与普通来源推荐；普通来源不冒充 Worker 实测 |
 | **展示** | 在 `bestip.<你的域名>` 显示产品化首页，`/admin` 提供管理控制台 |
-| **同步** | 自动写入优选池 A 记录:`auto.` `cf.` `ct.` `cu.` `cm.`；按托管域名查询 DNS，减少大 Zone API 压力 |
+| **同步** | 自动写入优选池 DNS only 记录：默认 A 记录 `auto.` `cf.` `ct.` `cu.` `cm.`；可选启用 AAAA；按托管域名查询 DNS，减少大 Zone API 压力 |
 | **通知** | Telegram(可选)，失败会记录到 `notify:lastError` |
 
 ---
@@ -116,8 +116,11 @@ wrangler deploy
 | 名 | 说明 |
 |---|---|
 | `CF_DNS_BY_CARRIER` | 设 `1` 启用三网分流（ct./cu./cm. 加上 auto./cf.） |
-| `DNS_TOP_N` | 每子域最多写多少条 A 记录，默认 10 |
+| `DNS_TOP_N` | 每子域最多写多少条 DNS 记录，默认 10 |
 | `DNS_MAX_CHANGE_RATIO` | 每个域名单次最多替换比例，默认 0.3 |
+| `CF_DNS_IPV6` | 设 `1` 后同步 `auto.` / `cf.` 的 AAAA 记录；默认关闭，避免客户端兼容性突变 |
+| `API_IPS_RATE_LIMIT` | `/api/ips` 每 IP 每分钟限额，默认 60；设 `0` 关闭 |
+| `API_IPS_REQUIRE_TOKEN` | 设 `1` 后 `/api/ips` 也需要 `Authorization: Bearer <API_IPS_TOKEN>` 或 `ADMIN_TOKEN` |
 | `ALLOWED_HOSTS` | 可选，逗号分隔的页面/API 入口 host 白名单；`/health` 仍放行便于监控 |
 | `ALLOW_PUBLIC_REFRESH` | 设 `1` 才允许无 token 手动刷新；不推荐公开使用 |
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | Telegram 通知 |
@@ -132,7 +135,7 @@ wrangler deploy
 |---|---|
 | `/` | 公开 IP 展示页（uouin 风格）；`?plain=1` 返回极简页 |
 | `POST /api/refresh` | 触发一次重新抓取（60s 冷却），需要 `Authorization: Bearer <REFRESH_TOKEN>`，除非显式设置 `ALLOW_PUBLIC_REFRESH=1` |
-| `/api/ips` | JSON 全量列表，每条带 `quality.testedBy/confidence`；参数见下表 |
+| `/api/ips` | JSON 全量列表，每条带 `quality.testedBy/confidence`；默认每 IP 每分钟限额 60，可选强制 Bearer token；参数见下表 |
 | `/api/stats` | 池子统计 + 最近一次 DNS 同步结果 + `publicRefreshEnabled` / `notifyLastError` |
 | `/health` | 轻量健康检查，返回 `status`、`reasons`、`lastErrorAt`、`criticalSourcesOk`，适合外部监控探活 |
 | `/api/diagnostics` | 诊断快照：节点数、三网分布、数据源健康、陈旧状态、DNS 同步、最近错误；需要 `ADMIN_TOKEN` |
@@ -177,20 +180,20 @@ curl -X POST \
 - **去重 key**:`(ip, port, carrier)` —— 同一 IP 在三网下可作 3 条独立记录(hostmonit 同 IP 同时为 CT 和 CM 最优时不会丢失数据)。
 - **稳定分排序**：优先保留上一批出现过的 IP，并综合 tested、来源数、延迟、丢包、速度排序，减少 DNS 大换血。
 - **质量下降保护**：如果本次总池、三网池、真实测速池明显缩水，或核心测速源异常导致线路池减少，保留上一批稳定结果并跳过 DNS 同步，避免错误数据污染线上域名。
-- **diff-based DNS sync**：已存在且仍在 wanted 中的记录**不动**，只删托管白名单记录中多余的 A 记录、创建缺失记录，并把最近一次同步结果写入 KV 的 `dns:lastSync`，方便 `/api/stats` 和 `/api/dns/current` 排查。
-- **DNS 生效验证**：同步后通过 Cloudflare / Google DoH 检查 `auto/cf/ct/cu/cm` 是否已解析到期望 IP，结果显示在首页、`/admin` 和 `/api/stats`；`dns:lastSync.cfApiRequests` 会记录本次 DNS 查询/写入大致 API 请求量。
+- **diff-based DNS sync**：已存在且仍在 wanted 中的记录**不动**，只删托管白名单记录中多余的 DNS only 记录、创建缺失记录，并把最近一次同步结果写入 KV 的 `dns:lastSync`，方便 `/api/stats` 和 `/api/dns/current` 排查。默认只同步 A 记录；`CF_DNS_IPV6=1` 时额外同步 `auto.` / `cf.` 的 AAAA 记录。
+- **DNS 生效验证**：同步后通过 Cloudflare / Google DoH 检查 `auto/cf/ct/cu/cm` 的 A/AAAA 是否已解析到期望 IP，结果显示在首页、`/admin` 和 `/api/stats`；`dns:lastSync.cfApiRequests` 会记录本次 DNS 查询/写入大致 API 请求量。
 - **变更阈值控制**：默认每个域名单次最多替换约 30% 记录，优先保留当前仍可用 A 记录，降低客户端连接波动。
 - **管理控制台**：`/admin` 需要 `ADMIN_TOKEN`，可查看 DNS 同步详情、最近错误、7 天趋势、稳定分 Top 20、数据源健康，并支持手动刷新。
 - **陈旧数据告警**：超过 8 小时未刷新时，首页、`/admin`、`/health`、`/api/diagnostics` 会明确提示。
 - **安全与缓存头**：HTML/API 响应默认 no-store，并带基础安全响应头；`/robots.txt` 避免索引 admin/API。
 - **Worker 平台限制**：Cloudflare Workers 禁止从 Worker 出口连接 CF 自家 IP（`connect()` 会失败），所以**本项目不在 Worker 内做 TCP 测速**。`hostmonit 实测` 才代表来源带延迟/丢包/速度；`来源推荐未测` 只代表通过 CF CIDR、地理与稳定分过滤。页面客户端测速只自动测当前线路前 10 个，移动端降低并发，页面隐藏时暂停。
-- **手动刷新保护**：`/api/refresh` 默认只接受 `POST + Bearer token`，并使用 `refresh:running` 运行锁阻止重复并发刷新。`ALLOW_PUBLIC_REFRESH=1` 仅建议临时调试；启用后首页和 `/api/stats` 会明确显示公开刷新风险。
+- **手动刷新保护**：`/api/refresh` 默认只接受 `POST + Bearer token`，并使用 Durable Object 刷新锁（降级为 KV `refresh:running`）阻止重复并发刷新。`ALLOW_PUBLIC_REFRESH=1` 仅建议临时调试；启用后首页和 `/api/stats` 会明确显示公开刷新风险。
 - **地理信息补全**：通过 ipwho.is（HTTPS，免费无 key）批量查询 IP 国家/城市/ASN，失败时自动回退到 ip-api.com；补全后会再次执行国家黑名单，未识别国家的 IP 不会被丢弃。
 - **DNS 同步历史**：`dns:lastSync` 记录最近一次同步结果，`dns:history:YYYY-MM-DD` 保留 7 天快照，方便 `/api/history` 追踪。
 - **域名边界保护**：推荐设置 `ROOT_DOMAIN`，所有托管 DNS 名称必须位于该根域下；可选 `ALLOWED_HOSTS` 限制页面/API 入口 host，降低误绑定域名风险。
 - **运行时配置管理**：`/api/config`（需 `Authorization: Bearer <ADMIN_TOKEN>`）支持 GET 查看、`export=1` 导出、POST 更新或导入运行时配置；GET 默认脱敏，`raw=1` 需要 `X-Config-Raw-Confirm: I_UNDERSTAND`，POST 会校验类型和范围，开启可用性/风险检测等危险项需要 `confirm: "I_UNDERSTAND"`。
 - **主题切换**：首页默认跟随系统 `prefers-color-scheme`，也可手动切换“深海 / 浅色 / 极光 / 琥珀”四种风格，选择会保存在浏览器本地。
-- **基础 CSP 安全头**：响应头包含 `content-security-policy`，限制 `default-src 'self'`、`script-src 'unsafe-inline'`、`img-src * data:`，防范 XSS。
+- **基础 CSP 安全头**：响应头包含 `content-security-policy`，HTML 脚本使用 nonce，限制 `default-src 'self'`、`base-uri 'self'`、`frame-ancestors 'none'`，降低 XSS 与嵌入风险。
 - **源去重标记**：部分数据源（如 `CMLiussss/*` 与 `addressesapi/*`）属于同一上游但子域不同，`aliasOf/signal` 字段用于统计独立信号；`hostmonit` 标记为核心源，失败时 `/health` 会进入 degraded。
 
 ---
@@ -201,7 +204,7 @@ curl -X POST \
 - `CF_API_TOKEN` 只给目标域名 Zone 的 DNS Edit 权限，不要给 Account 全局权限，也不要写进 `wrangler.toml`；只能通过 Cloudflare secret 配置。
 - `robots.txt` 只能减少搜索引擎索引，不是访问控制；真正敏感的接口必须依赖 Bearer token 鉴权。
 - 如果某个子域 A 记录少于 `DNS_TOP_N`，先看 `/api/dns/current` 的 `lastSync`：没有错误通常代表该运营商候选不足或被 DNS 黑名单过滤。
-- 本项目只同步 `auto.`、`cf.`、`ct.`、`cu.`、`cm.` 这组托管白名单 DNS only A 记录，不再自动清理 `proxy.`、`proxyip.`、`pNN.` 等可能被其他服务使用的历史记录。
+- 本项目只同步 `auto.`、`cf.`、`ct.`、`cu.`、`cm.` 这组托管白名单 DNS only 记录（默认 A；可选 AAAA），不再自动清理 `proxy.`、`proxyip.`、`pNN.` 等可能被其他服务使用的历史记录。
 - 如果某次刷新没有拿到可用 IP，或候选池相比上一批明显变差，Worker 会保留上一批稳定结果，跳过 DNS 同步，避免把可用域名清空或污染。
 
 ---
@@ -241,6 +244,7 @@ node scripts/verify-worker.mjs
 - 500 响应不暴露 stack
 - `/health` 包含 `status/reasons`
 - 版本号
+- CSP nonce / `/api/ips` 访问保护 / AAAA 可选同步 / Durable Object 刷新锁
 
 ## 📖 延伸阅读
 
