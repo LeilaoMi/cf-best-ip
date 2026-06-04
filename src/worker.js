@@ -1615,7 +1615,7 @@ function renderAdmin(data, visitor) {
   const syncHtml = syncRows.length ? syncRows.map(r => {
     const v = verifyRows.get(r.name);
     const vText = v ? (v.ok ? `已生效 ${v.matched}/${v.expected}` : `待传播 ${v.matched}/${v.expected}`) : "未验证";
-    return `<div class="card"><b>${r.name}</b><span>保留 ${r.kept || 0} · 新增 ${r.added || 0} · 删除 ${r.removed || 0} · 上限 ${r.maxChanges || "—"} · ${vText}</span></div>`;
+    return `<div class="card"><b>${r.name}</b><span>DNS only · 保留 ${r.kept || 0} · 新增 ${r.added || 0} · 删除 ${r.removed || 0} · 上限 ${r.maxChanges || "—"} · ${vText}</span></div>`;
   }).join("") : '<div class="empty">暂无 DNS 同步记录</div>';
   const histRows = history.map(h => `<tr><td>${h.date}</td><td>${h.count}</td><td>${h.byCarrier?.CT || 0}</td><td>${h.byCarrier?.CU || 0}</td><td>${h.byCarrier?.CM || 0}</td><td>${h.byCarrier?.CF || 0}</td></tr>`).join("");
   const trendSvg = (() => {
@@ -1696,7 +1696,7 @@ function renderHome(data, visitor) {
     <div class="sync-grid">${syncRows.map(r => {
       const v = verifyRows.get(r.name);
       const vText = v ? (v.ok ? `已生效 ${v.matched}/${v.expected}` : `待传播 ${v.matched}/${v.expected}`) : "未验证";
-      return `<div class="sync-item"><b>${r.name}</b><span>保留 ${r.kept || 0} · 新增 ${r.added || 0} · 删除 ${r.removed || 0} · ${vText}</span></div>`;
+      return `<div class="sync-item"><b>${r.name}</b><span>DNS only · 保留 ${r.kept || 0} · 新增 ${r.added || 0} · 删除 ${r.removed || 0} · ${vText}</span></div>`;
     }).join("")}</div>
   </section>` : "";
 

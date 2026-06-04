@@ -102,7 +102,7 @@ wrangler deploy
 | 名 | 说明 | 示例 |
 |---|---|---|
 | `KV` (binding) | KV namespace 绑定，变量名必须叫 `KV` | wrangler 创建后绑定 |
-| `CF_API_TOKEN` | CF API Token（Zone:DNS:Edit） | 在 [profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) 生成 |
+| `CF_API_TOKEN` | CF API Token（只给目标 Zone 的 DNS Edit 权限） | 在 [profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) 生成 |
 | `CF_ZONE_ID` | 你域名的 Zone ID | dashboard 域名概览页右下角 |
 | `SERVICE_HOSTNAME` | Worker 管理页 / API 入口，不参与优选 IP DNS 同步 | `bestip.example.com` |
 | `AUTO_RECORD_NAME` | 默认推荐优选池，会同步成 A 记录 | `auto.example.com` |
@@ -128,17 +128,36 @@ wrangler deploy
 
 | 路径 | 说明 |
 |---|---|
-| `/` | 公开 IP 展示页（uouin 风格） |
+| `/` | 公开 IP 展示页（uouin 风格）；`?plain=1` 返回极简页 |
 | `POST /api/refresh` | 触发一次重新抓取（60s 冷却），需要 `Authorization: Bearer <REFRESH_TOKEN>`，除非显式设置 `ALLOW_PUBLIC_REFRESH=1` |
-| `/api/ips` | JSON 全量列表，支持 `?carrier=CT/CU/CM&top=N`，每条带 `quality.testedBy/confidence` |
+| `/api/ips` | JSON 全量列表，每条带 `quality.testedBy/confidence`；参数见下表 |
 | `/api/stats` | 池子统计 + 最近一次 DNS 同步结果 + `publicRefreshEnabled` / `notifyLastError` |
 | `/health` | 轻量健康检查，返回 `status`、`reasons`、`lastErrorAt`、`criticalSourcesOk`，适合外部监控探活 |
 | `/api/diagnostics` | 诊断快照：节点数、三网分布、数据源健康、陈旧状态、DNS 同步、最近错误；需要 `ADMIN_TOKEN` |
 | `/api/config` | 运行时配置查看/修改（GET 默认脱敏 / `raw=1` 需确认头 / POST 写入需类型校验），需 `Authorization: Bearer <ADMIN_TOKEN>` |
-| `/api/dns/current` | 当前 4 子域的 DNS 记录 + 最近一次同步结果 |
+| `/api/dns/current` | 当前托管子域的 DNS only A 记录 + 最近一次同步结果 |
 | `/api/history?days=7` | 过去 N 天的快照 |
-| `/sub` | 纯文本订阅：`IP:port` 一行一条，可作 DDNS 用；公开缓存 300 秒降低重复抓取 |
+| `/sub` | 订阅输出；公开缓存 300 秒降低重复抓取，支持 `format=plain/csv/jsonl` |
 | `/api/preferred-ips` | EDT 格式订阅（Karing 等客户端适用） |
+
+常用查询参数：
+
+| 参数 | 适用接口 | 说明 |
+|---|---|---|
+| `carrier=CT,CU,CM` | `/api/ips`、`/sub` | 按电信/联通/移动筛选，`CMCC` 会归一为 `CM` |
+| `country=US,JP` | `/api/ips`、`/sub` | 按国家代码筛选，多个用逗号分隔 |
+| `colo=LAX,SJC` | `/api/ips`、`/sub` | 按 Cloudflare colo 筛选 |
+| `family=v4/v6` | `/api/ips`、`/sub` | 只返回 IPv4 或 IPv6 |
+| `port=443` | `/api/ips`、`/sub` | 按端口筛选 |
+| `maxDelay=300` | `/api/ips`、`/sub` | 只返回延迟不高于该值的节点 |
+| `minMbps=10` | `/api/ips`、`/sub` | 只返回速度不低于该值的节点 |
+| `exclude=1.1.1.1,2.2.2.2` | `/api/ips`、`/sub` | 排除指定 IP |
+| `smart=1` | `/api/ips`、`/sub` | 按访问者网络自动偏向推荐线路 |
+| `perCountry=1` | `/api/ips`、`/sub` | 每个国家最多取 N 个，避免单一国家占满结果 |
+| `perCountryN=2` | `/api/ips`、`/sub` | 配合 `perCountry=1` 使用 |
+| `top=50` / `limit=50` | `/api/ips`、`/sub` | 限制返回数量 |
+| `format=plain/csv/jsonl` | `/sub` | 订阅输出格式，默认 `plain` |
+| `comment=0` | `/sub` | 纯文本订阅不输出注释 |
 
 手动刷新示例：
 
@@ -176,8 +195,10 @@ curl -X POST \
 ## 运维建议
 
 - 正常运行靠 Cron 自动刷新；公开页面上的手动刷新只给持有 `REFRESH_TOKEN` 的管理员使用。管理接口只接受 `Authorization: Bearer ...`，不要把 token 放进 URL 查询参数。
+- `CF_API_TOKEN` 只给目标域名 Zone 的 DNS Edit 权限，不要给 Account 全局权限，也不要写进 `wrangler.toml`；只能通过 Cloudflare secret 配置。
+- `robots.txt` 只能减少搜索引擎索引，不是访问控制；真正敏感的接口必须依赖 Bearer token 鉴权。
 - 如果某个子域 A 记录少于 `DNS_TOP_N`，先看 `/api/dns/current` 的 `lastSync`：没有错误通常代表该运营商候选不足或被 DNS 黑名单过滤。
-- 本项目只同步 `auto.`、`cf.`、`ct.`、`cu.`、`cm.` 这组托管白名单记录，不再自动清理 `proxy.`、`proxyip.`、`pNN.` 等可能被其他服务使用的历史记录。
+- 本项目只同步 `auto.`、`cf.`、`ct.`、`cu.`、`cm.` 这组托管白名单 DNS only A 记录，不再自动清理 `proxy.`、`proxyip.`、`pNN.` 等可能被其他服务使用的历史记录。
 - 如果某次刷新没有拿到可用 IP，或候选池相比上一批明显变差，Worker 会保留上一批稳定结果，跳过 DNS 同步，避免把可用域名清空或污染。
 
 ---
