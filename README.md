@@ -281,4 +281,4 @@ node scripts/verify-worker.mjs
 
 ## 监控
 
-仓库包含 `.github/workflows/health-check.yml`，每 30 分钟请求 `https://bestip.leilaomi.cc.cd/health`，用于发现 Worker、Cron 或数据源异常。
+仓库包含 `.github/workflows/health-check.yml`，每 30 分钟请求 `https://bestip.leilaomi.cc.cd/health`，用于发现 Worker、Cron 或数据源异常。该 workflow 会最多重试 3 次并打印 `/health` JSON；如果 Worker 短暂返回 degraded/503，日志会保留 `status/reasons/sourceHealth`，方便区分外部数据源波动与真实服务故障。

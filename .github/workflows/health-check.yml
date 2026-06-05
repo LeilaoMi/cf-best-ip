@@ -12,19 +12,46 @@ jobs:
       - name: Check cf-best-ip health
         run: |
           set -euo pipefail
-          body="$(curl -fsS --max-time 20 https://bestip.leilaomi.cc.cd/health)"
-          echo "$body"
-          echo "$body" | jq -e '.ok == true'
-      - name: Source health gate
-        if: always()
-        run: |
-          body="$(curl -fsS --max-time 20 https://bestip.leilaomi.cc.cd/health)"
-          ok=$(echo "$body" | jq -r '.sourceHealth.ok // 0')
-          total=$(echo "$body" | jq -r '.sourceHealth.total // 0')
-          failed=$(echo "$body" | jq -r '.sourceHealth.failed // 0')
-          echo "Sources: $ok/$total ok, $failed failed"
-          # Fail if more than 60% of sources failed
+          url="https://bestip.leilaomi.cc.cd/health"
+          attempts=3
+          sleep_seconds=30
+          last_body=""
+          last_code="000"
+
+          for i in $(seq 1 "$attempts"); do
+            echo "Attempt $i/$attempts: $url"
+            response="$(curl -sS --max-time 20 -w '\n%{http_code}' "$url" || printf '\n000')"
+            last_code="$(printf '%s' "$response" | tail -n1)"
+            last_body="$(printf '%s' "$response" | sed '$d')"
+            printf '%s\n' "$last_body" | jq .
+
+            if [ "$last_code" -ge 200 ] && [ "$last_code" -lt 300 ] && printf '%s\n' "$last_body" | jq -e '.ok == true' >/dev/null; then
+              ok=$(printf '%s\n' "$last_body" | jq -r '.sourceHealth.ok // 0')
+              total=$(printf '%s\n' "$last_body" | jq -r '.sourceHealth.total // 0')
+              failed=$(printf '%s\n' "$last_body" | jq -r '.sourceHealth.failed // 0')
+              echo "Healthy: HTTP $last_code, sources $ok/$total ok, $failed failed"
+              exit 0
+            fi
+
+            status="$(printf '%s\n' "$last_body" | jq -r '.status // "unknown"' 2>/dev/null || echo unknown)"
+            reasons="$(printf '%s\n' "$last_body" | jq -cr '.reasons // []' 2>/dev/null || echo '[]')"
+            echo "Not healthy yet: HTTP $last_code, status=$status, reasons=$reasons"
+            if [ "$i" -lt "$attempts" ]; then
+              sleep "$sleep_seconds"
+            fi
+          done
+
+          ok=$(printf '%s\n' "$last_body" | jq -r '.sourceHealth.ok // 0' 2>/dev/null || echo 0)
+          total=$(printf '%s\n' "$last_body" | jq -r '.sourceHealth.total // 0' 2>/dev/null || echo 0)
+          failed=$(printf '%s\n' "$last_body" | jq -r '.sourceHealth.failed // 0' 2>/dev/null || echo 0)
+          status="$(printf '%s\n' "$last_body" | jq -r '.status // "unknown"' 2>/dev/null || echo unknown)"
+          reasons="$(printf '%s\n' "$last_body" | jq -cr '.reasons // []' 2>/dev/null || echo '[]')"
+          echo "Final health: HTTP $last_code, status=$status, reasons=$reasons, sources $ok/$total ok, $failed failed"
+
           if [ "$total" -gt 0 ]; then
             threshold=$(( total * 60 / 100 ))
             [ "$failed" -le "$threshold" ] || { echo "::error::Too many sources failed: $failed/$total"; exit 1; }
           fi
+
+          echo "::error::Health check failed after $attempts attempts: HTTP $last_code status=$status reasons=$reasons"
+          exit 1
