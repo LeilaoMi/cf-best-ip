@@ -51,15 +51,20 @@ export function qualityGuard(alive, previous, sourceStats = [], carrierName = c 
   }
   const prevTested = testedCount(prevIps);
   const nextTested = testedCount(alive);
-  if (prevTested >= 10 && nextTested < Math.floor(prevTested * 0.5)) {
+  const criticalFailed = criticalSourceFailed(sourceStats);
+
+  // hostmonit/critical speed-test sources can temporarily fail from Workers egress.
+  // Do not block a refresh if the overall pool is still healthy enough; otherwise
+  // KV becomes stale and /health stays degraded forever.
+  if (!criticalFailed && prevTested >= 10 && nextTested < Math.floor(prevTested * 0.5)) {
     return { error: "tested-pool-shrank", message: `真实测速 IP 从 ${prevTested} 个降到 ${nextTested} 个，已保留上一批结果。` };
   }
-  if (criticalSourceFailed(sourceStats)) {
+  if (criticalFailed) {
     const prevBy = countByCarrier(prevIps);
     const nextBy = countByCarrier(alive);
     for (const k of ["CT", "CU", "CM"]) {
-      if (prevBy[k] >= 10 && nextBy[k] < prevBy[k]) {
-        return { error: "critical-source-degraded", message: `核心测速源异常且${carrierName(k)}池减少，已保留上一批结果。` };
+      if (prevBy[k] >= 10 && nextBy[k] < Math.floor(prevBy[k] * 0.4)) {
+        return { error: "critical-source-degraded", message: `核心测速源异常且${carrierName(k)}池严重减少，已保留上一批结果。` };
       }
     }
   }
