@@ -1486,12 +1486,15 @@ async function handle(request, env, ctx) {
     // and usable, so do not fail the public health check only because DNS sync was throttled.
     if (lastDnsSync?.ok === false && !dnsRateLimited) reasons.push("dns-failed");
     if (!sourceOk) reasons.push("source-health-low");
-    if (!sh.criticalSourcesOk) reasons.push("critical-source-failed");
+    const criticalSourceFatal = !sh.criticalSourcesOk && (ips.length < 50 || sh.independentSignals < 5 || sh.ok < Math.ceil(sh.total * 0.6));
+    // A critical speed-test source such as hostmonit may fail temporarily while the pool remains
+    // fresh and backed by many independent sources. Treat that as degraded metadata, not outage.
+    if (criticalSourceFatal) reasons.push("critical-source-failed");
     const ok = reasons.length === 0;
     const status = ok ? "ok" : "degraded";
     return json({
       ok, status, reasons, total: ips.length, stale: info.stale, ageMs: info.ageMs,
-      updatedAt: data.updatedAt || 0, dnsOk: lastDnsSync?.ok ?? null, dnsRateLimited,
+      updatedAt: data.updatedAt || 0, dnsOk: lastDnsSync?.ok ?? null, dnsRateLimited, criticalSourceFatal,
       sourceHealth: { ok: sh.ok, total: sh.total, failed: sh.failed, criticalSourcesOk: sh.criticalSourcesOk, independentSignals: sh.independentSignals },
       lastErrorAt: lastError?.failedAt || null,
     }, { status: ok ? 200 : 503 });
