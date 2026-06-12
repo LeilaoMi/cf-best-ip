@@ -35,9 +35,16 @@ test('qualityGuard detects pool and tested shrinkage', () => {
   assert.equal(qualityGuard(alive, prev)?.error, 'tested-pool-shrank');
 });
 
-test('qualityGuard detects critical source degraded carrier pool', () => {
+test('qualityGuard allows temporary critical source failure when carrier pool remains healthy', () => {
   const prev = { ips: Array.from({ length: 60 }, (_, i) => ({ ip: `1.1.1.${i}`, carrier: i < 20 ? 'CT' : 'CF', tested: i < 20 })) };
   const alive = Array.from({ length: 60 }, (_, i) => ({ ip: `2.2.2.${i}`, carrier: i < 15 ? 'CT' : 'CF', tested: i < 20 }));
+  const issue = qualityGuard(alive, prev, [{ name: 'hostmonit', critical: true, error: 'timeout' }], c => c);
+  assert.equal(issue, null);
+});
+
+test('qualityGuard detects critical source degraded carrier pool', () => {
+  const prev = { ips: Array.from({ length: 60 }, (_, i) => ({ ip: `1.1.1.${i}`, carrier: i < 20 ? 'CT' : 'CF', tested: i < 20 })) };
+  const alive = Array.from({ length: 60 }, (_, i) => ({ ip: `2.2.2.${i}`, carrier: i < 7 ? 'CT' : 'CF', tested: i < 20 }));
   const issue = qualityGuard(alive, prev, [{ name: 'hostmonit', critical: true, error: 'timeout' }], c => c);
   assert.equal(issue?.error, 'critical-source-degraded');
 });
