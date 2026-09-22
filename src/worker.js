@@ -43,8 +43,8 @@
 // 1. 常量 / 数据源 / 字典
 // ============================================================
 import { isCfNativeIp } from "./cidr.js";
-import { planDnsRecordSync } from "./dns.js";
-import { applyStabilityScores, countByCarrier, qualityGuard, sourceHealth } from "./scoring.js";
+import { isRateLimitError, planDnsRecordSync } from "./dns.js";
+import { applyStabilityScores, backoffSkipCycles, countByCarrier, qualityGuard, sourceHealth } from "./scoring.js";
 
 const VERSION = "3.9.0";
 
@@ -337,21 +337,28 @@ function isApiIpsAuthorized(request, env) {
   if (env.ADMIN_TOKEN && constantTimeEqual(token, env.ADMIN_TOKEN)) return true;
   return Boolean(env.API_IPS_TOKEN && constantTimeEqual(token, env.API_IPS_TOKEN));
 }
-async function requireApiIpsAccess(request, env) {
-  if (env.API_IPS_REQUIRE_TOKEN === "1" && !isApiIpsAuthorized(request, env)) {
-    return json({ ok: false, error: "unauthorized", hint: "需要 Authorization: Bearer <API_IPS_TOKEN> 或 <ADMIN_TOKEN>" }, { status: 401 });
-  }
-  if (env.API_IPS_RATE_LIMIT === "0" || !env.KV) return null;
-  const limit = Math.max(1, Number(env.API_IPS_RATE_LIMIT || 60));
+async function rateLimitByIp(request, env, keyPrefix, limitEnv, defLimit) {
+  if (env[limitEnv] === "0" || !env.KV) return null;
+  const limit = Math.max(1, Number(env[limitEnv] || defLimit));
   const now = Math.floor(Date.now() / 60000);
   const ip = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown";
-  const key = `rate:api_ips:${now}:${ip}`;
+  const key = `rate:${keyPrefix}:${now}:${ip}`;
   const count = Number(await env.KV.get(key) || 0) + 1;
   if (count > limit && !isApiIpsAuthorized(request, env)) {
     return json({ ok: false, error: "rate-limited", retryAfter: 60 }, { status: 429, headers: { "retry-after": "60" } });
   }
   await env.KV.put(key, String(count), { expirationTtl: 120 });
   return null;
+}
+async function requireApiIpsAccess(request, env) {
+  if (env.API_IPS_REQUIRE_TOKEN === "1" && !isApiIpsAuthorized(request, env)) {
+    return json({ ok: false, error: "unauthorized", hint: "需要 Authorization: Bearer <API_IPS_TOKEN> 或 <ADMIN_TOKEN>" }, { status: 401 });
+  }
+  return rateLimitByIp(request, env, "api_ips", "API_IPS_RATE_LIMIT", 60);
+}
+async function requireSubAccess(request, env) {
+  // 订阅被 DDNS/客户端高频轮询，加宽松限流防刷；ADMIN/API token 持有者豁免
+  return rateLimitByIp(request, env, "sub", "SUB_RATE_LIMIT", 120);
 }
 
 const IP_RE = /\b((?:25[0-5]|2[0-4]\d|[01]?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|[01]?\d?\d)){3})\b/g;
@@ -825,13 +832,6 @@ const SOURCE_FETCH_CONCURRENCY = 8;
 const SOURCE_BACKOFF_CYCLE_MS = 6 * 60 * 60 * 1000; // 与 Cron 周期对齐
 const SOURCE_BACKOFF_KEY = "source:backoff";
 
-function backoffSkipCycles(meta, fails) {
-  // 关键测速源最多只冷却 1 个周期，避免 tested 池长期失血；
-  // 普通源按连续失败次数退避，最多 3 个周期后强制重试。
-  const cap = meta?.critical ? 1 : 3;
-  return Math.min(Math.max(fails, 1), cap);
-}
-
 async function aggregateSources(env) {
   const now = Date.now();
   const backoff = (await kvGet(env, SOURCE_BACKOFF_KEY, {})) || {};
@@ -1241,9 +1241,6 @@ async function batchDnsRecords(env, deletes, posts) {
 }
 const DNS_BACKOFF_KEY = "dns:backoffUntil";
 const DNS_BACKOFF_MS = 30 * 60 * 1000;
-function isRateLimitError(e) {
-  return /rate.?limit|429|throttl|quota exceeded/i.test(String((e && e.message) || e || ""));
-}
 async function syncAllDns(env, alive) {
   const startedAt = Date.now();
   const topN = Number(env.DNS_TOP_N || 10);
@@ -1591,6 +1588,8 @@ async function handle(request, env, ctx) {
 
   // ---- 订阅 ----
   if (path === "/sub" || path === "/sub.txt" || path === "/api/ips.txt" || path === "/ips.txt") {
+    const accessError = await requireSubAccess(request, env);
+    if (accessError) return accessError;
     const filtered = applyFilter(ips, params, requesterColo, cfg);
     const format = (params.get("format") || "plain").toLowerCase();
     if (format === "csv") {

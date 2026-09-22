@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildWantedIps, planDnsRecordSync } from "../src/dns.js";
+import { buildWantedIps, isRateLimitError, planDnsRecordSync } from "../src/dns.js";
 
 test("buildWantedIps dedupes and respects topN", () => {
   const ips = [
@@ -81,4 +81,12 @@ test("planDnsRecordSync skips empty candidate list", () => {
     name: "cf.example.com",
     type: "A",
   });
+});
+
+test("isRateLimitError matches Cloudflare throttling signals", () => {
+  assert.equal(isRateLimitError(new Error("Cloudflare API POST failed: Rate limited")), true);
+  assert.equal(isRateLimitError(new Error("HTTP 429 Too Many Requests")), true);
+  assert.equal(isRateLimitError("throttled: quota exceeded"), true);
+  assert.equal(isRateLimitError(new Error("Bad Request")), false);
+  assert.equal(isRateLimitError(null), false);
 });

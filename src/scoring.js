@@ -87,3 +87,11 @@ export function sourceHealth(sourceStats = []) {
   const independentSignals = new Set(sourceStats.map(x => x.signal || x.name)).size;
   return { total, ok: Math.max(0, total - failed), failed, empty, critical, criticalFailed, criticalSourcesOk: criticalFailed === 0, independentSignals };
 }
+
+
+export function backoffSkipCycles(meta, fails) {
+  // 关键测速源最多只冷却 1 个周期，避免 tested 池长期失血；
+  // 普通源按连续失败次数退避，最多 3 个周期后强制重试。
+  const cap = meta?.critical ? 1 : 3;
+  return Math.min(Math.max(fails, 1), cap);
+}
