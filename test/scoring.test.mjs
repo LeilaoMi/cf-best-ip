@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   applyStabilityScores,
+  backoffSkipCycles,
   carrierKey,
   countByCarrier,
   qualityGuard,
@@ -65,4 +66,24 @@ test('sourceHealth reports critical and independent signal stats', () => {
     criticalSourcesOk: false,
     independentSignals: 2,
   });
+});
+
+test('backoffSkipCycles caps critical sources at 1 cycle and others at 3', () => {
+  assert.equal(backoffSkipCycles({ critical: true }, 5), 1);
+  assert.equal(backoffSkipCycles({ critical: true }, 1), 1);
+  assert.equal(backoffSkipCycles({}, 1), 1);
+  assert.equal(backoffSkipCycles({}, 2), 2);
+  assert.equal(backoffSkipCycles({}, 9), 3);
+  assert.equal(backoffSkipCycles(null, 0), 1);
+});
+
+test('sourceHealth does not count backoff-skipped sources as failed', () => {
+  const health = sourceHealth([
+    { name: 'a', count: 5 },
+    { name: 'b', count: 0, skipped: 'backoff:fails=2', critical: false, signal: 'b' },
+    { name: 'c', count: 0, skipped: 'alias-hit:x', signal: 'x' },
+  ]);
+  assert.equal(health.total, 3);
+  assert.equal(health.failed, 0);
+  assert.equal(health.ok, 3);
 });

@@ -1,3 +1,7 @@
+export function isRateLimitError(e) {
+  return /rate.?limit|429|throttl|quota exceeded/i.test(String((e && e.message) || e || ""));
+}
+
 export function buildWantedIps(ips, topN) {
   const wanted = [];
   const seen = new Set();

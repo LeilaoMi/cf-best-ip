@@ -28,6 +28,7 @@ CF_DNS_BY_CARRIER = "1"   # "1" = 按运营商分子域同步 (ct./cu./cm.)
 CF_DNS_IPV6       = "0"   # "1" = 同步 AAAA 记录；默认关闭，避免客户端兼容性突变
 DNS_TOP_N         = "10"
 API_IPS_RATE_LIMIT = "60" # /api/ips 每 IP 每分钟限额；设 "0" 关闭
+SUB_RATE_LIMIT     = "120" # /sub 系订阅每 IP 每分钟限额；设 "0" 关闭
 # API_IPS_REQUIRE_TOKEN = "1" # 设 "1" 后 /api/ips 也需要 Bearer token
 # ALLOW_PUBLIC_REFRESH = "1" # 不推荐；仅在你明确接受公开刷新风险时启用
 
