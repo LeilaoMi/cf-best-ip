@@ -103,6 +103,9 @@ wrangler deploy
 | 三网分流 | 已启用：`ct.` / `cu.` / `cm.` |
 | IPv6 DNS 同步 | 默认关闭：`CF_DNS_IPV6=0` |
 | `/api/ips` 限流 | 默认每 IP 每分钟 60 次 |
+| `/sub` 系订阅限流 | 默认每 IP 每分钟 120 次，`ADMIN_TOKEN` 持有者豁免 |
+| 源失败退避 | 连续失败的源按 6 小时周期冷却（关键测速源只冷 1 周期），别名源在 canonical 成功时跳过抓取 |
+| DNS 同步节流 | 多子域合并为一次 batch 写；无变化跳过 DoH 验证；429 后退避 30 分钟 |
 | 公开刷新 | 已关闭：`ALLOW_PUBLIC_REFRESH` 未启用 |
 
 最近一次线上验证结果：
@@ -148,6 +151,7 @@ wrangler deploy
 | `DNS_MAX_CHANGE_RATIO` | 每个域名单次最多替换比例，默认 0.3 |
 | `CF_DNS_IPV6` | 设 `1` 后同步 `auto.` / `cf.` 的 AAAA 记录；默认关闭，避免客户端兼容性突变 |
 | `API_IPS_RATE_LIMIT` | `/api/ips` 每 IP 每分钟限额，默认 60；设 `0` 关闭 |
+| `SUB_RATE_LIMIT` | `/sub`、`/sub.txt`、`/api/ips.txt`、`/ips.txt` 每 IP 每分钟限额，默认 120；设 `0` 关闭 |
 | `API_IPS_REQUIRE_TOKEN` | 设 `1` 后 `/api/ips` 也需要 `Authorization: Bearer <API_IPS_TOKEN>` 或 `ADMIN_TOKEN` |
 | `ALLOWED_HOSTS` | 可选，逗号分隔的页面/API 入口 host 白名单；`/health` 仍放行便于监控 |
 | `ALLOW_PUBLIC_REFRESH` | 设 `1` 才允许无 token 手动刷新；不推荐公开使用 |
