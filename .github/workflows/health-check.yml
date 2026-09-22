@@ -73,3 +73,20 @@ jobs:
 
           echo "::error::Health check failed after $attempts attempts: HTTP $last_code status=$status reasons=$reasons"
           exit 1
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe health endpoint with different clients
+        run: |
+          set -uo pipefail
+          url="https://bestip.leilaomi.cc.cd/health"
+          echo "=== 1. curl default UA ==="
+          curl -sS --max-time 20 -D /tmp/h1.txt -o /tmp/b1.txt -w 'HTTP %{http_code}, bytes %{size_download}\n' "$url" || echo "curl exit $?"
+          head -c 300 /tmp/b1.txt; echo
+          grep -i -E "content-type|server|cf-ray" /tmp/h1.txt || true
+          echo "=== 2. curl browser UA ==="
+          curl -sS --max-time 20 -D /tmp/h2.txt -o /tmp/b2.txt -w 'HTTP %{http_code}, bytes %{size_download}\n' -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36" -H "Accept: application/json" "$url" || echo "curl exit $?"
+          head -c 300 /tmp/b2.txt; echo
+          grep -i -E "content-type|server|cf-ray" /tmp/h2.txt || true
+          echo "=== 3. node fetch browser UA ==="
+          URL="$url" node -e '(async () => { try { const r = await fetch(process.env.URL, {headers: {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36", "Accept": "application/json"}}); const t = await r.text(); console.log("HTTP " + r.status + ", bytes " + t.length); console.log("content-type: " + r.headers.get("content-type")); console.log(t.slice(0, 500)); } catch (e) { console.log("fetch error: " + e.message); } })();' || true
