@@ -821,15 +821,70 @@ async function fetchSource(src) {
   }
 }
 
-async function aggregateSources() {
-  const results = await Promise.all(SOURCES.map(fetchSource));
-  const all = [];
+const SOURCE_FETCH_CONCURRENCY = 8;
+const SOURCE_BACKOFF_CYCLE_MS = 6 * 60 * 60 * 1000; // 与 Cron 周期对齐
+const SOURCE_BACKOFF_KEY = "source:backoff";
+
+function backoffSkipCycles(meta, fails) {
+  // 关键测速源最多只冷却 1 个周期，避免 tested 池长期失血；
+  // 普通源按连续失败次数退避，最多 3 个周期后强制重试。
+  const cap = meta?.critical ? 1 : 3;
+  return Math.min(Math.max(fails, 1), cap);
+}
+
+async function aggregateSources(env) {
+  const now = Date.now();
+  const backoff = (await kvGet(env, SOURCE_BACKOFF_KEY, {})) || {};
+  const active = [];
   const stats = [];
-  for (const r of results) {
-    const meta = sourceMeta(r.name);
+  for (const src of SOURCES) {
+    const rec = backoff[src.name];
+    if (rec && Number(rec.until || 0) > now) {
+      const meta = sourceMeta(src.name);
+      stats.push({ name: src.name, count: 0, skipped: `backoff:fails=${rec.fails || 1}`, critical: !!meta?.critical, aliasOf: meta?.aliasOf || null, signal: sourceSignalName(meta || src) });
+      continue;
+    }
+    active.push(src);
+  }
+  // 别名源（如 CMLiussss/cm → addressesapi/cmcc）与 canonical 同信号：
+  // canonical 本轮成功则跳过别名抓取，省一次出站请求；canonical 失败则照常抓，保证覆盖。
+  const canonicals = active.filter(s => !s.aliasOf);
+  const aliases = active.filter(s => s.aliasOf);
+  const byName = new Map();
+  const fetched = await pMap(canonicals, async (src) => ({ src, r: await fetchSource(src) }), SOURCE_FETCH_CONCURRENCY);
+  for (const { src, r } of fetched) byName.set(src.name, r);
+  for (const src of aliases) {
+    const canon = byName.get(src.aliasOf);
+    if (canon && !canon.error && (canon.ips || []).length) {
+      byName.set(src.name, { name: src.name, ips: [], skipped: `alias-hit:${src.aliasOf}`, aliasCount: canon.ips.length });
+      continue;
+    }
+    byName.set(src.name, await fetchSource(src));
+  }
+  const all = [];
+  const nextBackoff = { ...backoff };
+  let backoffDirty = false;
+  for (const src of SOURCES) {
+    const meta = sourceMeta(src.name);
+    const rec = backoff[src.name];
+    if (rec && Number(rec.until || 0) > now) continue; // 已记 skipped stat
+    const r = byName.get(src.name) || { name: src.name, ips: [], error: "not-fetched" };
+    if (r.skipped) {
+      stats.push({ name: r.name, count: r.aliasCount || 0, skipped: r.skipped, critical: !!meta?.critical, aliasOf: meta?.aliasOf || null, signal: sourceSignalName(meta || src) });
+      continue;
+    }
     stats.push({ name: r.name, count: r.ips.length, error: r.error, critical: !!meta?.critical, aliasOf: meta?.aliasOf || null, signal: sourceSignalName(meta) });
     all.push(...r.ips);
+    if (r.error) {
+      const fails = (Number(rec?.fails) || 0) + 1;
+      nextBackoff[src.name] = { fails, until: now + backoffSkipCycles(meta, fails) * SOURCE_BACKOFF_CYCLE_MS, error: String(r.error).slice(0, 120) };
+      backoffDirty = true;
+    } else if (rec) {
+      delete nextBackoff[src.name];
+      backoffDirty = true;
+    }
   }
+  if (backoffDirty) await kvSet(env, SOURCE_BACKOFF_KEY, nextBackoff, { expirationTtl: 7 * 24 * 60 * 60 });
   // 合并去重，按 ip:port 维度
   const uniq = uniqBy(all, x => `${x.ip}:${x.port}:${x.carrier || ""}`);
   // v3.0: 严格只保留落在 CF 官方 CIDR 段的 IP,反代 IP 完全丢弃
@@ -924,8 +979,8 @@ async function runFullTest(env, ctx, opts = {}) {
   const previous = await getLatest(env);
   const startedAt = Date.now();
 
-  // 1. 拉源
-  const agg = await aggregateSources();
+  // 1. 拉源（含失败退避 + 别名去重）
+  const agg = await aggregateSources(env);
   // 2. 标记 / 测速
   //    注意：Cloudflare Workers 禁止 connect() 到自家 IP，
   //    所以对来源于公开池的 CF IP，我们直接信任源数据（它们都已被
@@ -1184,19 +1239,10 @@ async function batchDnsRecords(env, deletes, posts) {
     body: JSON.stringify(body),
   });
 }
-async function syncRecordFromExisting(env, name, ips, topN, existing, type = "A") {
-  const plan = planDnsRecordSync(name, ips, topN, existing, env.DNS_MAX_CHANGE_RATIO || 0.3, type);
-  if (plan.skipped) return { ...plan, type };
-  await batchDnsRecords(env, plan.deletes, plan.posts);
-  return {
-    name,
-    type,
-    ips: plan.ips,
-    kept: plan.kept,
-    added: plan.added,
-    removed: plan.removed,
-    maxChanges: plan.maxChanges,
-  };
+const DNS_BACKOFF_KEY = "dns:backoffUntil";
+const DNS_BACKOFF_MS = 30 * 60 * 1000;
+function isRateLimitError(e) {
+  return /rate.?limit|429|throttl|quota exceeded/i.test(String((e && e.message) || e || ""));
 }
 async function syncAllDns(env, alive) {
   const startedAt = Date.now();
@@ -1204,6 +1250,11 @@ async function syncAllDns(env, alive) {
   const cfg = await getConfig(env);
   const results = [];
   try {
+    // 429 退避中：不动 dns:lastSync（保持上一次 ok 状态），直接跳过
+    const backoffUntil = Number(await kvGet(env, DNS_BACKOFF_KEY, 0) || 0);
+    if (backoffUntil > Date.now()) {
+      return { ok: true, skipped: true, reason: "rate-limit-backoff", retryAfterSec: Math.ceil((backoffUntil - Date.now()) / 1000), startedAt, finishedAt: Date.now(), topN, cfApiRequests: 0, results };
+    }
     let pool = alive.slice();
     if (cfg.dnsBlocklistEnabled && cfg.dnsBlocklist?.length) {
       const block = new Set(cfg.dnsBlocklist);
@@ -1217,36 +1268,64 @@ async function syncAllDns(env, alive) {
     const byName = await listManagedARecords(env, managedNames);
     let cfApiRequests = Number(byName.cfApiRequests || 0);
 
+    const v4pool = pool.filter(x => !(x.ip || "").includes(":"));
+    // 先全部算 plan，不写；最后合并成一次 batch 调用
+    const jobs = [];
     const autoName = getAutoRecordName(env);
-    if (autoName) results.push(await syncRecordFromExisting(env, autoName, pool.filter(x => !(x.ip || "").includes(":")), topN, byName.get(autoName) || [], "A"));
-    results.push(await syncRecordFromExisting(env, env.CF_RECORD_NAME, pool.filter(x => !(x.ip || "").includes(":")), topN, byName.get(env.CF_RECORD_NAME) || [], "A"));
+    if (autoName) jobs.push({ name: autoName, ips: v4pool, type: "A", existing: byName.get(autoName) || [] });
+    jobs.push({ name: env.CF_RECORD_NAME, ips: v4pool, type: "A", existing: byName.get(env.CF_RECORD_NAME) || [] });
 
     if (env.CF_DNS_BY_CARRIER === "1" && root) {
       const groups = { CT: "ct", CU: "cu", CM: "cm" };
       for (const [carrier, prefix] of Object.entries(groups)) {
         const name = `${prefix}.${root}`;
         const subset = pool.filter(x => x.carrier === carrier && !(x.ip || "").includes(":"));
-        if (subset.length) results.push(await syncRecordFromExisting(env, name, subset, topN, byName.get(name) || [], "A"));
+        if (subset.length) jobs.push({ name, ips: subset, type: "A", existing: byName.get(name) || [] });
       }
     }
+    let byNameV6 = null;
     if (env.CF_DNS_IPV6 === "1") {
       const v6Pool = pool.filter(x => (x.ip || "").includes(":"));
       if (v6Pool.length) {
-        const byNameV6 = await listManagedRecords(env, managedNames, "AAAA");
+        byNameV6 = await listManagedRecords(env, managedNames, "AAAA");
         cfApiRequests += Number(byNameV6.cfApiRequests || 0);
-        if (autoName) results.push(await syncRecordFromExisting(env, autoName, v6Pool, topN, byNameV6.get(autoName) || [], "AAAA"));
-        results.push(await syncRecordFromExisting(env, env.CF_RECORD_NAME, v6Pool, topN, byNameV6.get(env.CF_RECORD_NAME) || [], "AAAA"));
+        if (autoName) jobs.push({ name: autoName, ips: v6Pool, type: "AAAA", existing: byNameV6.get(autoName) || [] });
+        jobs.push({ name: env.CF_RECORD_NAME, ips: v6Pool, type: "AAAA", existing: byNameV6.get(env.CF_RECORD_NAME) || [] });
       }
     }
-    const verification = await verifyDnsRecords(results).catch(e => ({ ok: false, error: String(e && e.message || e), checkedAt: Date.now(), checks: [] }));
-    const writeRequests = results.filter(r => !r.skipped).length;
-    const summary = { ok: true, startedAt, finishedAt: Date.now(), elapsedMs: Date.now() - startedAt, topN, cfApiRequests: cfApiRequests + writeRequests, ipv6Enabled: env.CF_DNS_IPV6 === "1", results, verification };
+    const plans = jobs.map(j => {
+      if (!j.ips.length) return { ...j, skipped: true };
+      return { ...j, ...planDnsRecordSync(j.name, j.ips, topN, j.existing, env.DNS_MAX_CHANGE_RATIO || 0.3, j.type) };
+    });
+    const allDeletes = plans.flatMap(p => p.deletes || []);
+    const allPosts = plans.flatMap(p => p.posts || []);
+    const changed = allDeletes.length > 0 || allPosts.length > 0;
+    if (changed) {
+      try {
+        await batchDnsRecords(env, allDeletes, allPosts);
+        cfApiRequests += 1;
+      } catch (e) {
+        if (isRateLimitError(e)) await kvSet(env, DNS_BACKOFF_KEY, Date.now() + DNS_BACKOFF_MS, { expirationTtl: 3600 });
+        throw e;
+      }
+    }
+    for (const p of plans) {
+      if (p.skipped) { results.push({ name: p.name, type: p.type, skipped: true }); continue; }
+      results.push({ name: p.name, type: p.type, ips: p.ips, kept: p.kept, added: p.added, removed: p.removed, maxChanges: p.maxChanges, unchanged: !((p.deletes || []).length || (p.posts || []).length) });
+    }
+    // 无任何变化：跳过 DoH 验证（省 2×N 次外部请求），直接记 ok
+    const verification = changed
+      ? await verifyDnsRecords(results).catch(e => ({ ok: false, error: String(e && e.message || e), checkedAt: Date.now(), checks: [] }))
+      : { ok: true, skipped: true, reason: "no-change", checkedAt: Date.now(), checks: [] };
+    const summary = { ok: true, startedAt, finishedAt: Date.now(), elapsedMs: Date.now() - startedAt, topN, cfApiRequests, ipv6Enabled: env.CF_DNS_IPV6 === "1", changed, results, verification };
     await kvSet(env, "dns:lastSync", summary);
     // 写入当日 DNS 同步历史（7 天 TTL）
     const day = new Date().toISOString().slice(0, 10);
     await kvSet(env, `dns:history:${day}`, summary, { expirationTtl: 60 * 60 * 24 * 7 });
     return results;
   } catch (e) {
+    // 读阶段（list）被限流同样退避，避免接下来几个周期反复撞墙
+    if (isRateLimitError(e)) await kvSet(env, DNS_BACKOFF_KEY, Date.now() + DNS_BACKOFF_MS, { expirationTtl: 3600 }).catch(() => {});
     const summary = { ok: false, startedAt, finishedAt: Date.now(), elapsedMs: Date.now() - startedAt, topN, results, error: String(e && e.message || e) };
     await kvSet(env, "dns:lastSync", summary);
     throw e;
