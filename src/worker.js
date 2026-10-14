@@ -109,6 +109,16 @@ const SOURCES = [
   { name: "CMLiussss/ct", url: "https://cf.090227.xyz/ct",   type: "carrier", category: "cf-native" },
   { name: "wetest.vip/cloudflare", url: "https://www.wetest.vip/page/cloudflare/address_v4.html", type: "uouin_html", category: "cf-native" },
   { name: "IPDB/bestcf-csv",            url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/BestCF/ipv4.csv", type: "ipdb_csv", category: "cf-native" }, // 2026-10-15: 切到带实测数据的 CSV
+  // ===== 2026-10-15 bestcf.pages.dev 深挖：TG 原生分享者（经 Leo 确认是 TG 真人，非 GitHub 用户）=====
+  // uouin/麒麟优选：商业域名检测公司，全国测速节点，带延迟+速度+运营商三元数据（hostmonit 死后最佳替代）
+  { name: "uouin/麒麟优选",               url: "https://bestcf.pages.dev/uouin/all.txt", type: "uouin_text", category: "cf-native" },
+  // nirevil：TG 分享者，带 colo+延迟（速度多为 0，只取延迟）
+  { name: "nirevil",                      url: "https://bestcf.pages.dev/nirevil/ipv4.txt", type: "nirevil_text", category: "cf-native" },
+  // s5gy/lzj：TG 分享者，纯文本，量大新鲜
+  { name: "s5gy",                          url: "https://bestcf.pages.dev/s5gy/all.txt", type: "text", category: "cf-native" },
+  { name: "lzj",                           url: "https://bestcf.pages.dev/lzj/all.txt", type: "text", category: "cf-native" },
+  // xinyitang3/Mia优选：Mia 的源，Leo 熟
+  { name: "xinyitang3",                    url: "https://bestcf.pages.dev/xinyitang3/ipv4.txt", type: "text", category: "cf-native" },
   // 注：IPDB/proxy（上面已配置 proxy.txt）已对应 030101.xyz?type=proxy，不再重复配置
 ];
 
@@ -786,6 +796,53 @@ async function fetchSource(src) {
           loss: Number.isFinite(lossPct) ? lossPct / 100 : null,
           mbps: Number.isFinite(speedMBs) ? speedMBs * 8 : null,
           tested: true,
+        });
+      }
+      return { name: src.name, ips };
+    }
+
+    // uouin/麒麟优选：`IP:443#麒麟优选 | 电信 | IP | 43.69ms | 71.37mb/s`
+    // 带运营商+延迟+速度三元实测数据
+    if (src.type === "uouin_text") {
+      const carrierMap = { "电信": "CT", "联通": "CU", "移动": "CM" };
+      for (const raw of body.split(/[\r\n]+/)) {
+        const line = raw.trim();
+        if (!line || line.startsWith("#")) continue;
+        const parts = line.split("|").map(s => s.trim());
+        const m = parts[0].match(/^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})/);
+        if (!m) continue;
+        const carrier = carrierMap[parts[1]] || null;
+        const delay = parts[3] ? parseFloat(parts[3]) : NaN;
+        const mbps = parts[4] ? parseFloat(parts[4]) : NaN;
+        ips.push({
+          ip: m[1], port: +m[2], carrier, family: "v4", category,
+          sources: [src.name],
+          delay: Number.isFinite(delay) ? delay : null,
+          loss: null,
+          mbps: Number.isFinite(mbps) ? mbps : null,
+          tested: true,
+        });
+      }
+      return { name: src.name, ips };
+    }
+
+    // nirevil：`IP:443#NiREvil优选 | CF | IP | SJC | 98ms | 0mbps`
+    // 带 colo+延迟（速度多为 0，不取）
+    if (src.type === "nirevil_text") {
+      for (const raw of body.split(/[\r\n]+/)) {
+        const line = raw.trim();
+        if (!line || line.startsWith("#")) continue;
+        const parts = line.split("|").map(s => s.trim());
+        const m = parts[0].match(/^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})/);
+        if (!m) continue;
+        const colo = parts[3] && /^[A-Z]{3}$/.test(parts[3]) ? parts[3] : undefined;
+        const delay = parts[4] ? parseFloat(parts[4]) : NaN;
+        ips.push({
+          ip: m[1], port: +m[2], carrier: null, family: "v4", category,
+          sources: [src.name],
+          colo,
+          delay: Number.isFinite(delay) ? delay : null,
+          tested: parts[4] ? true : false,
         });
       }
       return { name: src.name, ips };
