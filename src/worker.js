@@ -80,17 +80,17 @@ const SOURCES = [
     method: "POST",
     body: { key: "o1zrmHAF" },
     category: "cf-native",
-    critical: true,
+    critical: false, // 2026-10-15: hostmonit 已实质死亡(526)，不再作为 critical 源阻塞更新
   },
   // ===== v2.6 社区高星 CF native 源(纯 CF 段,大幅提升 cf-native 数量) =====
   { name: "joname1/BestCFip",           url: "https://raw.githubusercontent.com/joname1/BestCFip/main/ipv4.txt", type: "text", category: "cf-native" },
   { name: "joname1/BestCFip/ipv6",      url: "https://raw.githubusercontent.com/joname1/BestCFip/main/ipv6.txt", type: "v6_text", category: "cf-native" },
-  { name: "KafeMars/cloudflare_ips",    url: "https://raw.githubusercontent.com/KafeMars/best-ips-domains/main/cloudflare_ips.txt", type: "text", category: "cf-native" },
+  { name: "KafeMars/cloudflare_ips",    url: "https://raw.githubusercontent.com/KafeMars/best-ips-domains/main/cf-bestips.txt", type: "text", category: "cf-native" },
   { name: "KafeMars/US_IP4",            url: "https://raw.githubusercontent.com/KafeMars/best-ips-domains/main/US_IP4", type: "text", category: "cf-native" },
   { name: "KafeMars/HK_IP4",            url: "https://raw.githubusercontent.com/KafeMars/best-ips-domains/main/HK_IP4", type: "text", category: "cf-native" },
-  { name: "KafeMars/JP_IP4",            url: "https://raw.githubusercontent.com/KafeMars/best-ips-domains/main/JP_IP4", type: "text", category: "cf-native" },
-  { name: "KafeMars/SG_IP4",            url: "https://raw.githubusercontent.com/KafeMars/best-ips-domains/main/SG_IP4", type: "text", category: "cf-native" },
-  { name: "KafeMars/EU_IP4",            url: "https://raw.githubusercontent.com/KafeMars/best-ips-domains/main/EU_IP4", type: "text", category: "cf-native" },
+  { name: "KafeMars/JP_IP4",            url: "https://raw.githubusercontent.com/KafeMars/best-ips-domains/main/CF-BestIPs-JP", type: "text", category: "cf-native" },
+  { name: "KafeMars/SG_IP4",            url: "https://raw.githubusercontent.com/KafeMars/best-ips-domains/main/CF-BestIPs-SG", type: "text", category: "cf-native" },
+  // 2026-10-15: KafeMars/EU_IP4 上游已删除且无替代文件，移除该源
   { name: "addressesapi/ip.164746.xyz", url: "https://addressesapi.090227.xyz/ip.164746.xyz", type: "carrier", category: "cf-native" },
   { name: "addressesapi/CloudFlareYes", url: "https://addressesapi.090227.xyz/CloudFlareYes", type: "carrier", category: "cf-native" },
   { name: "addressesapi/cmcc",          url: "https://addressesapi.090227.xyz/cmcc", type: "carrier", category: "cf-native" },
@@ -108,7 +108,7 @@ const SOURCES = [
   { name: "CMLiussss/cu", url: "https://cf.090227.xyz/cu",   type: "carrier", category: "cf-native" },
   { name: "CMLiussss/ct", url: "https://cf.090227.xyz/ct",   type: "carrier", category: "cf-native" },
   { name: "wetest.vip/cloudflare", url: "https://www.wetest.vip/page/cloudflare/address_v4.html", type: "uouin_html", category: "cf-native" },
-  { name: "IPDB/bestcf",                url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/bestcf.txt", type: "text", category: "cf-native" },
+  { name: "IPDB/bestcf-csv",            url: "https://raw.githubusercontent.com/ymyuuu/IPDB/main/BestCF/ipv4.csv", type: "ipdb_csv", category: "cf-native" }, // 2026-10-15: 切到带实测数据的 CSV
   // 注：IPDB/proxy（上面已配置 proxy.txt）已对应 030101.xyz?type=proxy，不再重复配置
 ];
 
@@ -766,6 +766,30 @@ async function fetchSource(src) {
     const body = await r.text();
     const ips = [];
     const category = src.category || "cf-native";
+
+    // IPDB BestCF/ipv4.csv: IP 地址,已发送,已接收,丢包率,平均延迟,下载速度 (MB/s)
+    // 自带实测数据，MIT 许可。丢包率是百分比→转小数；速度是 MB/s→转 Mbps
+    if (src.type === "ipdb_csv") {
+      const lines = body.split(/[\r\n]+/);
+      for (let i = 1; i < lines.length; i++) { // 跳过表头
+        const parts = lines[i].split(",");
+        if (parts.length < 6) continue;
+        const ip = parts[0].trim();
+        if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(ip)) continue;
+        const lossPct = parseFloat(parts[3]);
+        const delay = parseFloat(parts[4]);
+        const speedMBs = parseFloat(parts[5]);
+        ips.push({
+          ip, port: 443, carrier: null, family: "v4", category,
+          sources: [src.name],
+          delay: Number.isFinite(delay) ? delay : null,
+          loss: Number.isFinite(lossPct) ? lossPct / 100 : null,
+          mbps: Number.isFinite(speedMBs) ? speedMBs * 8 : null,
+          tested: true,
+        });
+      }
+      return { name: src.name, ips };
+    }
 
     if (src.type === "uouin_html") {
       // uouin 页面 IP 周围用中文标签标注 carrier
