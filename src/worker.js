@@ -1062,6 +1062,20 @@ async function runFullTest(env, ctx, opts = {}) {
 
   // 1. 拉源（含失败退避 + 别名去重）
   const agg = await aggregateSources(env);
+  // P1: 源新鲜度告警 — 任一源连续失败 >= 3 次即 TG 告警（24h 去重）
+  {
+    const backoff = (await kvGet(env, SOURCE_BACKOFF_KEY, {})) || {};
+    for (const [name, rec] of Object.entries(backoff)) {
+      const fails = Number(rec?.fails) || 0;
+      if (fails >= SOURCE_STALE_FAILS) {
+        const err = String(rec?.error || "unknown").slice(0, 80);
+        ctx.waitUntil(sendAlert(env, `source:${name}`,
+          `cf-best-ip 数据源异常`,
+          [`源: \`${name}\``, `连续失败: *${fails}* 次`, `最后错误: ${err}`]
+        ).catch(() => {}));
+      }
+    }
+  }
   // 2. 标记 / 测速
   //    注意：Cloudflare Workers 禁止 connect() 到自家 IP，
   //    所以对来源于公开池的 CF IP，我们直接信任源数据（它们都已被
@@ -1181,6 +1195,33 @@ async function runFullTest(env, ctx, opts = {}) {
   }
   // 9. Webhook
   ctx.waitUntil(notify(env, { ...payload, dnsSync }).catch(() => {}));
+  // P1: DNS 限流告警 — 同步因限流跳过即 TG 告警（24h 去重）
+  {
+    const d = dnsSync;
+    const rateLimited = d?.reason === "rate-limit-backoff" ||
+      (d?.ok === false && /rate.limit|throttl/i.test(String(d?.error || "")));
+    if (rateLimited) {
+      const retry = d?.retryAfterSec ? `，${d.retryAfterSec} 秒后重试` : "";
+      ctx.waitUntil(sendAlert(env, "dns-ratelimit",
+        `cf-best-ip DNS 同步被限流跳过`,
+        [`原因: 限流退避中${retry}`, `DNS 记录未更新，IP 池数据正常`]
+      ).catch(() => {}));
+    }
+  }
+  // P1: 运营商保底告警 — 任一运营商 < 5 个即 TG 告警（24h 去重）
+  {
+    const byCarrier = countByCarrier(payload.ips || []);
+    for (const code of ["CT", "CU", "CM"]) {
+      const n = byCarrier[code] || 0;
+      if (n < CARRIER_MIN_COUNT) {
+        const names = { CT: "电信", CU: "联通", CM: "移动" };
+        ctx.waitUntil(sendAlert(env, `carrier:${code}`,
+          `cf-best-ip ${names[code]}池不足`,
+          [`当前: *${n}* 个（保底 ${CARRIER_MIN_COUNT} 个）`, `可能影响${names[code]}用户优选质量`]
+        ).catch(() => {}));
+      }
+    }
+  }
   return { ...payload, dnsSync };
 }
 
@@ -1461,6 +1502,35 @@ async function notify(env, payload) {
     }
     await kvSet(env, "notify:lastStatus", { ok: true, sentAt: Date.now() });
   }
+}
+
+// ============================================================
+// 8b. P1 新鲜度告警（带 24h 去重）
+// ============================================================
+const ALERT_DEDUP_MS = 24 * 60 * 60 * 1000;
+const SOURCE_STALE_FAILS = 3;      // 源连续失败 N 次告警
+const CARRIER_MIN_COUNT = 5;       // 运营商保底数量
+
+async function sendAlert(env, key, title, lines) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return false;
+  const kvKey = `alert:${key}`;
+  const last = await kvGet(env, kvKey, null);
+  const now = Date.now();
+  if (last && (now - last.sentAt) < ALERT_DEDUP_MS) return false; // 24h 内已告警
+  const md = [`⚠️ *${title}*`, ...lines,
+    `时间: ${new Date(now).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}`,
+  ].join("\n");
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text: md, parse_mode: "Markdown", disable_web_page_preview: true }),
+    });
+    const result = await r.json().catch(() => null);
+    if (!r.ok || result?.ok === false) return false;
+    await kvSet(env, kvKey, { sentAt: now, title });
+    return true;
+  } catch { return false; }
 }
 
 // ============================================================
