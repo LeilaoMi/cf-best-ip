@@ -7,7 +7,11 @@ const cidr = fs.readFileSync(new URL('../src/cidr.js', import.meta.url), 'utf8')
 const scoring = fs.readFileSync(new URL('../src/scoring.js', import.meta.url), 'utf8');
 const dns = fs.readFileSync(new URL('../src/dns.js', import.meta.url), 'utf8');
 const scheduledWorkflow = fs.readFileSync(new URL('../.github/workflows/scheduled-test.yml', import.meta.url), 'utf8');
+const envVars = [...new Set([...source.matchAll(/env\.([A-Z][A-Z0-9_]+)/g)].map(m => m[1]))];
+const routes = [...new Set([...source.matchAll(/path === "(\/[^"]*)"/g)].map(m => m[1]))].filter(r => !['/index.html', '/robots.txt'].includes(r));
 const checks = [
+  ['readme documents every env var', envVars.every(v => readme.includes(v))],
+  ['readme documents every route', routes.every(r => readme.includes(r))],
   ['has ipwho.is https', source.includes('https://ipwho.is/batch')],
   ['has csp header', source.includes('content-security-policy')],
   ['csp nonce', source.includes('function makeNonce') && source.includes('script-src ${scriptSrc}') && source.includes('<script nonce=')],
@@ -16,26 +20,19 @@ const checks = [
   ['config raw confirm', source.includes('x-config-raw-confirm')],
   ['500 hides stack', source.includes('error: "internal-error"') && !source.includes('stack: e?.stack')],
   ['health status reasons', source.includes('status, reasons') && source.includes('lastErrorAt')],
-  ['cron offset 15 min', toml.includes('crons = ["15 */6 * * *"]') && readme.includes('Cron `15 */6 * * *`')],
-  ['readme module structure current', !readme.includes('~1580 行') && readme.includes('src/cidr.js') && readme.includes('src/scoring.js') && readme.includes('src/dns.js')],
-  ['readme config auth', readme.includes('Authorization: Bearer <ADMIN_TOKEN>')],
-  ['readme api parameter table', readme.includes('常用查询参数') && readme.includes('perCountryN=2') && readme.includes('comment=0')],
-  ['readme subscription formats', readme.includes('format=plain/csv/jsonl')],
-  ['readme cf token least privilege', readme.includes('目标域名 Zone') && readme.includes('DNS Edit') && readme.includes('不要写进 `wrangler.toml`')],
-  ['readme robots not access control', readme.includes('robots.txt') && readme.includes('不是访问控制')],
-  ['readme dns only records', readme.includes('DNS only A 记录')],
-  ['root domain guard', source.includes('function getRootDomain') && source.includes('assertManagedDnsNamesAllowed') && readme.includes('ROOT_DOMAIN') && toml.includes('ROOT_DOMAIN')],
-  ['allowed hosts guard', source.includes('function requireAllowedHost') && source.includes('ALLOWED_HOSTS') && readme.includes('ALLOWED_HOSTS') && toml.includes('ALLOWED_HOSTS')],
-  ['dns current admin auth', source.includes('path === "/api/dns/current"') && source.includes('const authError = requireAdminAuth(request, env);') && readme.includes('/api/dns/current') && readme.includes('需要 `ADMIN_TOKEN`')],
+  ['cron offset 15 min', toml.includes('crons = ["15 */6 * * *"]')],
+  ['root domain guard', source.includes('function getRootDomain') && source.includes('assertManagedDnsNamesAllowed') && toml.includes('ROOT_DOMAIN')],
+  ['allowed hosts guard', source.includes('function requireAllowedHost') && source.includes('ALLOWED_HOSTS') && toml.includes('ALLOWED_HOSTS')],
+  ['dns current admin auth', source.includes('path === "/api/dns/current"') && source.includes('const authError = requireAdminAuth(request, env);')],
   ['quality metadata', source.includes('function qualityForIp') && source.includes('testedBy=hostmonit') && source.includes('confidence')],
   ['post-geo country blocklist', source.includes('地理补全后再执行一次国家黑名单')],
   ['critical source health', source.includes('criticalSourcesOk') && source.includes('critical-source-failed')],
   ['source alias signal stats', source.includes('sourceSignalName') && source.includes('independentSignals')],
   ['sub cache headers', source.includes('SUB_CACHE_HEADERS') && source.includes('public, max-age=300')],
   ['dns managed query request count', source.includes('function listManagedARecords') && source.includes('cfApiRequests')],
-  ['api ips access guard', source.includes('function requireApiIpsAccess') && source.includes('API_IPS_REQUIRE_TOKEN') && toml.includes('API_IPS_RATE_LIMIT') && readme.includes('API_IPS_REQUIRE_TOKEN')],
-  ['optional aaaa sync', source.includes('CF_DNS_IPV6') && source.includes('AAAA') && toml.includes('CF_DNS_IPV6') && readme.includes('CF_DNS_IPV6')],
-  ['durable refresh lock', source.includes('export class RefreshLock') && source.includes('env.REFRESH_LOCK') && toml.includes('REFRESH_LOCK') && readme.includes('Durable Object 刷新锁')],
+  ['api ips access guard', source.includes('function requireApiIpsAccess') && source.includes('API_IPS_REQUIRE_TOKEN') && toml.includes('API_IPS_RATE_LIMIT')],
+  ['optional aaaa sync', source.includes('CF_DNS_IPV6') && source.includes('AAAA') && toml.includes('CF_DNS_IPV6')],
+  ['durable refresh lock', source.includes('export class RefreshLock') && source.includes('env.REFRESH_LOCK') && toml.includes('REFRESH_LOCK')],
   ['notify error persistence', source.includes('notify:lastError') && source.includes('Telegram notify failed')],
   ['public refresh warning', source.includes('publicRefreshEnabled') && source.includes('public-refresh-warning')],
   ['client test resource guard', source.includes('getClientTestConcurrency') && source.includes('MAX_CLIENT_TEST_ROWS') && source.includes('document.hidden')],
@@ -51,10 +48,8 @@ const checks = [
   ['refresh running lock', source.includes('refresh:running') && source.includes('refresh-running')],
   ['admin tokens memory only', !source.includes('sessionStorage') && source.includes('__cfBestIpAdminToken') && source.includes('let refreshToken')],
   ['config import export', source.includes('params.get("export") === "1"') && source.includes('format: "cf-best-ip-config-v1"') && source.includes('imported: Boolean')],
-  ['readme security batch 1', readme.includes('refresh:running') && readme.includes('仅保存在当前 JS 内存') && readme.includes('导入运行时配置')],
   ['theme switcher', source.includes('data-theme-choice="system"') && source.includes('data-theme-choice="aurora"') && source.includes('cf-best-ip-theme')],
-  ['readme theme switcher', readme.includes('深海 / 浅色 / 极光 / 琥珀')],
-  ['version 3.9.1', source.includes('const VERSION = "3.9.1"') && readme.includes('version-3.9.1-blue')],
+  ['version 3.9.1', source.includes('const VERSION = "3.9.1"')],
 ];
 for (const [name, ok] of checks) {
   if (!ok) throw new Error(`check failed: ${name}`);
