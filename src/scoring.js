@@ -17,7 +17,7 @@ export function scoreIp(item, previousMap) {
   if (prev) score += 40;
   if (item.tested) score += 30;
   score += Math.min((item.sources?.length || 0) * 6, 30);
-  if (item.delay != null) score += Math.max(0, 30 - item.delay / 10);
+  if (item.tested && item.delay != null) score += Math.max(0, 30 - item.delay / 10);
   if (item.loss != null) score += Math.max(0, 20 - item.loss * 100);
   if (item.mbps != null) score += Math.min(item.mbps, 30) / 2;
   return Math.round(score * 10) / 10;
@@ -36,7 +36,7 @@ export function applyStabilityScores(ips, previous) {
 }
 
 export function testedCount(ips) {
-  return (ips || []).filter(x => x.tested || x.quality?.testedBy === "hostmonit").length;
+  return (ips || []).filter(x => x.tested && x.measuredIn === "cn").length;
 }
 
 export function criticalSourceFailed(sourceStats = []) {
