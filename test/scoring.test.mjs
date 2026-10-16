@@ -30,22 +30,22 @@ test('applyStabilityScores sorts by computed score', () => {
 });
 
 test('qualityGuard detects pool and tested shrinkage', () => {
-  const prev = { ips: Array.from({ length: 60 }, (_, i) => ({ ip: `1.1.1.${i}`, carrier: 'CT', tested: i < 20 })) };
+  const prev = { ips: Array.from({ length: 60 }, (_, i) => ({ ip: `1.1.1.${i}`, carrier: 'CT', tested: i < 20, measuredIn: 'cn' })) };
   assert.equal(qualityGuard(Array.from({ length: 35 }, (_, i) => ({ ip: `2.2.2.${i}`, carrier: 'CT' })), prev)?.error, 'pool-shrank');
-  const alive = Array.from({ length: 60 }, (_, i) => ({ ip: `3.3.3.${i}`, carrier: i < 15 ? 'CT' : 'CF', tested: i < 5 }));
+  const alive = Array.from({ length: 60 }, (_, i) => ({ ip: `3.3.3.${i}`, carrier: i < 15 ? 'CT' : 'CF', tested: i < 5, measuredIn: 'cn' }));
   assert.equal(qualityGuard(alive, prev)?.error, 'tested-pool-shrank');
 });
 
 test('qualityGuard allows temporary critical source failure when carrier pool remains healthy', () => {
-  const prev = { ips: Array.from({ length: 60 }, (_, i) => ({ ip: `1.1.1.${i}`, carrier: i < 20 ? 'CT' : 'CF', tested: i < 20 })) };
-  const alive = Array.from({ length: 60 }, (_, i) => ({ ip: `2.2.2.${i}`, carrier: i < 15 ? 'CT' : 'CF', tested: i < 20 }));
+  const prev = { ips: Array.from({ length: 60 }, (_, i) => ({ ip: `1.1.1.${i}`, carrier: i < 20 ? 'CT' : 'CF', tested: i < 20, measuredIn: 'cn' })) };
+  const alive = Array.from({ length: 60 }, (_, i) => ({ ip: `2.2.2.${i}`, carrier: i < 15 ? 'CT' : 'CF', tested: i < 20, measuredIn: 'cn' }));
   const issue = qualityGuard(alive, prev, [{ name: 'hostmonit', critical: true, error: 'timeout' }], c => c);
   assert.equal(issue, null);
 });
 
 test('qualityGuard detects critical source degraded carrier pool', () => {
-  const prev = { ips: Array.from({ length: 60 }, (_, i) => ({ ip: `1.1.1.${i}`, carrier: i < 20 ? 'CT' : 'CF', tested: i < 20 })) };
-  const alive = Array.from({ length: 60 }, (_, i) => ({ ip: `2.2.2.${i}`, carrier: i < 7 ? 'CT' : 'CF', tested: i < 20 }));
+  const prev = { ips: Array.from({ length: 60 }, (_, i) => ({ ip: `1.1.1.${i}`, carrier: i < 20 ? 'CT' : 'CF', tested: i < 20, measuredIn: 'cn' })) };
+  const alive = Array.from({ length: 60 }, (_, i) => ({ ip: `2.2.2.${i}`, carrier: i < 7 ? 'CT' : 'CF', tested: i < 20, measuredIn: 'cn' }));
   const issue = qualityGuard(alive, prev, [{ name: 'hostmonit', critical: true, error: 'timeout' }], c => c);
   assert.equal(issue?.error, 'critical-source-degraded');
 });
