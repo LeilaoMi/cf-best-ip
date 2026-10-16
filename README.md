@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-orange)](https://workers.cloudflare.com/)
-[![Version](https://img.shields.io/badge/version-3.9.0-blue)]()
+[![Version](https://img.shields.io/badge/version-3.9.1-blue)]()
 
 > 在 Cloudflare Worker 上跑的 **CF 自家 IP 优选服务**:聚合社区主流数据源,经官方 CIDR 校验,按运营商 / 全局展示,自动同步到自定义子域 A 记录。
 
@@ -188,7 +188,7 @@ wrangler deploy
 | `port=443` | `/api/ips`、`/sub` | 按端口筛选 |
 | `maxDelay=300` | `/api/ips`、`/sub` | 只返回延迟不高于该值的节点 |
 | `minMbps=10` | `/api/ips`、`/sub` | 只返回速度不低于该值的节点 |
-| `exclude=1.1.1.1,2.2.2.2` | `/api/ips`、`/sub` | 排除指定 IP |
+| `exclude=1.1.1.1,2.2.2.2` | `/api/ips`、`/sub` | 排除指定 IP（两位字母仍按国家代码排除） |
 | `smart=1` | `/api/ips`、`/sub` | 按访问者网络自动偏向推荐线路 |
 | `perCountry=1` | `/api/ips`、`/sub` | 每个国家最多取 N 个，避免单一国家占满结果 |
 | `perCountryN=2` | `/api/ips`、`/sub` | 配合 `perCountry=1` 使用 |
