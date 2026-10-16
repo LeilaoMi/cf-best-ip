@@ -46,7 +46,7 @@ import { isCfNativeIp } from "./cidr.js";
 import { isRateLimitError, planDnsRecordSync } from "./dns.js";
 import { applyStabilityScores, backoffSkipCycles, countByCarrier, qualityGuard, sourceHealth } from "./scoring.js";
 
-const VERSION = "3.9.0";
+const VERSION = "3.9.1";
 
 const DEFAULT_CFG = {
   topN: 30,
@@ -151,7 +151,7 @@ function sourceSignalName(src) {
   return src?.aliasOf || src?.name || "unknown";
 }
 function qualityForIp(x) {
-  if (x.tested) return { testedBy: "hostmonit", confidence: "high" };
+  if (x.tested) return { testedBy: x.measuredBy || "hostmonit", confidence: "high" };
   const sources = x.sources || [];
   if (sources.length >= 2) return { testedBy: "source", confidence: "medium" };
   return { testedBy: "source", confidence: "low" };
@@ -160,7 +160,7 @@ function withQuality(x) {
   return { ...x, quality: x.quality || qualityForIp(x) };
 }
 function testedCount(ips = []) {
-  return ips.filter(x => x.tested || x.quality?.testedBy === "hostmonit").length;
+  return ips.filter(x => x.tested && x.measuredIn === "cn").length;
 }
 function criticalSourceFailed(sourceStats = []) {
   return sourceStats.some(x => x.critical && (x.error || !x.count));
@@ -269,6 +269,8 @@ function uniqBy(arr, keyFn) {
         cur.mbps = x.mbps;
         cur.colo = x.colo;
         cur.tested = true;
+        cur.measuredBy = x.measuredBy;
+        cur.measuredIn = x.measuredIn;
       }
     }
   }
@@ -370,6 +372,13 @@ async function requireSubAccess(request, env) {
   // 订阅被 DDNS/客户端高频轮询，加宽松限流防刷；ADMIN/API token 持有者豁免
   return rateLimitByIp(request, env, "sub", "SUB_RATE_LIMIT", 120);
 }
+
+// BestCF.pages.dev 等聚合页的标题/广告行（如 "162.159.198.1:443#... | 10-16 12:39 | BestCF.pages.dev"）不是优选结果
+function isPromoLine(line) {
+  return /bestcf\.pages\.dev/i.test(line);
+}
+// BestCF 标题行固定使用的占位 IP，被其它源原样转抄（如 KafeMars JP/SG），一律剔除
+const PLACEHOLDER_IPS = new Set(["162.159.197.1", "162.159.198.1"]);
 
 const IP_RE = /\b((?:25[0-5]|2[0-4]\d|[01]?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|[01]?\d?\d)){3})\b/g;
 
@@ -765,6 +774,8 @@ async function fetchSource(src) {
             colo: x.colo && x.colo !== "Default" ? x.colo : undefined,
             node: x.node,
             tested: true,
+            measuredBy: "hostmonit",
+            measuredIn: "cn",
             family: "v4",
             category: "cf-native",
           });
@@ -792,10 +803,12 @@ async function fetchSource(src) {
         ips.push({
           ip, port: 443, carrier: null, family: "v4", category,
           sources: [src.name],
-          delay: Number.isFinite(delay) ? delay : null,
+          // IPDB 测速不在国内三网，只作参考，不参与国内延迟排序
+          delay: null,
+          refDelay: Number.isFinite(delay) ? delay : null,
           loss: Number.isFinite(lossPct) ? lossPct / 100 : null,
           mbps: Number.isFinite(speedMBs) ? speedMBs * 8 : null,
-          tested: true,
+          tested: false,
         });
       }
       return { name: src.name, ips };
@@ -807,7 +820,7 @@ async function fetchSource(src) {
       const carrierMap = { "电信": "CT", "联通": "CU", "移动": "CM" };
       for (const raw of body.split(/[\r\n]+/)) {
         const line = raw.trim();
-        if (!line || line.startsWith("#")) continue;
+        if (!line || line.startsWith("#") || isPromoLine(line)) continue;
         const parts = line.split("|").map(s => s.trim());
         const m = parts[0].match(/^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})/);
         if (!m) continue;
@@ -821,6 +834,8 @@ async function fetchSource(src) {
           loss: null,
           mbps: Number.isFinite(mbps) ? mbps : null,
           tested: true,
+          measuredBy: "uouin",
+          measuredIn: "cn",
         });
       }
       return { name: src.name, ips };
@@ -831,7 +846,7 @@ async function fetchSource(src) {
     if (src.type === "nirevil_text") {
       for (const raw of body.split(/[\r\n]+/)) {
         const line = raw.trim();
-        if (!line || line.startsWith("#")) continue;
+        if (!line || line.startsWith("#") || isPromoLine(line)) continue;
         const parts = line.split("|").map(s => s.trim());
         const m = parts[0].match(/^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})/);
         if (!m) continue;
@@ -841,8 +856,10 @@ async function fetchSource(src) {
           ip: m[1], port: +m[2], carrier: null, family: "v4", category,
           sources: [src.name],
           colo,
-          delay: Number.isFinite(delay) ? delay : null,
-          tested: parts[4] ? true : false,
+          // nirevil 在海外（如 MSP）测速，只作参考，不参与国内延迟排序
+          delay: null,
+          refDelay: Number.isFinite(delay) ? delay : null,
+          tested: false,
         });
       }
       return { name: src.name, ips };
@@ -891,7 +908,7 @@ async function fetchSource(src) {
 
     for (const raw of body.split(/[\r\n,]+/)) {
       const line = raw.trim();
-      if (!line || line.startsWith("#") || line.startsWith("//")) continue;
+      if (!line || line.startsWith("#") || line.startsWith("//") || isPromoLine(line)) continue;
       if (useAdaptive) {
         const parsed = parseLineAdaptive(line);
         if (parsed) ips.push({ ...parsed, category: category, sources: [src.name], family: parsed.ip && parsed.ip.includes(":") ? "v6" : "v4" });
@@ -969,7 +986,7 @@ async function aggregateSources(env) {
   // 合并去重，按 ip:port 维度
   const uniq = uniqBy(all, x => `${x.ip}:${x.port}:${x.carrier || ""}`);
   // v3.0: 严格只保留落在 CF 官方 CIDR 段的 IP,反代 IP 完全丢弃
-  const cfOnly = uniq.filter(x => isCfNativeIp(x.ip)).map(withQuality);
+  const cfOnly = uniq.filter(x => isCfNativeIp(x.ip) && !PLACEHOLDER_IPS.has(x.ip)).map(withQuality);
   return { ips: cfOnly, stats };
 }
 
@@ -1536,6 +1553,14 @@ async function sendAlert(env, key, title, lines) {
 // ============================================================
 // 9. 筛选 / 输出格式
 // ============================================================
+// 稳定分优先；同分时国内实测延迟低者在前。海外 refDelay 不参与排序。
+function rankCompare(a, b) {
+  if ((b._score || 0) !== (a._score || 0)) return (b._score || 0) - (a._score || 0);
+  const ad = a.tested && a.delay != null ? a.delay : 9999;
+  const bd = b.tested && b.delay != null ? b.delay : 9999;
+  if (ad !== bd) return ad - bd;
+  return (b.sources?.length || 0) - (a.sources?.length || 0);
+}
 function applyFilter(ips, params, requesterColo, cfg) {
   const country = (params.get("country") || "").toUpperCase();
   const colo = (params.get("colo") || "").toUpperCase();
@@ -1543,7 +1568,7 @@ function applyFilter(ips, params, requesterColo, cfg) {
   const port = params.get("port");
   const maxDelay = params.get("maxDelay") ? Number(params.get("maxDelay")) : null;
   const minMbps = params.get("minMbps") ? Number(params.get("minMbps")) : null;
-  const exclude = (params.get("exclude") || "").toUpperCase().split(",").filter(Boolean);
+  const exclude = (params.get("exclude") || "").toUpperCase().split(",").map(v => v.trim()).filter(Boolean);
   let top = Number(params.get("top") || params.get("limit") || 20);
   if (!Number.isFinite(top) || top < 1) top = 20;
   if (top > 200) top = 200;
@@ -1577,7 +1602,11 @@ function applyFilter(ips, params, requesterColo, cfg) {
   }
   if (maxDelay) out = out.filter(x => x.delay != null && x.delay <= maxDelay);
   if (minMbps) out = out.filter(x => x.mbps != null && x.mbps >= minMbps);
-  if (exclude.length) out = out.filter(x => !x.country || !exclude.includes(x.country));
+  if (exclude.length) {
+    // 按 IP 排除；两位字母仍按国家代码排除（兼容旧用法）
+    const ex = new Set(exclude);
+    out = out.filter(x => !ex.has((x.ip || "").toUpperCase()) && !(x.country && ex.has(x.country)));
+  }
   const familyParam = (params.get("family") || "").toLowerCase();
   if (familyParam === "v4") out = out.filter(x => !x.family || x.family === "v4");
   else if (familyParam === "v6") out = out.filter(x => x.family === "v6");
@@ -1589,10 +1618,10 @@ function applyFilter(ips, params, requesterColo, cfg) {
       const ai = a.country === myCountry ? 0 : 1;
       const bi = b.country === myCountry ? 0 : 1;
       if (ai !== bi) return ai - bi;
-      return (a.delay || 9999) - (b.delay || 9999);
+      return rankCompare(a, b);
     });
   } else {
-    out.sort((a, b) => (a.delay || 9999) - (b.delay || 9999));
+    out.sort(rankCompare);
   }
 
   // 分国家模式：每国最多取 perCountryN 个，再按国家总量降序铺开
@@ -1625,7 +1654,8 @@ function fmtAddr(x) {
 }
 function fmtSub(ips, withComment) {
   return ips.map(x => {
-    const tag = [x.country, x.colo, x.carrier && carrierName(x.carrier)].filter(Boolean).join("-");
+    // 任播 IP 的地理库国家没有意义（几乎都显示 CA/US），备注只保留 colo 与运营商
+    const tag = [x.colo, x.carrier && carrierName(x.carrier)].filter(Boolean).join("-");
     return withComment ? `${fmtAddr(x)}#${tag || "CF"}` : fmtAddr(x);
   }).join("\n");
 }
@@ -1765,7 +1795,7 @@ async function handle(request, env, ctx) {
       total: ips.length,
       returned: filtered.length,
       updatedAt: data.updatedAt,
-      qualityNote: "testedBy=hostmonit 表示来源实测；testedBy=source 表示来源推荐，非本 Worker TCP 实测。",
+      qualityNote: "testedBy=hostmonit/uouin 表示国内三网来源实测；testedBy=source 表示来源推荐，非本 Worker TCP 实测；refDelay 为海外测速，仅供参考。",
       ips: filtered.map(withQuality),
     });
   }
@@ -2093,7 +2123,7 @@ function renderHome(data, visitor, nonce) {
   const fmtSpeed = (x) => x.mbps != null ? `${x.mbps}M` : "—";
   const fmtQuality = (x) => {
     const q = x.quality || qualityForIp(x);
-    if (q.testedBy === "hostmonit") return "hostmonit 实测";
+    if (x.tested) return `国内实测 · ${q.testedBy}`;
     if (q.confidence === "medium") return "多源推荐未测";
     return "来源推荐未测";
   };
