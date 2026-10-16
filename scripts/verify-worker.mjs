@@ -54,7 +54,7 @@ const checks = [
   ['readme security batch 1', readme.includes('refresh:running') && readme.includes('仅保存在当前 JS 内存') && readme.includes('导入运行时配置')],
   ['theme switcher', source.includes('data-theme-choice="system"') && source.includes('data-theme-choice="aurora"') && source.includes('cf-best-ip-theme')],
   ['readme theme switcher', readme.includes('深海 / 浅色 / 极光 / 琥珀')],
-  ['version 3.9.0', source.includes('const VERSION = "3.9.0"') && readme.includes('version-3.9.0-blue')],
+  ['version 3.9.1', source.includes('const VERSION = "3.9.1"') && readme.includes('version-3.9.1-blue')],
 ];
 for (const [name, ok] of checks) {
   if (!ok) throw new Error(`check failed: ${name}`);
