@@ -239,12 +239,49 @@ wrangler secret put ECH_REPORT_TOKEN   # 随机长串；与 GitHub Actions secre
   - 7 天未更新的条目自动清理。
 - 返回：`{"ok": true, "accepted": 2, "counts": {"ok": 1, "restricted": 1, "unknown": 1}, "stored": 280, "pruned": 0}`。
 
+### 探测器：`tools/ech-probe` + Actions `ECH Probe`
+
+Go 程序（Go ≥ 1.24，只用标准库，`crypto/tls` 的 `EncryptedClientHelloConfigList`），由 `.github/workflows/ech-probe.yml` 每 6 小时 UTC 第 45 分钟运行（池子 :15 刷新后 30 分钟），也可手动运行（可勾选 `dry_run`）。
+
+流程：
+
+1. 从 `/api/ips?limit=1000` 取池子，并按 `/api/stats` 的国家分桶补齐（单次 `/api/ips` 最多返回 200 行），只留 IPv4、去重。
+2. 对每个哨兵主机名经 DoH（`https://cloudflare-dns.com/dns-query`，RFC 8484 wireformat，TYPE65）取 HTTPS 记录里的 `ech` 配置；哨兵本身没发布 ECH 时（如 `www.cloudflare.com`）借用 `cloudflare-ech.com` 的配置（Cloudflare 全网共用这一把 ECH key）。
+3. 对每个 IP × 哨兵：TCP 连 `IP:443`，SNI = 哨兵，带 ECH 做 TLS 1.3 握手，`GET /cdn-cgi/trace`：
+   - 响应体含 `error code: 1034` / `Edge IP Restricted`（或 403 且含 1034）→ `restricted`；
+   - 拿到其它任何 HTTP 响应 → `ok`；
+   - 超时 / 连接 / 握手错误重试 1 次仍失败 → `unknown`（网络错误永远不会判成 `restricted`）。
+4. 单 IP 结论：任一哨兵 `restricted` → `restricted`；全部 `ok` → `ok`；否则 `unknown`。并发 16，单次 8 秒超时。
+5. 护栏：`restricted` 占比 > 50% 或 `unknown` 占比 > 30% 视为探测环境异常，非零退出、不上报。否则带 `runId = GITHUB_RUN_ID` 上报。
+
+需要的设置：
+
+| 位置 | 名称 | 说明 |
+|---|---|---|
+| Actions secret | `ECH_REPORT_TOKEN` | 必填，与 Worker secret `ECH_REPORT_TOKEN` 同值；缺失时工作流直接失败并提示 |
+| Actions variable | `ECH_SENTINELS` | 可选，逗号分隔的哨兵主机名；默认 `doh.leilaomi.ccwu.cc,www.cloudflare.com`。哨兵应选**开着 ECH 的 Free 计划站点**（最严格），`www.cloudflare.com` 只作补充 |
+
+> 如果 Worker 域名开了 Bot Fight Mode / WAF 托管规则，GitHub Actions 的 `POST /api/ech-report` 可能被拦截（403 / 质询页）。需要在 Cloudflare 面板对路径 `/api/ech-report` 加一条 WAF 自定义规则「Skip」（跳过托管规则 / Bot Fight / 超级机器人模式）。接口本身有独立 Token 鉴权和限流。
+
+本地运行：
+
+```bash
+cd tools/ech-probe
+go test ./...
+go run . -dry-run                              # 探测全池，只打印汇总
+go run . -dry-run -v -ips 162.159.136.89,104.16.0.195   # 指定 IP，打印每次握手结果
+ECH_REPORT_TOKEN=... go run .                  # 探测并上报
+```
+
+其它参数：`-sentinels`、`-path`（默认 `/cdn-cgi/trace`）、`-concurrency`、`-timeout`、`-doh`、`-ech-fallback`、`-api`、`-max-restricted`、`-max-unknown`，见 `go run . -h`。
+
 ---
 
 ## 监控与告警
 
 - **GitHub Actions `Health Check`**：每 30 分钟请求一次 `/health`，失败重试 3 次。可在仓库变量 `HEALTH_URL` 里改地址。
 - **GitHub Actions `Scheduled Test`**：运行单元测试和 `scripts/verify-worker.mjs`。
+- **GitHub Actions `ECH Probe`**：每 6 小时带 ECH 探测池子并上报 `/api/ech-report`，汇总写在运行页的 Summary 里。
 - **Telegram**（可选）：每次刷新推送结果；另外以下情况告警，24 小时内同类只发一次：
   - 某个数据源连续失败 3 次；
   - DNS 同步被限流；
@@ -277,6 +314,7 @@ src/cidr.js      Cloudflare 官方 CIDR 判断
 src/scoring.js   稳定分、质量保护、源健康统计
 src/dns.js       DNS 差量计划
 src/ech.js       ECH 打标：上报校验、合并、/api/ips 的 ech 字段
+tools/ech-probe/ ECH 探测器（Go，GitHub Actions 定时运行）
 scripts/verify-worker.mjs
 test/
 wrangler.toml
