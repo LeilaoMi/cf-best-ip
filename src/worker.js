@@ -367,7 +367,7 @@ async function rateLimitByIp(request, env, keyPrefix, limitEnv, defLimit) {
   return null;
 }
 async function requireApiIpsAccess(request, env) {
-  if (env.API_IPS_REQUIRE_TOKEN === "1" && !isApiIpsAuthorized(request, env)) {
+  if (env.API_IPS_REQUIRE_TOKEN === "1" && !isApiIpsAuthorized(request, env) && !isEchReportAuthorized(request, env)) {
     return json({ ok: false, error: "unauthorized", hint: "需要 Authorization: Bearer <API_IPS_TOKEN> 或 <ADMIN_TOKEN>" }, { status: 401 });
   }
   return rateLimitByIp(request, env, "api_ips", "API_IPS_RATE_LIMIT", 60);
@@ -390,6 +390,15 @@ function requireEchReportAuth(request, env) {
     return json({ ok: false, error: "unauthorized", hint: "需要 Authorization: Bearer <ECH_REPORT_TOKEN>" }, { status: 401 });
   }
   return null;
+}
+/**
+ * 请求是否携带有效的 ECH_REPORT_TOKEN（Bearer 头，常量时间比较；未配置 secret 时恒为 false）。
+ * 只用于给探测器放宽 /api/ips 的行数上限；token 错误时调用方按公共请求处理，不返回 401。
+ * @returns {boolean}
+ */
+function isEchReportAuthorized(request, env) {
+  if (!env.ECH_REPORT_TOKEN) return false;
+  return constantTimeEqual(bearerToken(request), env.ECH_REPORT_TOKEN);
 }
 /**
  * 读取 KV ech:status；任何读取/解析失败都返回 null，保证 /api/ips 不受影响。
@@ -1589,7 +1598,21 @@ function rankCompare(a, b) {
   if (ad !== bd) return ad - bd;
   return (b.sources?.length || 0) - (a.sources?.length || 0);
 }
-function applyFilter(ips, params, requesterColo, cfg) {
+/** 公共请求单次最多返回的行数（/sub、/api/ips、/api/preferred-ips）。 */
+const PUBLIC_MAX_TOP = 200;
+/** 携带有效 ECH_REPORT_TOKEN 的 /api/ips 请求可取的最大行数（探测器一次取全池）。 */
+const ECH_READER_MAX_TOP = 2000;
+
+/**
+ * 按查询参数筛选、排序并截断 IP 列表。
+ * @param {object[]} ips 池子
+ * @param {URLSearchParams} params 查询参数
+ * @param {string | undefined} requesterColo 访问者 colo（smart=1 用）
+ * @param {object} cfg 运行配置
+ * @param {number} [maxTop=PUBLIC_MAX_TOP] top/limit 的上限；只有已鉴权的调用方才会放宽
+ * @returns {object[]}
+ */
+function applyFilter(ips, params, requesterColo, cfg, maxTop = PUBLIC_MAX_TOP) {
   const country = (params.get("country") || "").toUpperCase();
   const colo = (params.get("colo") || "").toUpperCase();
   const carrier = (params.get("carrier") || "").toUpperCase();
@@ -1599,7 +1622,7 @@ function applyFilter(ips, params, requesterColo, cfg) {
   const exclude = (params.get("exclude") || "").toUpperCase().split(",").map(v => v.trim()).filter(Boolean);
   let top = Number(params.get("top") || params.get("limit") || 20);
   if (!Number.isFinite(top) || top < 1) top = 20;
-  if (top > 200) top = 200;
+  if (top > maxTop) top = maxTop;
 
   // 分国家 top-N 模式（来自 cfnb）：?perCountry=1 或 cfg.perCountryMode
   const perCountryQuery = params.get("perCountry");
@@ -1829,7 +1852,9 @@ async function handle(request, env, ctx) {
     // ?ech=1：排除最近确认 ECH 受限（ech === false）的 IP；true 与 null（未知/过期）保留
     const echOnly = ["1", "true", "yes"].includes((params.get("ech") || "").toLowerCase());
     const pool = echOnly ? ips.filter(x => echOf(x.ip) !== false) : ips;
-    const filtered = applyFilter(pool, params, requesterColo, cfg);
+    // 带有效 ECH_REPORT_TOKEN 的探测器可一次取到 ECH_READER_MAX_TOP 行；其它请求（含 token 错误）仍按公共上限 200
+    const maxTop = isEchReportAuthorized(request, env) ? ECH_READER_MAX_TOP : PUBLIC_MAX_TOP;
+    const filtered = applyFilter(pool, params, requesterColo, cfg, maxTop);
     return json({
       ok: true,
       total: ips.length,
