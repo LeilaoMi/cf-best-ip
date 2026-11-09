@@ -89,6 +89,11 @@ func parseECHFromDNSResponse(msg []byte, wantID uint16) ([]byte, error) {
 	if flags&0x8000 == 0 {
 		return nil, errors.New("not a DNS response")
 	}
+	// TC: the HTTPS RRset may be partial, so its ECH config cannot be
+	// trusted; failing lets the caller try -ech-fallback or stop.
+	if flags&0x0200 != 0 {
+		return nil, errors.New("truncated DNS response (TC set)")
+	}
 	if rcode := flags & 0x000F; rcode != 0 {
 		return nil, fmt.Errorf("DNS rcode %d", rcode)
 	}

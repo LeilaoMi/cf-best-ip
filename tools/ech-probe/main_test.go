@@ -154,6 +154,11 @@ func TestParseECHFromDNSResponse(t *testing.T) {
 	if _, err := parseECHFromDNSResponse(msg[:len(msg)-3], 0x1234); err == nil {
 		t.Fatal("truncated message must fail")
 	}
+	tc := append([]byte(nil), msg...)
+	binary.BigEndian.PutUint16(tc[2:], binary.BigEndian.Uint16(tc[2:])|0x0200)
+	if _, err := parseECHFromDNSResponse(tc, 0x1234); err == nil || !strings.Contains(err.Error(), "TC") {
+		t.Fatalf("TC response must fail, got %v", err)
+	}
 }
 
 // TestEchFromSVCB rejects AliasMode, missing and truncated ech params.
