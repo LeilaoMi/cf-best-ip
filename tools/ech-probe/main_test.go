@@ -253,6 +253,7 @@ func TestReport(t *testing.T) {
 // TestRunRequiresTokenUnlessDryRun checks the missing-secret exit code.
 func TestRunRequiresTokenUnlessDryRun(t *testing.T) {
 	t.Setenv("ECH_REPORT_TOKEN", "")
+	t.Setenv("ECH_SENTINELS", "sentinel.example.com")
 	t.Setenv("ECH_API_BASE", "https://bestip.example.com")
 	if code := run([]string{"-ips", "1.2.3.4"}); code != 2 {
 		t.Fatalf("run without token = %d, want 2", code)
@@ -263,6 +264,7 @@ func TestRunRequiresTokenUnlessDryRun(t *testing.T) {
 // explicitly (env ECH_API_BASE or -api) and must be https.
 func TestAPIBaseHasNoDefault(t *testing.T) {
 	t.Setenv("ECH_API_BASE", "")
+	t.Setenv("ECH_SENTINELS", "sentinel.example.com")
 	for _, args := range [][]string{
 		{"-dry-run"},        // dry-run still fetches the pool
 		{"-ips", "1.2.3.4"}, // reporting needs a target
@@ -290,6 +292,37 @@ func TestAPIBaseHasNoDefault(t *testing.T) {
 	t.Setenv("ECH_REPORT_TOKEN", "tok")
 	if code := run([]string{"-ips", "1.2.3.4"}); code != 2 {
 		t.Fatalf("run without API base = %d, want 2", code)
+	}
+}
+
+// TestSentinelsHaveNoDefault checks that sentinels must be given explicitly
+// (env ECH_SENTINELS or -sentinels), dry-run included.
+func TestSentinelsHaveNoDefault(t *testing.T) {
+	t.Setenv("ECH_API_BASE", "https://bestip.example.com")
+	t.Setenv("ECH_REPORT_TOKEN", "tok")
+	for _, v := range []string{"", " , ,"} {
+		t.Setenv("ECH_SENTINELS", v)
+		for _, args := range [][]string{
+			nil,
+			{"-dry-run"},
+			{"-dry-run", "-ips", "1.2.3.4"},
+			{"-sentinels", " , "},
+		} {
+			if _, err := parseOptions(args); err == nil || !strings.Contains(err.Error(), "ECH_SENTINELS") {
+				t.Fatalf("ECH_SENTINELS=%q parseOptions(%v) err = %v, want sentinels error", v, args, err)
+			}
+		}
+		if code := run([]string{"-dry-run", "-ips", "1.2.3.4"}); code != 2 {
+			t.Fatalf("run without sentinels = %d, want 2", code)
+		}
+	}
+	o, err := parseOptions([]string{"-sentinels", "One.example.com,two.example.com"})
+	if err != nil || strings.Join(o.sentinels, ",") != "one.example.com,two.example.com" {
+		t.Fatalf("-sentinels: %v %v", o.sentinels, err)
+	}
+	t.Setenv("ECH_SENTINELS", "env.example.com")
+	if o, err := parseOptions([]string{"-sentinels", "flag.example.com"}); err != nil || strings.Join(o.sentinels, ",") != "flag.example.com" {
+		t.Fatalf("flag must override env: %v %v", o.sentinels, err)
 	}
 }
 

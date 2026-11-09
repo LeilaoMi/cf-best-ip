@@ -27,11 +27,10 @@ import (
 )
 
 const (
-	defaultDoH       = "https://cloudflare-dns.com/dns-query"
-	defaultSentinels = "doh.leilaomi.ccwu.cc,www.cloudflare.com"
-	maxReportIPs     = 2000 // must match the Worker's limit
-	poolLimit        = 2000 // /api/ips row cap for ECH_REPORT_TOKEN holders (Worker ECH_READER_MAX_TOP)
-	userAgent        = "cf-best-ip-ech-probe/1"
+	defaultDoH   = "https://cloudflare-dns.com/dns-query"
+	maxReportIPs = 2000 // must match the Worker's limit
+	poolLimit    = 2000 // /api/ips row cap for ECH_REPORT_TOKEN holders (Worker ECH_READER_MAX_TOP)
+	userAgent    = "cf-best-ip-ech-probe/1"
 )
 
 type options struct {
@@ -82,7 +81,8 @@ func parseOptions(args []string) (options, error) {
 	fs.StringVar(&o.dohURL, "doh", envOr("ECH_DOH_URL", defaultDoH), "DoH endpoint (RFC 8484) used to fetch ECH configs")
 	fs.StringVar(&o.echFallback, "ech-fallback", envOr("ECH_FALLBACK_HOST", "cloudflare-ech.com"),
 		"host whose ECH config is used for sentinels that publish none (Cloudflare shares one ECH key; empty disables)")
-	sentinels := fs.String("sentinels", envOr("ECH_SENTINELS", defaultSentinels), "comma-separated sentinel hostnames (env ECH_SENTINELS)")
+	sentinels := fs.String("sentinels", envOr("ECH_SENTINELS", ""),
+		"comma-separated sentinel hostnames: your own Cloudflare-proxied hosts that answer 1034 on restricted IPs (env ECH_SENTINELS; required, no default)")
 	fs.StringVar(&o.path, "path", "/cdn-cgi/trace", "HTTP path requested on each sentinel")
 	fs.IntVar(&o.concurrency, "concurrency", 16, "parallel IP probes")
 	fs.DurationVar(&o.timeout, "timeout", 8*time.Second, "timeout per connection attempt")
@@ -95,8 +95,11 @@ func parseOptions(args []string) (options, error) {
 		return o, err
 	}
 	o.sentinels = splitList(*sentinels)
+	// No built-in default: a sentinel the operator does not control can
+	// change plan, drop ECH or alter its responses, silently turning
+	// restricted IPs into "ok".
 	if len(o.sentinels) == 0 {
-		return o, errors.New("no sentinels configured")
+		return o, errors.New("sentinels not set: set ECH_SENTINELS (Actions variable) or -sentinels to your own Cloudflare-proxied hostnames that return error 1034 on restricted IPs")
 	}
 	for _, s := range splitList(*ips) {
 		a, err := netip.ParseAddr(s)

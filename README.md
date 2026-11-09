@@ -267,7 +267,7 @@ Go 程序（Go ≥ 1.24，只用标准库，`crypto/tls` 的 `EncryptedClientHel
 |---|---|---|
 | Actions variable | `ECH_API_BASE` | **必填**，你自建 Worker 的 HTTPS 地址（如 `https://bestip.example.com`，不带路径）。取池子和上报都用它，上报会带 Token，所以**没有默认值**；未设置或不是 `https://` 时工作流（含 dry-run）直接失败并提示 |
 | Actions secret | `ECH_REPORT_TOKEN` | 必填，与 Worker secret `ECH_REPORT_TOKEN` 同值；缺失时工作流直接失败并提示。勾选 dry_run 时可不填，但只能取到 200 行；若 Worker 开了 `API_IPS_REQUIRE_TOKEN=1`，无 Token 读 `/api/ips` 会 401，dry-run 也必须提供 |
-| Actions variable | `ECH_SENTINELS` | 可选，逗号分隔的哨兵主机名；默认 `doh.leilaomi.ccwu.cc,www.cloudflare.com`（`doh.leilaomi.ccwu.cc` 是本仓库作者自己的 Free 计划站点）。哨兵应选**你自己控制、开着 ECH 的 Free 计划站点**（最严格），`www.cloudflare.com` 只作补充。**fork 部署请务必设置此变量**：默认哨兵不归你控制，若它换套餐、关 ECH 或改响应，结论会悄悄变错（非 1034 的响应都判 `ok`） |
+| Actions variable | `ECH_SENTINELS` | **必填**，逗号分隔的哨兵主机名（如 `doh.example.com,www.example.com`），**没有默认值**；未设置时工作流（含 dry-run）直接失败并提示。应填**你自己的**、经 Cloudflare 代理（橙云）且对 1034 敏感的主机名——最好是开着 ECH 的 Free 计划站点（限制最严格）。不要用不归你控制的主机：它换套餐、关 ECH 或改响应时，结论会悄悄变错（非 1034 的响应都判 `ok`）。`www.cloudflare.com` 只作补充，不建议单独使用 |
 
 > **定时运行的启用条件**：fork 出来的公开仓库默认**不会**运行定时工作流，配好变量和 secret 后还要到 fork 的「Actions」页面点「I understand my workflows, go ahead and enable them」，再在左侧选 `ECH Probe` 点「Enable workflow」。公开仓库连续 60 天没有活动时 GitHub 也会自动停用定时工作流（会发邮件提醒），需要回到同一页面重新启用。定时探测停掉后，`ech` 标记会在 36 小时后全部变回 `null`。
 
@@ -287,6 +287,7 @@ Go 程序（Go ≥ 1.24，只用标准库，`crypto/tls` 的 `EncryptedClientHel
 ```bash
 cd tools/ech-probe
 go test ./...
+export ECH_SENTINELS=doh.example.com,www.example.com     # 必填：换成你自己的哨兵主机名（也可用 -sentinels）
 go run . -dry-run -v -ips 162.159.136.89,104.16.0.195   # 指定 IP，打印每次握手结果（不需要 -api）
 go run . -dry-run -api https://bestip.example.com       # 取池子探测，只打印汇总（无 Token 时最多 200 行；Worker 开了 API_IPS_REQUIRE_TOKEN=1 时会 401，需带 Token）
 ECH_REPORT_TOKEN=... go run . -dry-run -api https://bestip.example.com   # 带 Token 取全池，只打印汇总
@@ -295,7 +296,9 @@ ECH_REPORT_TOKEN=... go run . -api https://bestip.example.com            # 探�
 
 `-api`（或环境变量 `ECH_API_BASE`）**没有默认值**，必须是你自建 Worker 的 `https://` 地址；只有「`-dry-run` + `-ips`」这种既不取池子也不上报的用法可以省略。
 
-其它参数：`-sentinels`、`-path`（默认 `/cdn-cgi/trace`）、`-concurrency`、`-timeout`、`-doh`、`-ech-fallback`、`-max-restricted`、`-max-unknown`，见 `go run . -h`。
+`-sentinels`（或环境变量 `ECH_SENTINELS`）同样**没有默认值**，任何用法都必须提供。
+
+其它参数：`-path`（默认 `/cdn-cgi/trace`）、`-concurrency`、`-timeout`、`-doh`、`-ech-fallback`、`-max-restricted`、`-max-unknown`，见 `go run . -h`。
 
 ---
 
