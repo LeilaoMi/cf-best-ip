@@ -384,6 +384,27 @@ func runID() string {
 	return "local-" + time.Now().UTC().Format("20060102T150405Z")
 }
 
+// errInsecureRedirect is returned for redirects that would leave HTTPS.
+var errInsecureRedirect = errors.New("refusing redirect to a non-https URL")
+
+// checkRedirect refuses any redirect that leaves https (requests may carry
+// the ECH_REPORT_TOKEN) and keeps Go's default limit of 10 redirects. Go
+// already drops Authorization on redirects to another host.
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	if req.URL.Scheme != "https" {
+		return fmt.Errorf("%w: %s", errInsecureRedirect, req.URL.Redacted())
+	}
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	return nil
+}
+
+// newHTTPClient is the client used for DoH, the pool and the report.
+func newHTTPClient() *http.Client {
+	return &http.Client{Timeout: 20 * time.Second, CheckRedirect: checkRedirect}
+}
+
 // run is the whole program; it returns the process exit code (0 ok,
 // 1 probe/report failure or guard tripped, 2 usage error).
 func run(args []string) int {
@@ -400,7 +421,7 @@ func run(args []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	httpClient := &http.Client{Timeout: 20 * time.Second}
+	httpClient := newHTTPClient()
 
 	var targets []probeTarget
 	var fallbackECH []byte
@@ -416,14 +437,13 @@ func run(args []string) int {
 			}
 		}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "warn: sentinel %s skipped, no ECH config: %v\n", h, err)
-			continue
+			// Probing with fewer sentinels than configured would weaken the
+			// verdict (e.g. losing the strict Free-plan sentinel turns
+			// restricted IPs into ok), so stop instead of reporting.
+			fmt.Fprintf(os.Stderr, "error: sentinel %s has no ECH config (and no fallback): %v; nothing reported\n", h, err)
+			return 1
 		}
 		targets = append(targets, probeTarget{Host: h, ECH: ech})
-	}
-	if len(targets) == 0 {
-		fmt.Fprintln(os.Stderr, "error: no sentinel has an ECH config; nothing reported")
-		return 1
 	}
 
 	ips := o.ipsOverride

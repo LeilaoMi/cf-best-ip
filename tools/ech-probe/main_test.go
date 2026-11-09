@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -337,5 +338,34 @@ func TestPoolWarnings(t *testing.T) {
 	}
 	if w := poolWarnings(poolResult{Total: 328, Returned: 200}, true); len(w) != 1 || !strings.Contains(w[0], "not have") {
 		t.Fatalf("old worker: %v", w)
+	}
+}
+
+// TestCheckRedirectRefusesDowngrade checks that credentials never follow a
+// redirect to plain http and that the default redirect limit stays.
+func TestCheckRedirectRefusesDowngrade(t *testing.T) {
+	mk := func(u string) *http.Request {
+		r, err := http.NewRequest(http.MethodGet, u, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	via := []*http.Request{mk("https://bestip.example.com/api/ips")}
+	if err := checkRedirect(mk("http://bestip.example.com/api/ips"), via); !errors.Is(err, errInsecureRedirect) {
+		t.Fatalf("http redirect: %v", err)
+	}
+	if err := checkRedirect(mk("https://bestip.example.com/api/ips/"), via); err != nil {
+		t.Fatalf("https redirect: %v", err)
+	}
+	ten := make([]*http.Request, 10)
+	for i := range ten {
+		ten[i] = via[0]
+	}
+	if err := checkRedirect(mk("https://bestip.example.com/x"), ten); err == nil {
+		t.Fatal("11th redirect must stop")
+	}
+	if newHTTPClient().CheckRedirect == nil {
+		t.Fatal("client must install checkRedirect")
 	}
 }

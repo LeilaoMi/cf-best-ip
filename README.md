@@ -249,8 +249,9 @@ Go 程序（Go ≥ 1.24，只用标准库，`crypto/tls` 的 `EncryptedClientHel
 
 流程：
 
-1. 带 `Authorization: Bearer <ECH_REPORT_TOKEN>` 一次请求 `/api/ips?limit=2000&perCountry=0` 取全池（不带 `ech` 过滤），只留 IPv4、去重。Worker 只对有效 Token 放宽到 2000 行；不带 Token（如本地 dry-run）或 Worker 尚未部署这项改动时最多 200 行。返回行数少于池子总数、或正好达到 2000 行上限时会打印 `warn:`，未取到的 IP 本轮不探测（它们的旧标记 36 小时后变回 `null`）。
+1. （HTTP 客户端拒绝任何跳出 https 的重定向，Token 不会明文外泄）带 `Authorization: Bearer <ECH_REPORT_TOKEN>` 一次请求 `/api/ips?limit=2000&perCountry=0` 取全池（不带 `ech` 过滤），只留 IPv4、去重。Worker 只对有效 Token 放宽到 2000 行；不带 Token（如本地 dry-run）或 Worker 尚未部署这项改动时最多 200 行。返回行数少于池子总数、或正好达到 2000 行上限时会打印 `warn:`，未取到的 IP 本轮不探测（它们的旧标记 36 小时后变回 `null`）。
 2. 对每个哨兵主机名经 DoH（`https://cloudflare-dns.com/dns-query`，RFC 8484 wireformat，TYPE65）取 HTTPS 记录里的 `ech` 配置；哨兵本身没发布 ECH 时（如 `www.cloudflare.com`）借用 `cloudflare-ech.com` 的配置（Cloudflare 全网共用这一把 ECH key）。
+   - 每个哨兵都必须取到 ECH 配置（自身或 `-ech-fallback` 借用）；任一哨兵取不到时整次运行失败、不上报（少了最严格的哨兵会把受限 IP 误判成 `ok`）。
 3. 对每个 IP × 哨兵：TCP 连 `IP:443`，SNI = 哨兵，带 ECH 做 TLS 1.3 握手，`GET /cdn-cgi/trace`：
    - 响应体匹配带单词边界的 `error code: 1034`（`10345` 不算）或含 `Edge IP Restricted` → `restricted`；
    - 403 且响应体匹配带单词边界的 `Error 1034` / `error code: 1034`（不区分大小写）→ `restricted`；仅在 Ray ID 等位置出现数字 `1034` **不算**；
@@ -270,12 +271,13 @@ Go 程序（Go ≥ 1.24，只用标准库，`crypto/tls` 的 `EncryptedClientHel
 > **Cloudflare 安全功能可能拦截 Actions 的上报**（403 / 质询页，工作流会以 `report HTTP 403` 失败；连续失败超过 36 小时后 `ech` 标记会全部变回 `null`）。按 Worker 域名所在 zone 开启的功能分别处理：
 >
 > - **Bot Fight Mode**（免费版「机器人攻击模式」）：WAF 自定义规则**无法**跳过它（[Cloudflare 文档](https://developers.cloudflare.com/waf/custom-rules/skip/options/)）。如果它拦截了上报，只能在「安全性 → 机器人」里关闭 Bot Fight Mode，或升级到 Super Bot Fight Mode 后用下面的 Skip 规则。
-> - **Super Bot Fight Mode / WAF 托管规则**（bot 类检查）：加一条 WAF 自定义规则，表达式 `(http.request.uri.path eq "/api/ech-report" and http.request.method eq "POST")`，动作 **Skip**，只勾选「All Super Bot Fight Mode rules」和（确有误拦时）「All managed rules」。
-> - **取池子的 `GET /api/ips` 也被拦**（工作流在上报前就以 `fetch pool: ... HTTP 403` 失败）：确认是 bot 类误拦后，把上面那条 Skip 规则的表达式扩成 `(http.request.uri.path eq "/api/ech-report" and http.request.method eq "POST") or (http.request.uri.path eq "/api/ips" and http.request.method eq "GET")`，跳过范围同样只限 bot 类检查。`/api/ips` 是公开读接口，Worker 内限流（`API_IPS_RATE_LIMIT`）照常生效。
+> - **Super Bot Fight Mode**：加一条 WAF 自定义规则，表达式 `(http.host eq "bestip.example.com" and http.request.uri.path eq "/api/ech-report" and http.request.method eq "POST")`（`bestip.example.com` 换成你的 Worker 主机名，避免同 zone 其它站点的同名路径也被匹配），动作 **Skip**，只勾选「All Super Bot Fight Mode rules」。
+> - **WAF 托管规则误拦**：**不要**勾选「All managed rules」（那会让匹配的请求跳过全部攻击检测）。在「安全性 → 事件」里找到拦截它的具体托管规则 ID，只为这些规则 ID 在托管规则集上加例外（Skip 指定规则），条件同样带上 `http.host` + 路径 + 方法。
+> - **取池子的 `GET /api/ips` 也被拦**（工作流在上报前就以 `fetch pool: ... HTTP 403` 失败）：确认是 bot 类误拦后，把上面的表达式扩成 `http.host eq "bestip.example.com" and ((http.request.uri.path eq "/api/ech-report" and http.request.method eq "POST") or (http.request.uri.path eq "/api/ips" and http.request.method eq "GET"))`，跳过范围同样只限上面两类（Super Bot Fight Mode、具体误拦的托管规则 ID）。`/api/ips` 是公开读接口，Worker 内限流（`API_IPS_RATE_LIMIT`）照常生效。
 > - **速率限制规则：不要跳过。** 上面的表达式只按路径和方法匹配，任何人都能构造出这样的请求，跳过速率限制等于让未鉴权的请求绕过边缘限流。探测器每 6 小时只发 1 次上报（取池子 1 次），正常的边缘限流不会挡住它；如果确实被限流，请放宽该规则的阈值，而不是对这条路径整体 Skip。
 > - **Browser Integrity Check / Security Level** 等非规则引擎产品：同一条 Skip 规则里在「More components to skip」中勾选对应产品（同样只为 bot 类误拦）。
 >
-> 接口本身仍有独立 Token 鉴权（`ECH_REPORT_TOKEN`）和 Worker 内限流，并保留边缘限流；跳过 bot 类检查不会让它变成公开写入口。
+> 接口本身仍有独立 Token 鉴权（`ECH_REPORT_TOKEN`）和 Worker 内限流，并保留边缘限流与其余托管规则；只跳过 bot 类检查和具体误拦的规则，不会让它变成公开写入口。
 
 本地运行：
 
