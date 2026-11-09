@@ -73,6 +73,8 @@ test('validateEchReport rejects malformed input', () => {
     report([], { runId: '' }),
     report([], { runId: 'has space' }),
     report([], { runId: 12 }),
+    report([], { runId: 'x'.repeat(129) }),
+    report([], { runId: 'a/b' }),
     report([], { sentinels: [] }),
     report([], { sentinels: 'doh.example.com' }),
     report([], { sentinels: ['not a host'] }),
@@ -366,4 +368,12 @@ test('mergeEchStatus caps the stored entry count and drops the oldest first', ()
   assert.equal(r.pruned, 3);
   assert.equal(r.accepted, 2);
   assert.ok(ECH_MAX_STORED >= 2 * ECH_MAX_RESULTS);
+});
+
+test('validateEchReport accepts any documented runId character, including as the first one', () => {
+  for (const runId of ['_probe', '-probe', '.probe', ':probe', '123456.2', 'local-20261109T135000Z', 'x'.repeat(128)]) {
+    const r = validateEchReport(report([], { runId }));
+    assert.equal(r.ok, true, runId);
+    assert.equal(r.report.runId, runId);
+  }
 });
