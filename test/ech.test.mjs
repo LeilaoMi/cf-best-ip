@@ -377,3 +377,18 @@ test('validateEchReport accepts any documented runId character, including as the
     assert.equal(r.report.runId, runId);
   }
 });
+
+test('POST /api/ech-report answers a retryable 503 (not 500, not ok) when the KV write fails', async () => {
+  const env = makeEnv({ ECH_REPORT_TOKEN: 'ech-secret', ECH_REPORT_RATE_LIMIT: '0' });
+  const put = env.KV.put.bind(env.KV);
+  env.KV.put = async (key, value, opts) => {
+    if (key === ECH_STATUS_KEY) throw new Error('KV PUT failed: 429 Too Many Requests');
+    return put(key, value, opts);
+  };
+  const res = await worker.fetch(new Request(HOST + '/api/ech-report', post('ech-secret', report([{ ip: '104.16.0.195', status: 'ok' }]))), env, { waitUntil() {} });
+  assert.equal(res.status, 503);
+  assert.equal(res.headers.get('retry-after'), '2');
+  const body = await res.json();
+  assert.deepEqual({ ok: body.ok, error: body.error }, { ok: false, error: 'kv-write-failed' });
+  assert.equal(env.KV.store.has(ECH_STATUS_KEY), false);
+});

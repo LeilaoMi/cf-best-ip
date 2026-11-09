@@ -1892,7 +1892,12 @@ async function handle(request, env, ctx) {
     try { prev = await kvGet(env, ECH_STATUS_KEY, null); }
     catch { return json({ ok: false, error: "kv-read-failed" }, { status: 503 }); }
     const { next, accepted, counts, pruned } = mergeEchStatus(prev, checked.report, Date.now());
-    await kvSet(env, ECH_STATUS_KEY, next);
+    try {
+      await kvSet(env, ECH_STATUS_KEY, next);
+    } catch {
+      // KV 同 key 每秒只能写一次（以及偶发的 KV 故障）：没写成功就不报成功，返回可重试的 503
+      return json({ ok: false, error: "kv-write-failed", retryAfter: 2 }, { status: 503, headers: { "retry-after": "2" } });
+    }
     return json({ ok: true, accepted, counts, stored: Object.keys(next.ips).length, pruned });
   }
 
