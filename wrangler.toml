@@ -37,6 +37,7 @@ SUB_RATE_LIMIT     = "120" # /sub 系订阅每 IP 每分钟限额；设 "0" 关�
 #   wrangler secret put REFRESH_TOKEN         # 手动刷新 /api/refresh 的 Bearer token
 #   wrangler secret put ADMIN_TOKEN           # /admin、/api/config、/api/diagnostics 等管理接口 Bearer token
 #   wrangler secret put TELEGRAM_BOT_TOKEN    # 可选
+#   wrangler secret put ECH_REPORT_TOKEN      # 可选，ECH 探测器上报 /api/ech-report 的独立 token（与 Actions secret 同值）
 
 [[durable_objects.bindings]]
 name = "REFRESH_LOCK"

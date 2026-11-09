@@ -25,12 +25,15 @@
  *    API_IPS_RATE_LIMIT         可选，/api/ips 每 IP 每分钟限额，默认 60
  *    REFRESH_TOKEN             可选但强烈建议，手动刷新 /api/refresh 的 Bearer token
  *    ALLOW_PUBLIC_REFRESH      可选，设 "1" 才允许无 token 手动刷新（不推荐）
+ *    ECH_REPORT_TOKEN          可选，ECH 探测器上报 /api/ech-report 的独立 Bearer token（未配置则该接口禁用）
+ *    ECH_REPORT_RATE_LIMIT     可选，/api/ech-report 每 IP 每分钟限额，默认 10
  *    TELEGRAM_BOT_TOKEN /
  *    TELEGRAM_CHAT_ID          可选，Cron 完成后推送通知
  *
  *  项目主路由：
  *    /                         展示页（uouin 风，处理页面测速）
- *    /api/ips                  JSON 节点列表（支持 carrier / country / colo 过滤）
+ *    /api/ips                  JSON 节点列表（支持 carrier / country / colo 过滤；每行带 ech 打标，?ech=1 排除 ECH 受限 IP）
+ *    /api/ech-report           POST，ECH 探测器上报（ECH_REPORT_TOKEN）
  *    /api/refresh              手动触发拉取 + 同步 DNS（60s 冷却）
  *    /api/stats                统计信息
  *    /api/dns/current          看 CF 当前 DNS 记录 + 最近一次同步结果
@@ -44,6 +47,7 @@
 // ============================================================
 import { isCfNativeIp } from "./cidr.js";
 import { isRateLimitError, planDnsRecordSync } from "./dns.js";
+import { ECH_MAX_BODY_BYTES, ECH_STATUS_KEY, makeEchLookup, mergeEchStatus, readBodyLimited, validateEchReport } from "./ech.js";
 import { applyStabilityScores, backoffSkipCycles, countByCarrier, qualityGuard, sourceHealth } from "./scoring.js";
 
 const VERSION = "3.9.1";
@@ -371,6 +375,22 @@ async function requireApiIpsAccess(request, env) {
 async function requireSubAccess(request, env) {
   // 订阅被 DDNS/客户端高频轮询，加宽松限流防刷；ADMIN/API token 持有者豁免
   return rateLimitByIp(request, env, "sub", "SUB_RATE_LIMIT", 120);
+}
+
+function requireEchReportAuth(request, env) {
+  // 独立 secret，不复用 ADMIN/REFRESH token；未配置即视为接口禁用
+  if (!env.ECH_REPORT_TOKEN) {
+    return json({ ok: false, error: "ech-report-disabled", hint: "请先配置 ECH_REPORT_TOKEN secret" }, { status: 503 });
+  }
+  if (!constantTimeEqual(bearerToken(request), env.ECH_REPORT_TOKEN)) {
+    return json({ ok: false, error: "unauthorized", hint: "需要 Authorization: Bearer <ECH_REPORT_TOKEN>" }, { status: 401 });
+  }
+  return null;
+}
+async function loadEchStatus(env) {
+  // ECH 打标只是附加信息：KV 读取失败时返回 null，/api/ips 照常输出（ech 字段为 null）
+  try { return await kvGet(env, ECH_STATUS_KEY, null); }
+  catch { return null; }
 }
 
 // BestCF.pages.dev 等聚合页的标题/广告行（如 "162.159.198.1:443#... | 10-16 12:39 | BestCF.pages.dev"）不是优选结果
@@ -1789,15 +1809,51 @@ async function handle(request, env, ctx) {
   if (path === "/api/ips") {
     const accessError = await requireApiIpsAccess(request, env);
     if (accessError) return accessError;
-    const filtered = applyFilter(ips, params, requesterColo, cfg);
+    const echStatus = await loadEchStatus(env);
+    const echOf = makeEchLookup(echStatus);
+    // ?ech=1：排除最近确认 ECH 受限（ech === false）的 IP；true 与 null（未知/过期）保留
+    const echOnly = ["1", "true", "yes"].includes((params.get("ech") || "").toLowerCase());
+    const pool = echOnly ? ips.filter(x => echOf(x.ip) !== false) : ips;
+    const filtered = applyFilter(pool, params, requesterColo, cfg);
     return json({
       ok: true,
       total: ips.length,
       returned: filtered.length,
       updatedAt: data.updatedAt,
+      echUpdatedAt: Number.isFinite(echStatus?.updatedAt) ? echStatus.updatedAt : null,
       qualityNote: "testedBy=hostmonit/uouin 表示国内三网来源实测；testedBy=source 表示来源推荐，非本 Worker TCP 实测；refDelay 为海外测速，仅供参考。",
-      ips: filtered.map(withQuality),
+      echNote: "ech=true 表示最近 36 小时内带 ECH 实测可用；ech=false 表示带 ECH 会被 Cloudflare 1034 拒绝（不带 ECH 仍可用）；null 表示未知或过期。",
+      ips: filtered.map(x => ({ ...withQuality(x), ech: echOf(x.ip) })),
     });
+  }
+
+  // ---- ECH 探测器上报（独立 ECH_REPORT_TOKEN）----
+  if (path === "/api/ech-report") {
+    if (request.method !== "POST") {
+      return json({ ok: false, error: "method-not-allowed", hint: "请使用 POST" }, { status: 405, headers: { allow: "POST" } });
+    }
+    const authError = requireEchReportAuth(request, env);
+    if (authError) return authError;
+    const limitError = await rateLimitByIp(request, env, "ech_report", "ECH_REPORT_RATE_LIMIT", 10);
+    if (limitError) return limitError;
+    if (!env.KV) return json({ ok: false, error: "kv-not-configured" }, { status: 503 });
+    let body;
+    try {
+      body = JSON.parse(await readBodyLimited(request, ECH_MAX_BODY_BYTES));
+    } catch (e) {
+      if (e?.code === "body-too-large") {
+        return json({ ok: false, error: "payload-too-large", maxBytes: ECH_MAX_BODY_BYTES }, { status: 413 });
+      }
+      return json({ ok: false, error: "invalid-json" }, { status: 400 });
+    }
+    const checked = validateEchReport(body);
+    if (!checked.ok) return json({ ok: false, error: "invalid-report", detail: checked.error }, { status: 400 });
+    let prev;
+    try { prev = await kvGet(env, ECH_STATUS_KEY, null); }
+    catch { return json({ ok: false, error: "kv-read-failed" }, { status: 503 }); }
+    const { next, accepted, counts, pruned } = mergeEchStatus(prev, checked.report, Date.now());
+    await kvSet(env, ECH_STATUS_KEY, next);
+    return json({ ok: true, accepted, counts, stored: Object.keys(next.ips).length, pruned });
   }
 
   // ---- 维度统计 ----

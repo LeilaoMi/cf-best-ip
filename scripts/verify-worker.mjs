@@ -50,6 +50,7 @@ const checks = [
   ['config import export', source.includes('params.get("export") === "1"') && source.includes('format: "cf-best-ip-config-v1"') && source.includes('imported: Boolean')],
   ['theme switcher', source.includes('data-theme-choice="system"') && source.includes('data-theme-choice="aurora"') && source.includes('cf-best-ip-theme')],
   ['version 3.9.1', source.includes('const VERSION = "3.9.1"')],
+  ['ech report separate token', source.includes('path === "/api/ech-report"') && source.includes('function requireEchReportAuth') && source.includes('env.ECH_REPORT_TOKEN') && readme.includes('wrangler secret put ECH_REPORT_TOKEN')],
 ];
 for (const [name, ok] of checks) {
   if (!ok) throw new Error(`check failed: ${name}`);
