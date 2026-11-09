@@ -244,12 +244,69 @@ wrangler secret put ECH_REPORT_TOKEN   # 随机长串；与 GitHub Actions secre
 - 返回：`{"ok": true, "accepted": 2, "counts": {"ok": 1, "restricted": 1, "unknown": 1}, "stored": 280, "pruned": 0}`。
 - KV 读取失败返回 `503 kv-read-failed`；写入失败（如两次上报间隔不足 1 秒触发 KV 同 key 写入限制）返回 `503 kv-write-failed` 并带 `retry-after: 2`，这次上报**未**写入，稍后重试即可；不会返回 500，也不会在未写入时报成功。
 
+### 探测器：`tools/ech-probe` + Actions `ECH Probe`
+
+Go 程序（Go ≥ 1.24，只用标准库，`crypto/tls` 的 `EncryptedClientHelloConfigList`），由 `.github/workflows/ech-probe.yml` 每 6 小时 UTC 第 45 分钟运行（池子 :15 刷新后 30 分钟），也可手动运行（可勾选 `dry_run`）。
+
+流程：
+
+1. （HTTP 客户端拒绝任何跳出 https 的重定向，Token 不会明文外泄）带 `Authorization: Bearer <ECH_REPORT_TOKEN>` 一次请求 `/api/ips?limit=2000&perCountry=0` 取全池（不带 `ech` 过滤），只留 IPv4、去重。Worker 只对有效 Token 放宽到 2000 行；不带 Token（如本地 dry-run）或 Worker 尚未部署这项改动时最多 200 行。返回行数少于池子总数、或正好达到 2000 行上限时会打印 `warn:`，未取到的 IP 本轮不探测（它们的旧标记 36 小时后变回 `null`）。
+2. 对每个哨兵主机名经 DoH（`https://cloudflare-dns.com/dns-query`，RFC 8484 wireformat，TYPE65）取 HTTPS 记录里的 `ech` 配置；哨兵本身没发布 ECH 时（如 `www.cloudflare.com`）借用 `cloudflare-ech.com` 的配置（Cloudflare 全网共用这一把 ECH key）。
+   - 每个哨兵都必须取到 ECH 配置（自身或 `-ech-fallback` 借用）；任一哨兵取不到时整次运行失败、不上报（少了最严格的哨兵会把受限 IP 误判成 `ok`）。
+3. 对每个 IP × 哨兵：TCP 连 `IP:443`，SNI = 哨兵，带 ECH 做 TLS 1.3 握手，`GET /cdn-cgi/trace`：
+   - 响应体匹配带单词边界的 `error code: 1034`（`10345` 不算）或含 `Edge IP Restricted` → `restricted`；
+   - 403 且响应体匹配带单词边界的 `Error 1034` / `error code: 1034`（不区分大小写）→ `restricted`；仅在 Ray ID 等位置出现数字 `1034` **不算**；
+   - 拿到其它任何 HTTP 响应 → `ok`；
+   - 超时 / 连接 / 握手错误重试 1 次仍失败 → `unknown`（网络错误永远不会判成 `restricted`）。
+4. 单 IP 结论：任一哨兵 `restricted` → `restricted`；全部 `ok` → `ok`；否则 `unknown`。并发 16，单次 8 秒超时。
+5. 护栏：`restricted` 占比 > 50% 或 `unknown` 占比 > 30% 视为探测环境异常，非零退出、不上报。否则带 `runId = GITHUB_RUN_ID` 上报。
+
+需要的设置：
+
+| 位置 | 名称 | 说明 |
+|---|---|---|
+| Actions variable | `ECH_API_BASE` | **必填**，你自建 Worker 的 HTTPS 地址（如 `https://bestip.example.com`，不带路径）。取池子和上报都用它，上报会带 Token，所以**没有默认值**；未设置或不是 `https://` 时工作流（含 dry-run）直接失败并提示 |
+| Actions secret | `ECH_REPORT_TOKEN` | 必填，与 Worker secret `ECH_REPORT_TOKEN` 同值；缺失时工作流直接失败并提示。勾选 dry_run 时可不填，但只能取到 200 行；若 Worker 开了 `API_IPS_REQUIRE_TOKEN=1`，无 Token 读 `/api/ips` 会 401，dry-run 也必须提供 |
+| Actions variable | `ECH_SENTINELS` | **必填**，逗号分隔的哨兵主机名（如 `doh.example.com,www.example.com`），**没有默认值**；未设置时工作流（含 dry-run）直接失败并提示。应填**你自己的**、经 Cloudflare 代理（橙云）且对 1034 敏感的主机名——最好是开着 ECH 的 Free 计划站点（限制最严格）。不要用不归你控制的主机：它换套餐、关 ECH 或改响应时，结论会悄悄变错（非 1034 的响应都判 `ok`）。`www.cloudflare.com` 只作补充，不建议单独使用 |
+
+> **定时运行的启用条件**：fork 出来的公开仓库默认**不会**运行定时工作流，配好变量和 secret 后还要到 fork 的「Actions」页面点「I understand my workflows, go ahead and enable them」，再在左侧选 `ECH Probe` 点「Enable workflow」。公开仓库连续 60 天没有活动时 GitHub 也会自动停用定时工作流（会发邮件提醒），需要回到同一页面重新启用。定时探测停掉后，`ech` 标记会在 36 小时后全部变回 `null`。
+
+> **Cloudflare 安全功能可能拦截 Actions 的上报**（403 / 质询页，工作流会以 `report HTTP 403` 失败；连续失败超过 36 小时后 `ech` 标记会全部变回 `null`）。按 Worker 域名所在 zone 开启的功能分别处理：
+>
+> - **Bot Fight Mode**（免费版「机器人攻击模式」）：WAF 自定义规则**无法**跳过它（[Cloudflare 文档](https://developers.cloudflare.com/waf/custom-rules/skip/options/)）。如果它拦截了上报，只能在「安全性 → 机器人」里关闭 Bot Fight Mode，或升级到 Super Bot Fight Mode 后用下面的 Skip 规则。
+> - **Super Bot Fight Mode**：加一条 WAF 自定义规则，表达式 `(http.host eq "bestip.example.com" and http.request.uri.path eq "/api/ech-report" and http.request.method eq "POST")`（`bestip.example.com` 换成你的 Worker 主机名，避免同 zone 其它站点的同名路径也被匹配），动作 **Skip**，只勾选「All Super Bot Fight Mode rules」。
+> - **WAF 托管规则误拦**：**不要**勾选「All managed rules」（那会让匹配的请求跳过全部攻击检测）。在「安全性 → 事件」里找到拦截它的具体托管规则 ID，只为这些规则 ID 在托管规则集上加例外（Skip 指定规则），条件同样带上 `http.host` + 路径 + 方法。
+> - **取池子的 `GET /api/ips` 也被拦**（工作流在上报前就以 `fetch pool: ... HTTP 403` 失败）：确认是 bot 类误拦后，把上面的表达式扩成 `http.host eq "bestip.example.com" and ((http.request.uri.path eq "/api/ech-report" and http.request.method eq "POST") or (http.request.uri.path eq "/api/ips" and http.request.method eq "GET"))`，跳过范围同样只限上面两类（Super Bot Fight Mode、具体误拦的托管规则 ID）。`/api/ips` 是公开读接口，Worker 内限流（`API_IPS_RATE_LIMIT`）照常生效。
+> - **速率限制规则：不要跳过。** 上面的表达式只按路径和方法匹配，任何人都能构造出这样的请求，跳过速率限制等于让未鉴权的请求绕过边缘限流。探测器每 6 小时只发 1 次上报（取池子 1 次），正常的边缘限流不会挡住它；如果确实被限流，请放宽该规则的阈值，而不是对这条路径整体 Skip。
+> - **Browser Integrity Check / Security Level** 等非规则引擎产品：同一条 Skip 规则里在「More components to skip」中勾选对应产品（同样只为 bot 类误拦）。
+>
+> 接口本身仍有独立 Token 鉴权（`ECH_REPORT_TOKEN`）和 Worker 内限流，并保留边缘限流与其余托管规则；只跳过 bot 类检查和具体误拦的规则，不会让它变成公开写入口。
+
+本地运行：
+
+```bash
+cd tools/ech-probe
+go test ./...
+export ECH_SENTINELS=doh.example.com,www.example.com     # 必填：换成你自己的哨兵主机名（也可用 -sentinels）
+go run . -dry-run -v -ips 162.159.136.89,104.16.0.195   # 指定 IP，打印每次握手结果（不需要 -api）
+go run . -dry-run -api https://bestip.example.com       # 取池子探测，只打印汇总（无 Token 时最多 200 行；Worker 开了 API_IPS_REQUIRE_TOKEN=1 时会 401，需带 Token）
+ECH_REPORT_TOKEN=... go run . -dry-run -api https://bestip.example.com   # 带 Token 取全池，只打印汇总
+ECH_REPORT_TOKEN=... go run . -api https://bestip.example.com            # 探测全池并上报
+```
+
+`-api`（或环境变量 `ECH_API_BASE`）**没有默认值**，必须是你自建 Worker 的 `https://` 地址；只有「`-dry-run` + `-ips`」这种既不取池子也不上报的用法可以省略。
+
+`-sentinels`（或环境变量 `ECH_SENTINELS`）同样**没有默认值**，任何用法都必须提供；上报时最多 16 个（与 Worker 的 `/api/ech-report` 上限一致，超过时探测前就退出），`-dry-run` 不限。
+
+其它参数：`-path`（默认 `/cdn-cgi/trace`）、`-concurrency`、`-timeout`、`-doh`、`-ech-fallback`、`-max-restricted`、`-max-unknown`，见 `go run . -h`。
+
 ---
 
 ## 监控与告警
 
 - **GitHub Actions `Health Check`**：每 30 分钟请求一次 `/health`，失败重试 3 次。可在仓库变量 `HEALTH_URL` 里改地址。
 - **GitHub Actions `Scheduled Test`**：运行单元测试和 `scripts/verify-worker.mjs`。
+- **GitHub Actions `ECH Probe`**：每 6 小时带 ECH 探测池子并上报 `/api/ech-report`，汇总写在运行页的 Summary 里。
 - **Telegram**（可选）：每次刷新推送结果；另外以下情况告警，24 小时内同类只发一次：
   - 某个数据源连续失败 3 次；
   - DNS 同步被限流；
@@ -284,6 +341,7 @@ src/scoring.js   稳定分、质量保护、源健康统计
 src/dns.js       DNS 差量计划
 src/ratelimit.js 每 IP 限流计数：同 key 写入合并、KV 失败 fail-open
 src/ech.js       ECH 打标：上报校验、合并、/api/ips 的 ech 字段
+tools/ech-probe/ ECH 探测器（Go，GitHub Actions 定时运行）
 scripts/verify-worker.mjs
 test/
 wrangler.toml
