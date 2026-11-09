@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -319,6 +320,20 @@ func TestSentinelsHaveNoDefault(t *testing.T) {
 	o, err := parseOptions([]string{"-sentinels", "One.example.com,two.example.com"})
 	if err != nil || strings.Join(o.sentinels, ",") != "one.example.com,two.example.com" {
 		t.Fatalf("-sentinels: %v %v", o.sentinels, err)
+	}
+	// reporting is capped at the Worker's limit; dry-run is not
+	var many []string
+	for i := 0; i <= maxSentinels; i++ {
+		many = append(many, fmt.Sprintf("s%d.example.com", i))
+	}
+	if _, err := parseOptions([]string{"-sentinels", strings.Join(many, ",")}); err == nil {
+		t.Fatalf("%d sentinels must be rejected when reporting", len(many))
+	}
+	if _, err := parseOptions([]string{"-sentinels", strings.Join(many[:maxSentinels], ",")}); err != nil {
+		t.Fatalf("%d sentinels must be accepted: %v", maxSentinels, err)
+	}
+	if _, err := parseOptions([]string{"-dry-run", "-sentinels", strings.Join(many, ",")}); err != nil {
+		t.Fatalf("dry-run must accept %d sentinels: %v", len(many), err)
 	}
 	t.Setenv("ECH_SENTINELS", "env.example.com")
 	if o, err := parseOptions([]string{"-sentinels", "flag.example.com"}); err != nil || strings.Join(o.sentinels, ",") != "flag.example.com" {

@@ -29,6 +29,7 @@ import (
 const (
 	defaultDoH   = "https://cloudflare-dns.com/dns-query"
 	maxReportIPs = 2000 // must match the Worker's limit
+	maxSentinels = 16   // /api/ech-report limit, must match the Worker's ECH_MAX_SENTINELS
 	poolLimit    = 2000 // /api/ips row cap for ECH_REPORT_TOKEN holders (Worker ECH_READER_MAX_TOP)
 	userAgent    = "cf-best-ip-ech-probe/1"
 )
@@ -100,6 +101,11 @@ func parseOptions(args []string) (options, error) {
 	// restricted IPs into "ok".
 	if len(o.sentinels) == 0 {
 		return o, errors.New("sentinels not set: set ECH_SENTINELS (Actions variable) or -sentinels to your own Cloudflare-proxied hostnames that return error 1034 on restricted IPs")
+	}
+	// Fail before probing rather than after: the Worker rejects reports
+	// listing more sentinels. Dry runs never report, so they may use more.
+	if !o.dryRun && len(o.sentinels) > maxSentinels {
+		return o, fmt.Errorf("too many sentinels (%d): /api/ech-report accepts at most %d; use -dry-run to probe more", len(o.sentinels), maxSentinels)
 	}
 	for _, s := range splitList(*ips) {
 		a, err := netip.ParseAddr(s)

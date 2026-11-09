@@ -296,7 +296,7 @@ ECH_REPORT_TOKEN=... go run . -api https://bestip.example.com            # 探�
 
 `-api`（或环境变量 `ECH_API_BASE`）**没有默认值**，必须是你自建 Worker 的 `https://` 地址；只有「`-dry-run` + `-ips`」这种既不取池子也不上报的用法可以省略。
 
-`-sentinels`（或环境变量 `ECH_SENTINELS`）同样**没有默认值**，任何用法都必须提供。
+`-sentinels`（或环境变量 `ECH_SENTINELS`）同样**没有默认值**，任何用法都必须提供；上报时最多 16 个（与 Worker 的 `/api/ech-report` 上限一致，超过时探测前就退出），`-dry-run` 不限。
 
 其它参数：`-path`（默认 `/cdn-cgi/trace`）、`-concurrency`、`-timeout`、`-doh`、`-ech-fallback`、`-max-restricted`、`-max-unknown`，见 `go run . -h`。
 
