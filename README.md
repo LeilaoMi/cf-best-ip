@@ -242,6 +242,7 @@ wrangler secret put ECH_REPORT_TOKEN   # 随机长串；与 GitHub Actions secre
   - `unknown` 不覆盖已有的 `ok` / `restricted`，只在没有记录时写入；
   - 7 天未更新的条目自动清理；总条目超过 10000 时丢弃最旧的（多次上报不相交的 IP 集合也不会让 `ech:status` 无限增长）。
 - 返回：`{"ok": true, "accepted": 2, "counts": {"ok": 1, "restricted": 1, "unknown": 1}, "stored": 280, "pruned": 0}`。
+- KV 读取失败返回 `503 kv-read-failed`；写入失败（如两次上报间隔不足 1 秒触发 KV 同 key 写入限制）返回 `503 kv-write-failed` 并带 `retry-after: 2`，这次上报**未**写入，稍后重试即可；不会返回 500，也不会在未写入时报成功。
 
 ---
 
