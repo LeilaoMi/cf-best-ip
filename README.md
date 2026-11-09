@@ -144,7 +144,7 @@ wrangler deploy
 | `SUB_RATE_LIMIT` | 可选 | 订阅接口每 IP 每分钟次数，默认 120，`0` 关闭 |
 | `API_IPS_REQUIRE_TOKEN` + `API_IPS_TOKEN` | 可选 | `1` = `/api/ips` 需要 Bearer Token |
 | `ALLOW_PUBLIC_REFRESH` | 可选 | `1` = 允许无 Token 刷新，不推荐 |
-| `ECH_REPORT_TOKEN`（secret） | 可选 | ECH 探测器上报 `POST /api/ech-report` 的独立 Token；不配置则该接口返回 503（禁用） |
+| `ECH_REPORT_TOKEN`（secret） | 可选 | ECH 探测器上报 `POST /api/ech-report` 的独立 Token；不配置则该接口返回 503（禁用）。也让探测器读 `/api/ips` 时放宽到 2000 行（见下文） |
 | `ECH_REPORT_RATE_LIMIT` | 可选 | `/api/ech-report` 每 IP 每分钟次数，默认 10，`0` 关闭 |
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | 可选 | 刷新结果和告警推送 |
 
@@ -183,7 +183,7 @@ Token 只接受 `Authorization: Bearer ...` 请求头，不接受 URL 参数。
 | `maxDelay=200` | 只要国内实测延迟不高于该值的 |
 | `minMbps=10` | 只要速度不低于该值的 |
 | `exclude=1.1.1.1,2.2.2.2` | 排除指定 IP |
-| `top=50` / `limit=50` | 返回数量，默认 20，最多 200 |
+| `top=50` / `limit=50` | 返回数量，默认 20，最多 200（仅 `/api/ips` 带有效 `ECH_REPORT_TOKEN` 时最多 2000） |
 | `comment=0` | 订阅不带 `#备注` |
 | `ech=1` | 仅 `/api/ips`：排除 `ech === false` 的 IP（`true` 与 `null` 保留），在 `limit` 之前生效 |
 
@@ -209,6 +209,10 @@ curl -X POST -H "Authorization: Bearer $REFRESH_TOKEN" https://bestip.example.co
   - `false`：36 小时内实测带 ECH 会被 1034 拒绝；
   - `null`：没有记录、结果为 unknown、或已超过 36 小时（KV 读取失败时也一律为 `null`，接口不会因此报错）。
 - `/api/ips?ech=1` 排除 `ech === false` 的行，适合给开了 ECH 的客户端用。通用池、DNS 同步、评分、`/sub` 系订阅都不受影响。
+- 探测器取全池：`/api/ips` 请求带 `Authorization: Bearer <ECH_REPORT_TOKEN>`（常量时间比较）时，`limit` 上限从 200 放宽到 2000，例如 `/api/ips?limit=2000&perCountry=0`。
+  - 只放宽行数：限流（`API_IPS_RATE_LIMIT`）、筛选参数、输出格式都不变；`/sub` 系订阅和 `/api/preferred-ips` 仍最多 200。
+  - Token 错误、为空或用 `?token=` 传入时**按公共请求处理**（最多 200 行，不返回 401）；未配置 `ECH_REPORT_TOKEN` 时没有任何请求能放宽。
+  - 开了 `API_IPS_REQUIRE_TOKEN=1` 时，`ECH_REPORT_TOKEN` 也可用来读 `/api/ips`（只读）。
 
 ### `POST /api/ech-report`
 

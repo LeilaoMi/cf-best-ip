@@ -289,3 +289,69 @@ test('/api/ips keeps working with ech=null when the ech KV read fails', async ()
   assert.ok(r.body.ips.every(x => x.ech === null));
   assert.equal(r.body.echUpdatedAt, null);
 });
+
+/** 生成 n 个 IPv4 行的大池子（超过公共上限 200）。 */
+function bigPool(n) {
+  const ips = [];
+  for (let i = 0; i < n; i++) ips.push({ ip: `104.16.${Math.floor(i / 250)}.${(i % 250) + 1}`, port: 443, family: 'v4', _score: 1000 - i });
+  return { updatedAt: Date.now(), ips };
+}
+
+test('/api/ips lifts the 200-row cap only for a valid ECH_REPORT_TOKEN', async () => {
+  const env = makeEnv({ ECH_REPORT_TOKEN: 'ech-secret', ADMIN_TOKEN: 'admin-secret', API_IPS_RATE_LIMIT: '0' }, { 'ips:latest': bigPool(2300) });
+  const auth = t => ({ headers: { authorization: `Bearer ${t}` } });
+
+  const pub = await call(env, '/api/ips?limit=2000');
+  assert.equal(pub.status, 200);
+  assert.equal(pub.body.returned, 200);
+  assert.equal(pub.body.total, 2300);
+
+  // 错误 token / 其它 token / query token 一律按公共请求处理（200 行），不返回 401
+  for (const t of ['ech-secre', 'ech-secret2', 'admin-secret']) {
+    const r = await call(env, '/api/ips?limit=2000', auth(t));
+    assert.equal(r.status, 200, t);
+    assert.equal(r.body.returned, 200, t);
+  }
+  assert.equal((await call(env, '/api/ips?limit=2000&token=ech-secret')).body.returned, 200);
+
+  const full = await call(env, '/api/ips?limit=2000&perCountry=0', auth('ech-secret'));
+  assert.equal(full.status, 200);
+  assert.equal(full.body.returned, 2000);
+  assert.equal(new Set(full.body.ips.map(x => x.ip)).size, 2000);
+  const over = await call(env, '/api/ips?limit=5000', auth('ech-secret'));
+  assert.equal(over.body.returned, 2000);
+  // 默认 limit 不变
+  assert.equal((await call(env, '/api/ips', auth('ech-secret'))).body.returned, 20);
+});
+
+test('ECH_REPORT_TOKEN never lifts the cap when the secret is not configured', async () => {
+  const env = makeEnv({ API_IPS_RATE_LIMIT: '0' }, { 'ips:latest': bigPool(300) });
+  const r = await call(env, '/api/ips?limit=2000', { headers: { authorization: 'Bearer ' } });
+  assert.equal(r.body.returned, 200);
+  const r2 = await call(env, '/api/ips?limit=2000', { headers: { authorization: 'Bearer undefined' } });
+  assert.equal(r2.body.returned, 200);
+});
+
+test('/sub stays capped at 200 even with ECH_REPORT_TOKEN', async () => {
+  const env = makeEnv({ ECH_REPORT_TOKEN: 'ech-secret', SUB_RATE_LIMIT: '0' }, { 'ips:latest': bigPool(300) });
+  const res = await worker.fetch(new Request(HOST + '/sub?limit=2000', { headers: { authorization: 'Bearer ech-secret' } }), env, { waitUntil() {} });
+  assert.equal(res.status, 200);
+  assert.equal((await res.text()).split('\n').length, 200);
+});
+
+test('API_IPS_REQUIRE_TOKEN accepts ECH_REPORT_TOKEN for /api/ips and still rejects wrong tokens', async () => {
+  const env = makeEnv({ ECH_REPORT_TOKEN: 'ech-secret', API_IPS_REQUIRE_TOKEN: '1', API_IPS_RATE_LIMIT: '0' });
+  assert.equal((await call(env, '/api/ips')).status, 401);
+  assert.equal((await call(env, '/api/ips', { headers: { authorization: 'Bearer nope' } })).status, 401);
+  assert.equal((await call(env, '/api/ips', { headers: { authorization: 'Bearer ech-secret' } })).status, 200);
+});
+
+test('public /api/ips rate limit is unchanged and the ECH token does not bypass it', async () => {
+  const env = makeEnv({ ECH_REPORT_TOKEN: 'ech-secret', API_IPS_RATE_LIMIT: '2' });
+  const h = { headers: { 'cf-connecting-ip': '203.0.113.9' } };
+  assert.equal((await call(env, '/api/ips', h)).status, 200);
+  assert.equal((await call(env, '/api/ips', h)).status, 200);
+  assert.equal((await call(env, '/api/ips', h)).status, 429);
+  const t = { headers: { 'cf-connecting-ip': '203.0.113.9', authorization: 'Bearer ech-secret' } };
+  assert.equal((await call(env, '/api/ips', t)).status, 429);
+});
