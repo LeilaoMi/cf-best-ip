@@ -44,6 +44,7 @@
 // ============================================================
 import { isCfNativeIp } from "./cidr.js";
 import { isRateLimitError, planDnsRecordSync } from "./dns.js";
+import { createRateLimitState, hitRateLimit } from "./ratelimit.js";
 import { applyStabilityScores, backoffSkipCycles, countByCarrier, qualityGuard, sourceHealth } from "./scoring.js";
 
 const VERSION = "3.9.1";
@@ -349,17 +350,20 @@ function isApiIpsAuthorized(request, env) {
   if (env.ADMIN_TOKEN && constantTimeEqual(token, env.ADMIN_TOKEN)) return true;
   return Boolean(env.API_IPS_TOKEN && constantTimeEqual(token, env.API_IPS_TOKEN));
 }
+/** isolate 内的限流计数（合并同 key 的 KV 写入）。 */
+const rateLimitState = createRateLimitState();
 async function rateLimitByIp(request, env, keyPrefix, limitEnv, defLimit) {
   if (env[limitEnv] === "0" || !env.KV) return null;
   const limit = Math.max(1, Number(env[limitEnv] || defLimit));
   const now = Math.floor(Date.now() / 60000);
   const ip = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown";
   const key = `rate:${keyPrefix}:${now}:${ip}`;
-  const count = Number(await env.KV.get(key) || 0) + 1;
-  if (count > limit && !isApiIpsAuthorized(request, env)) {
+  // KV 同 key 每秒只能写一次：写入合并 + 读写失败 fail-open，计数失败绝不返回 500（见 src/ratelimit.js）
+  const r = await hitRateLimit({ kv: env.KV, key, limit, state: rateLimitState, exempt: isApiIpsAuthorized(request, env) });
+  if (r.degraded) console.warn(`rate limit ${keyPrefix} degraded: ${r.degraded}`);
+  if (r.limited) {
     return json({ ok: false, error: "rate-limited", retryAfter: 60 }, { status: 429, headers: { "retry-after": "60" } });
   }
-  await env.KV.put(key, String(count), { expirationTtl: 120 });
   return null;
 }
 async function requireApiIpsAccess(request, env) {

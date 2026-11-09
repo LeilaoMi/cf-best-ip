@@ -50,6 +50,7 @@ const checks = [
   ['config import export', source.includes('params.get("export") === "1"') && source.includes('format: "cf-best-ip-config-v1"') && source.includes('imported: Boolean')],
   ['theme switcher', source.includes('data-theme-choice="system"') && source.includes('data-theme-choice="aurora"') && source.includes('cf-best-ip-theme')],
   ['version 3.9.1', source.includes('const VERSION = "3.9.1"')],
+  ['rate limit kv fail-open', source.includes('from "./ratelimit.js"') && source.includes('hitRateLimit(') && !source.includes('await env.KV.put(key, String(count)')],
 ];
 for (const [name, ok] of checks) {
   if (!ok) throw new Error(`check failed: ${name}`);
