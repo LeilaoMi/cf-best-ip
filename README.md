@@ -144,6 +144,8 @@ wrangler deploy
 | `SUB_RATE_LIMIT` | 可选 | 订阅接口每 IP 每分钟次数，默认 120，`0` 关闭 |
 | `API_IPS_REQUIRE_TOKEN` + `API_IPS_TOKEN` | 可选 | `1` = `/api/ips` 需要 Bearer Token |
 | `ALLOW_PUBLIC_REFRESH` | 可选 | `1` = 允许无 Token 刷新，不推荐 |
+| `ECH_REPORT_TOKEN`（secret） | 可选 | ECH 探测器上报 `POST /api/ech-report` 的独立 Token；不配置则该接口返回 503（禁用）。也让探测器读 `/api/ips` 时放宽到 2000 行（见下文） |
+| `ECH_REPORT_RATE_LIMIT` | 可选 | `/api/ech-report` 每 IP 每分钟次数，默认 10，`0` 关闭 |
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | 可选 | 刷新结果和告警推送 |
 
 `wrangler.toml` 里声明了 `REFRESH_LOCK` Durable Object 作为刷新锁；没有绑定时自动退回 KV 锁。
@@ -157,11 +159,12 @@ wrangler deploy
 | `/` | — | 展示页，四种主题；`?plain=1` 极简页 |
 | `/sub`（`/sub.txt` `/ips.txt` `/api/ips.txt`） | 限流 | 订阅，默认 `IP:端口#colo-运营商`，支持 `format=plain/csv/jsonl` |
 | `/api/preferred-ips` | — | 纯 `IP:端口` 列表（Karing 等） |
-| `/api/ips` | 限流，可选 Token | JSON 列表，含 `_score`、`quality`、`refDelay` |
+| `/api/ips` | 限流，可选 Token | JSON 列表，含 `_score`、`quality`、`refDelay`、`ech`；`?ech=1` 排除 ECH 受限 IP |
 | `/api/stats` | — | 池子统计、数据源状态、最近一次 DNS 同步 |
 | `/api/history?days=7` | — | 每日快照，最多 30 天 |
 | `/health` | — | 健康检查：`status`、`reasons`、`dnsOk`、`dnsRateLimited`、`sourceHealth` |
 | `POST /api/refresh` | `REFRESH_TOKEN` / `ADMIN_TOKEN` | 立即刷新，60 秒冷却 |
+| `POST /api/ech-report` | `ECH_REPORT_TOKEN` | ECH 探测器上报结果，见下文「ECH 可用性打标」 |
 | `/admin` | `ADMIN_TOKEN` | 管理控制台 |
 | `/api/diagnostics` | `ADMIN_TOKEN` | 诊断快照 |
 | `/api/dns/current` | `ADMIN_TOKEN` | 当前托管 DNS 记录 |
@@ -180,8 +183,9 @@ Token 只接受 `Authorization: Bearer ...` 请求头，不接受 URL 参数。
 | `maxDelay=200` | 只要国内实测延迟不高于该值的 |
 | `minMbps=10` | 只要速度不低于该值的 |
 | `exclude=1.1.1.1,2.2.2.2` | 排除指定 IP |
-| `top=50` / `limit=50` | 返回数量，默认 20，最多 200 |
+| `top=50` / `limit=50` | 返回数量，默认 20，最多 200（仅 `/api/ips` 带有效 `ECH_REPORT_TOKEN` 时最多 2000） |
 | `comment=0` | 订阅不带 `#备注` |
+| `ech=1` | 仅 `/api/ips`：排除 `ech === false` 的 IP（`true` 与 `null` 保留），在 `limit` 之前生效 |
 
 示例：
 
@@ -192,6 +196,53 @@ curl "https://bestip.example.com/sub?carrier=CU&top=10"
 # 手动刷新
 curl -X POST -H "Authorization: Bearer $REFRESH_TOKEN" https://bestip.example.com/api/refresh
 ```
+
+---
+
+## ECH 可用性打标
+
+池子里约 10% 的 Cloudflare IP（常见于 `108.162.198.x`、`162.159.x`、`198.41.208-209.x`）在客户端**带 ECH** 访问 Free 计划站点时返回 Cloudflare `1034 Edge IP Restricted`，不带 ECH 则正常。这些 IP 对非 ECH 用户仍然可用，所以**不从池子删除，只打标**。
+
+- 外部探测器（GitHub Actions）定期带 ECH 实测每个 IP，把结果 `POST` 到 `/api/ech-report`；Worker 合并进 KV 键 `ech:status`。
+- `/api/ips` 每行增加 `ech` 字段：
+  - `true`：36 小时内实测带 ECH 可用；
+  - `false`：36 小时内实测带 ECH 会被 1034 拒绝；
+  - `null`：没有记录、结果为 unknown、或已超过 36 小时（KV 读取失败时也一律为 `null`，接口不会因此报错）。
+- `/api/ips?ech=1` 排除 `ech === false` 的行，适合给开了 ECH 的客户端用。通用池、DNS 同步、评分、`/sub` 系订阅都不受影响。
+- 探测器取全池：`/api/ips` 请求带 `Authorization: Bearer <ECH_REPORT_TOKEN>`（常量时间比较）时，`limit` 上限从 200 放宽到 2000，例如 `/api/ips?limit=2000&perCountry=0`。
+  - 只放宽行数：限流（`API_IPS_RATE_LIMIT`）、筛选参数、输出格式都不变；`/sub` 系订阅和 `/api/preferred-ips` 仍最多 200。
+  - 默认（未开 `API_IPS_REQUIRE_TOKEN`）：Token 错误、为空或用 `?token=` 传入时**按公共请求处理**（最多 200 行，不返回 401）；未配置 `ECH_REPORT_TOKEN` 时没有任何请求能放宽。
+  - 开了 `API_IPS_REQUIRE_TOKEN=1` 时：`ECH_REPORT_TOKEN` 也可用来读 `/api/ips`（只读）；缺失或错误的 Token 仍按该开关返回 `401`（不会退化成公共请求）。
+
+### `POST /api/ech-report`
+
+```bash
+wrangler secret put ECH_REPORT_TOKEN   # 随机长串；与 GitHub Actions secret ECH_REPORT_TOKEN 同值
+```
+
+- 鉴权：`Authorization: Bearer <ECH_REPORT_TOKEN>`（常量时间比较）。这是独立 secret，`ADMIN_TOKEN` / `REFRESH_TOKEN` **不能**用于此接口；未配置时接口返回 `503 ech-report-disabled`。
+- 同样受 `ALLOWED_HOSTS` 限制，并按 `ECH_REPORT_RATE_LIMIT` 限流（鉴权通过后才计数）。
+- Body（JSON，最大 256 KB，`results` 最多 2000 条）：
+
+```json
+{
+  "runId": "123456789",
+  "sentinels": ["doh.example.com", "www.cloudflare.com"],
+  "results": [
+    { "ip": "162.159.136.89", "status": "restricted" },
+    { "ip": "104.16.0.195", "status": "ok" },
+    { "ip": "2606:4700::1", "status": "unknown" }
+  ]
+}
+```
+
+- `ip` 严格校验 IPv4 / IPv6（IPv6 按 RFC 5952 规范化）；`status` 只能是 `ok` / `restricted` / `unknown`；`runId` 为 `[A-Za-z0-9._:-]`，最长 128。
+- 合并规则（KV `ech:status` = `{updatedAt, runId, sentinels, ips: {"<ip>": {s, t}}}`，`t` 为毫秒时间戳）：
+  - `ok` / `restricted` 覆盖旧结论；
+  - `unknown` 不覆盖已有的 `ok` / `restricted`，只在没有记录时写入；
+  - 7 天未更新的条目自动清理；总条目超过 10000 时丢弃最旧的（多次上报不相交的 IP 集合也不会让 `ech:status` 无限增长）。
+- 返回：`{"ok": true, "accepted": 2, "counts": {"ok": 1, "restricted": 1, "unknown": 1}, "stored": 280, "pruned": 0}`。
+- KV 读取失败返回 `503 kv-read-failed`；写入失败（如两次上报间隔不足 1 秒触发 KV 同 key 写入限制）返回 `503 kv-write-failed` 并带 `retry-after: 2`，这次上报**未**写入，稍后重试即可；不会返回 500，也不会在未写入时报成功。
 
 ---
 
@@ -219,7 +270,7 @@ curl -X POST -H "Authorization: Bearer $REFRESH_TOKEN" https://bestip.example.co
 ## 本地验证
 
 ```bash
-node --test                      # 单元测试：CIDR、DNS 差量计划、评分与质量保护
+node --test                      # 单元测试：CIDR、DNS 差量计划、评分与质量保护、ECH 打标
 node scripts/verify-worker.mjs   # 静态检查：安全头、鉴权、版本号、README 与配置一致
 ```
 
@@ -230,6 +281,7 @@ src/worker.js    Worker 入口：数据源、聚合、接口、页面、DNS 同�
 src/cidr.js      Cloudflare 官方 CIDR 判断
 src/scoring.js   稳定分、质量保护、源健康统计
 src/dns.js       DNS 差量计划
+src/ech.js       ECH 打标：上报校验、合并、/api/ips 的 ech 字段
 scripts/verify-worker.mjs
 test/
 wrangler.toml
