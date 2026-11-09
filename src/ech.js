@@ -69,6 +69,22 @@ export function canonicalIp(value) {
 }
 
 /**
+ * 池子里的地址 → ech:status 的 key。先走严格的 canonicalIp；不通过时再把带前导零的点分十进制 IPv4
+ * （如 `104.16.00.1`，按十进制而非八进制理解）规范成 `104.16.0.1`，让它也能匹配到上报结论。
+ * 只用于查询，上报校验仍用严格的 canonicalIp。
+ * @param {unknown} value
+ * @returns {string | null}
+ */
+export function lookupIpKey(value) {
+  const strict = canonicalIp(value);
+  if (strict || typeof value !== "string") return strict;
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(value.trim());
+  if (!m) return null;
+  const parts = m.slice(1).map(Number);
+  return parts.every(n => n <= 255) ? parts.join(".") : null;
+}
+
+/**
  * 校验并规范化哨兵主机名：小写、去掉结尾的点、至少两段、每段符合 LDH 规则。
  * @param {unknown} value
  * @returns {string | null}
@@ -197,7 +213,7 @@ export function makeEchLookup(status, now = Date.now()) {
   const ips = status && typeof status.ips === "object" && status.ips ? status.ips : null;
   if (!ips) return () => null;
   return (ip) => {
-    const key = canonicalIp(ip);
+    const key = lookupIpKey(ip);
     return key && Object.prototype.hasOwnProperty.call(ips, key) ? echFlag(ips[key], now) : null;
   };
 }

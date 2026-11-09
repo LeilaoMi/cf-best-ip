@@ -9,6 +9,7 @@ import {
   ECH_STATUS_KEY,
   canonicalIp,
   echFlag,
+  lookupIpKey,
   makeEchLookup,
   mergeEchStatus,
   readBodyLimited,
@@ -391,4 +392,19 @@ test('POST /api/ech-report answers a retryable 503 (not 500, not ok) when the KV
   const body = await res.json();
   assert.deepEqual({ ok: body.ok, error: body.error }, { ok: false, error: 'kv-write-failed' });
   assert.equal(env.KV.store.has(ECH_STATUS_KEY), false);
+});
+
+test('ech lookup matches pool IPv4 rows written with leading zeros (lookup only)', () => {
+  assert.equal(lookupIpKey('104.16.00.1'), '104.16.0.1');
+  assert.equal(lookupIpKey('010.001.000.009'), '10.1.0.9');
+  assert.equal(lookupIpKey('104.16.0.256'), null);
+  assert.equal(lookupIpKey('104.16.0.1'), '104.16.0.1');
+  assert.equal(lookupIpKey('2606:4700:0::1'), '2606:4700::1');
+  assert.equal(lookupIpKey(null), null);
+  // reports stay strict
+  assert.equal(canonicalIp('104.16.00.1'), null);
+  const now = Date.now();
+  const echOf = makeEchLookup({ ips: { '104.16.0.1': { s: 'restricted', t: now } } }, now);
+  assert.equal(echOf('104.16.00.1'), false);
+  assert.equal(echOf('104.16.0.1'), false);
 });
