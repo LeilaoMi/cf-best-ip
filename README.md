@@ -269,6 +269,8 @@ Go 程序（Go ≥ 1.24，只用标准库，`crypto/tls` 的 `EncryptedClientHel
 | Actions secret | `ECH_REPORT_TOKEN` | 必填，与 Worker secret `ECH_REPORT_TOKEN` 同值；缺失时工作流直接失败并提示。勾选 dry_run 时可不填，但只能取到 200 行；若 Worker 开了 `API_IPS_REQUIRE_TOKEN=1`，无 Token 读 `/api/ips` 会 401，dry-run 也必须提供 |
 | Actions variable | `ECH_SENTINELS` | 可选，逗号分隔的哨兵主机名；默认 `doh.leilaomi.ccwu.cc,www.cloudflare.com`（`doh.leilaomi.ccwu.cc` 是本仓库作者自己的 Free 计划站点）。哨兵应选**你自己控制、开着 ECH 的 Free 计划站点**（最严格），`www.cloudflare.com` 只作补充。**fork 部署请务必设置此变量**：默认哨兵不归你控制，若它换套餐、关 ECH 或改响应，结论会悄悄变错（非 1034 的响应都判 `ok`） |
 
+> **定时运行的启用条件**：fork 出来的公开仓库默认**不会**运行定时工作流，配好变量和 secret 后还要到 fork 的「Actions」页面点「I understand my workflows, go ahead and enable them」，再在左侧选 `ECH Probe` 点「Enable workflow」。公开仓库连续 60 天没有活动时 GitHub 也会自动停用定时工作流（会发邮件提醒），需要回到同一页面重新启用。定时探测停掉后，`ech` 标记会在 36 小时后全部变回 `null`。
+
 > **Cloudflare 安全功能可能拦截 Actions 的上报**（403 / 质询页，工作流会以 `report HTTP 403` 失败；连续失败超过 36 小时后 `ech` 标记会全部变回 `null`）。按 Worker 域名所在 zone 开启的功能分别处理：
 >
 > - **Bot Fight Mode**（免费版「机器人攻击模式」）：WAF 自定义规则**无法**跳过它（[Cloudflare 文档](https://developers.cloudflare.com/waf/custom-rules/skip/options/)）。如果它拦截了上报，只能在「安全性 → 机器人」里关闭 Bot Fight Mode，或升级到 Super Bot Fight Mode 后用下面的 Skip 规则。
