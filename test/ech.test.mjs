@@ -4,6 +4,7 @@ import {
   ECH_FRESH_MS,
   ECH_MAX_BODY_BYTES,
   ECH_MAX_RESULTS,
+  ECH_MAX_STORED,
   ECH_RETAIN_MS,
   ECH_STATUS_KEY,
   canonicalIp,
@@ -354,4 +355,15 @@ test('public /api/ips rate limit is unchanged and the ECH token does not bypass 
   assert.equal((await call(env, '/api/ips', h)).status, 429);
   const t = { headers: { 'cf-connecting-ip': '203.0.113.9', authorization: 'Bearer ech-secret' } };
   assert.equal((await call(env, '/api/ips', t)).status, 429);
+});
+
+test('mergeEchStatus caps the stored entry count and drops the oldest first', () => {
+  const now = Date.now();
+  const prevIps = {};
+  for (let i = 0; i < 5; i++) prevIps[`10.0.0.${i + 1}`] = { s: 'ok', t: now - (i + 1) * HOUR };
+  const r = mergeEchStatus({ ips: prevIps }, report([{ ip: '10.0.1.1', status: 'restricted' }, { ip: '10.0.1.2', status: 'ok' }]), now, undefined, 4);
+  assert.deepEqual(Object.keys(r.next.ips).sort(), ['10.0.0.1', '10.0.0.2', '10.0.1.1', '10.0.1.2']);
+  assert.equal(r.pruned, 3);
+  assert.equal(r.accepted, 2);
+  assert.ok(ECH_MAX_STORED >= 2 * ECH_MAX_RESULTS);
 });

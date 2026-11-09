@@ -9,6 +9,7 @@ export const ECH_MAX_BODY_BYTES = 256 * 1024;
 export const ECH_MAX_SENTINELS = 16;
 export const ECH_FRESH_MS = 36 * 60 * 60 * 1000;      // /api/ips 只信 36 小时内的结论
 export const ECH_RETAIN_MS = 7 * 24 * 60 * 60 * 1000; // 7 天未更新的条目清理掉
+export const ECH_MAX_STORED = 10000;                  // ech:status 总条目上限，超出时丢弃最旧的
 
 const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const HOST_LABEL_RE = /^(?!-)[a-z0-9-]{1,63}(?<!-)$/;
@@ -130,14 +131,16 @@ function isEntry(e) {
  * 把一次（已校验的）上报合并进 KV 里的 ech:status。
  * - ok / restricted 覆盖旧值；
  * - unknown 不覆盖已有的确定结论（ok/restricted），只在无记录（或旧记录本身就是 unknown）时写入；
- * - 清理 retainMs 内未更新的条目（以及结构损坏的条目）。
+ * - 清理 retainMs 内未更新的条目（以及结构损坏的条目）；
+ * - 总条目超过 maxStored 时按更新时间丢弃最旧的（计入 pruned）。
  * @param {object | null} prev KV 中现有的 ech:status
  * @param {{runId: string, sentinels: string[], results: {ip: string, status: string}[]}} report validateEchReport 的结果
  * @param {number} [now]
  * @param {number} [retainMs]
+ * @param {number} [maxStored]
  * @returns {{next: object, accepted: number, counts: {ok: number, restricted: number, unknown: number}, pruned: number}}
  */
-export function mergeEchStatus(prev, report, now = Date.now(), retainMs = ECH_RETAIN_MS) {
+export function mergeEchStatus(prev, report, now = Date.now(), retainMs = ECH_RETAIN_MS, maxStored = ECH_MAX_STORED) {
   const ips = {};
   const prevIps = prev && typeof prev.ips === "object" && prev.ips ? prev.ips : {};
   let pruned = 0;
@@ -154,8 +157,16 @@ export function mergeEchStatus(prev, report, now = Date.now(), retainMs = ECH_RE
     ips[ip] = { s: status, t: now };
     accepted++;
   }
+  // 总量上限：多次上报互不相交的 IP 集合时 ech:status 不会无限增长（/api/ips 每次都要读它）
+  let kept = ips;
+  const entries = Object.entries(ips);
+  if (entries.length > maxStored) {
+    entries.sort((a, b) => b[1].t - a[1].t);
+    pruned += entries.length - maxStored;
+    kept = Object.fromEntries(entries.slice(0, maxStored));
+  }
   return {
-    next: { updatedAt: now, runId: report.runId, sentinels: report.sentinels, ips },
+    next: { updatedAt: now, runId: report.runId, sentinels: report.sentinels, ips: kept },
     accepted,
     counts,
     pruned,
