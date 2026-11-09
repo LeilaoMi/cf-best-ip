@@ -211,8 +211,8 @@ curl -X POST -H "Authorization: Bearer $REFRESH_TOKEN" https://bestip.example.co
 - `/api/ips?ech=1` 排除 `ech === false` 的行，适合给开了 ECH 的客户端用。通用池、DNS 同步、评分、`/sub` 系订阅都不受影响。
 - 探测器取全池：`/api/ips` 请求带 `Authorization: Bearer <ECH_REPORT_TOKEN>`（常量时间比较）时，`limit` 上限从 200 放宽到 2000，例如 `/api/ips?limit=2000&perCountry=0`。
   - 只放宽行数：限流（`API_IPS_RATE_LIMIT`）、筛选参数、输出格式都不变；`/sub` 系订阅和 `/api/preferred-ips` 仍最多 200。
-  - Token 错误、为空或用 `?token=` 传入时**按公共请求处理**（最多 200 行，不返回 401）；未配置 `ECH_REPORT_TOKEN` 时没有任何请求能放宽。
-  - 开了 `API_IPS_REQUIRE_TOKEN=1` 时，`ECH_REPORT_TOKEN` 也可用来读 `/api/ips`（只读）。
+  - 默认（未开 `API_IPS_REQUIRE_TOKEN`）：Token 错误、为空或用 `?token=` 传入时**按公共请求处理**（最多 200 行，不返回 401）；未配置 `ECH_REPORT_TOKEN` 时没有任何请求能放宽。
+  - 开了 `API_IPS_REQUIRE_TOKEN=1` 时：`ECH_REPORT_TOKEN` 也可用来读 `/api/ips`（只读）；缺失或错误的 Token 仍按该开关返回 `401`（不会退化成公共请求）。
 
 ### `POST /api/ech-report`
 
