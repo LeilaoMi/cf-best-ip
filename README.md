@@ -264,13 +264,14 @@ Go 程序（Go ≥ 1.24，只用标准库，`crypto/tls` 的 `EncryptedClientHel
 | 位置 | 名称 | 说明 |
 |---|---|---|
 | Actions variable | `ECH_API_BASE` | **必填**，你自建 Worker 的 HTTPS 地址（如 `https://bestip.example.com`，不带路径）。取池子和上报都用它，上报会带 Token，所以**没有默认值**；未设置或不是 `https://` 时工作流（含 dry-run）直接失败并提示 |
-| Actions secret | `ECH_REPORT_TOKEN` | 必填，与 Worker secret `ECH_REPORT_TOKEN` 同值；缺失时工作流直接失败并提示（勾选 dry_run 时可不填，但只能取到 200 行） |
+| Actions secret | `ECH_REPORT_TOKEN` | 必填，与 Worker secret `ECH_REPORT_TOKEN` 同值；缺失时工作流直接失败并提示。勾选 dry_run 时可不填，但只能取到 200 行；若 Worker 开了 `API_IPS_REQUIRE_TOKEN=1`，无 Token 读 `/api/ips` 会 401，dry-run 也必须提供 |
 | Actions variable | `ECH_SENTINELS` | 可选，逗号分隔的哨兵主机名；默认 `doh.leilaomi.ccwu.cc,www.cloudflare.com`。哨兵应选**开着 ECH 的 Free 计划站点**（最严格），`www.cloudflare.com` 只作补充 |
 
 > **Cloudflare 安全功能可能拦截 Actions 的上报**（403 / 质询页，工作流会以 `report HTTP 403` 失败；连续失败超过 36 小时后 `ech` 标记会全部变回 `null`）。按 Worker 域名所在 zone 开启的功能分别处理：
 >
 > - **Bot Fight Mode**（免费版「机器人攻击模式」）：WAF 自定义规则**无法**跳过它（[Cloudflare 文档](https://developers.cloudflare.com/waf/custom-rules/skip/options/)）。如果它拦截了上报，只能在「安全性 → 机器人」里关闭 Bot Fight Mode，或升级到 Super Bot Fight Mode 后用下面的 Skip 规则。
 > - **Super Bot Fight Mode / WAF 托管规则**（bot 类检查）：加一条 WAF 自定义规则，表达式 `(http.request.uri.path eq "/api/ech-report" and http.request.method eq "POST")`，动作 **Skip**，只勾选「All Super Bot Fight Mode rules」和（确有误拦时）「All managed rules」。
+> - **取池子的 `GET /api/ips` 也被拦**（工作流在上报前就以 `fetch pool: ... HTTP 403` 失败）：确认是 bot 类误拦后，把上面那条 Skip 规则的表达式扩成 `(http.request.uri.path eq "/api/ech-report" and http.request.method eq "POST") or (http.request.uri.path eq "/api/ips" and http.request.method eq "GET")`，跳过范围同样只限 bot 类检查。`/api/ips` 是公开读接口，Worker 内限流（`API_IPS_RATE_LIMIT`）照常生效。
 > - **速率限制规则：不要跳过。** 上面的表达式只按路径和方法匹配，任何人都能构造出这样的请求，跳过速率限制等于让未鉴权的请求绕过边缘限流。探测器每 6 小时只发 1 次上报（取池子 1 次），正常的边缘限流不会挡住它；如果确实被限流，请放宽该规则的阈值，而不是对这条路径整体 Skip。
 > - **Browser Integrity Check / Security Level** 等非规则引擎产品：同一条 Skip 规则里在「More components to skip」中勾选对应产品（同样只为 bot 类误拦）。
 >
@@ -282,7 +283,7 @@ Go 程序（Go ≥ 1.24，只用标准库，`crypto/tls` 的 `EncryptedClientHel
 cd tools/ech-probe
 go test ./...
 go run . -dry-run -v -ips 162.159.136.89,104.16.0.195   # 指定 IP，打印每次握手结果（不需要 -api）
-go run . -dry-run -api https://bestip.example.com       # 取池子探测，只打印汇总（无 Token 时最多 200 行）
+go run . -dry-run -api https://bestip.example.com       # 取池子探测，只打印汇总（无 Token 时最多 200 行；Worker 开了 API_IPS_REQUIRE_TOKEN=1 时会 401，需带 Token）
 ECH_REPORT_TOKEN=... go run . -dry-run -api https://bestip.example.com   # 带 Token 取全池，只打印汇总
 ECH_REPORT_TOKEN=... go run . -api https://bestip.example.com            # 探测全池并上报
 ```
