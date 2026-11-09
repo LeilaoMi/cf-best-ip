@@ -377,6 +377,10 @@ async function requireSubAccess(request, env) {
   return rateLimitByIp(request, env, "sub", "SUB_RATE_LIMIT", 120);
 }
 
+/**
+ * /api/ech-report 鉴权：只认独立的 ECH_REPORT_TOKEN（Bearer 头，常量时间比较）。
+ * @returns {Response | null} 未配置 → 503；token 不符 → 401；通过 → null
+ */
 function requireEchReportAuth(request, env) {
   // 独立 secret，不复用 ADMIN/REFRESH token；未配置即视为接口禁用
   if (!env.ECH_REPORT_TOKEN) {
@@ -387,6 +391,10 @@ function requireEchReportAuth(request, env) {
   }
   return null;
 }
+/**
+ * 读取 KV ech:status；任何读取/解析失败都返回 null，保证 /api/ips 不受影响。
+ * @returns {Promise<object | null>}
+ */
 async function loadEchStatus(env) {
   // ECH 打标只是附加信息：KV 读取失败时返回 null，/api/ips 照常输出（ech 字段为 null）
   try { return await kvGet(env, ECH_STATUS_KEY, null); }
@@ -1717,6 +1725,13 @@ function fmtEDT(ips) { return ips.map(fmtAddr).join("\n"); }
 // ============================================================
 // 11. 路由
 // ============================================================
+/**
+ * 主路由：按 path 分发到页面、订阅、JSON API 与受保护的管理/上报接口。
+ * @param {Request} request
+ * @param {object} env Worker 绑定与变量
+ * @param {ExecutionContext} ctx
+ * @returns {Promise<Response>}
+ */
 async function handle(request, env, ctx) {
   const url = new URL(request.url);
   const path = url.pathname;
