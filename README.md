@@ -263,7 +263,8 @@ wrangler secret put ECH_REPORT_TOKEN   # 随机长串；与 GitHub Actions secre
 - **没有自测延迟**：Worker 不能连 Cloudflare 自家 IP，国内实测数据只来自 hostmonit 和 uouin，这两个源不稳定时实测池会变小。
 - **地理位置没意义**：Cloudflare 是任播网络，IP 地理库几乎都显示美国或加拿大。地理信息只在页面展示，不参与排序，也不写进订阅备注。
 - **上游会变**：社区源随时可能改格式或下线。失败的源会自动退避，`/api/stats` 的 `sourceStats` 可以看到每个源的数量和错误。
-- **KV 限额**：限流计数用 KV 实现，每次订阅请求写一次 KV。免费版每天只有 1000 次写入，订阅被高频拉取时注意用量。
+- **限流是近似的，且 fail-open**：`/api/ips`、`/sub` 的每 IP 每分钟限流用 KV 计数。KV 同一个 key 每秒只能写一次，所以同一 isolate 内同一个计数 key 至少隔 1 秒才写一次 KV，其余请求只在内存里累加；计数取「KV 值」和「本 isolate 内存值」中较大者。被拦下的请求只在 KV 里的值还没超限时补写一次（让其它 isolate 也能看到超限），之后不再为被拦请求写 KV。KV 读写失败时请求照常放行（读失败时退回只按本 isolate 内存计数），不会因此返回 500。代价是跨 isolate / 机房可能少算几次，需要严格限流请再叠加 Cloudflare 边缘的速率限制规则。
+- **KV 限额**：限流计数写 KV。写入已按 key 合并（每个 key 每秒最多一次），但免费版每天只有 1000 次写入，订阅被大量不同 IP 高频拉取时仍要注意用量。
 
 ---
 
@@ -281,6 +282,7 @@ src/worker.js    Worker 入口：数据源、聚合、接口、页面、DNS 同�
 src/cidr.js      Cloudflare 官方 CIDR 判断
 src/scoring.js   稳定分、质量保护、源健康统计
 src/dns.js       DNS 差量计划
+src/ratelimit.js 每 IP 限流计数：同 key 写入合并、KV 失败 fail-open
 src/ech.js       ECH 打标：上报校验、合并、/api/ips 的 ech 字段
 scripts/verify-worker.mjs
 test/
