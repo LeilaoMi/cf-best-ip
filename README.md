@@ -267,7 +267,7 @@ Go 程序（Go ≥ 1.24，只用标准库，`crypto/tls` 的 `EncryptedClientHel
 |---|---|---|
 | Actions variable | `ECH_API_BASE` | **必填**，你自建 Worker 的 HTTPS 地址（如 `https://bestip.example.com`，不带路径）。取池子和上报都用它，上报会带 Token，所以**没有默认值**；未设置或不是 `https://` 时工作流（含 dry-run）直接失败并提示 |
 | Actions secret | `ECH_REPORT_TOKEN` | 必填，与 Worker secret `ECH_REPORT_TOKEN` 同值；缺失时工作流直接失败并提示。勾选 dry_run 时可不填，但只能取到 200 行；若 Worker 开了 `API_IPS_REQUIRE_TOKEN=1`，无 Token 读 `/api/ips` 会 401，dry-run 也必须提供 |
-| Actions variable | `ECH_SENTINELS` | 可选，逗号分隔的哨兵主机名；默认 `doh.leilaomi.ccwu.cc,www.cloudflare.com`。哨兵应选**开着 ECH 的 Free 计划站点**（最严格），`www.cloudflare.com` 只作补充 |
+| Actions variable | `ECH_SENTINELS` | 可选，逗号分隔的哨兵主机名；默认 `doh.leilaomi.ccwu.cc,www.cloudflare.com`（`doh.leilaomi.ccwu.cc` 是本仓库作者自己的 Free 计划站点）。哨兵应选**你自己控制、开着 ECH 的 Free 计划站点**（最严格），`www.cloudflare.com` 只作补充。**fork 部署请务必设置此变量**：默认哨兵不归你控制，若它换套餐、关 ECH 或改响应，结论会悄悄变错（非 1034 的响应都判 `ok`） |
 
 > **Cloudflare 安全功能可能拦截 Actions 的上报**（403 / 质询页，工作流会以 `report HTTP 403` 失败；连续失败超过 36 小时后 `ech` 标记会全部变回 `null`）。按 Worker 域名所在 zone 开启的功能分别处理：
 >
