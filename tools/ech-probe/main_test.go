@@ -12,6 +12,7 @@ import (
 	"testing"
 )
 
+// TestClassifyResponse covers 1034 detection and false-positive guards.
 func TestClassifyResponse(t *testing.T) {
 	cases := []struct {
 		code int
@@ -21,6 +22,9 @@ func TestClassifyResponse(t *testing.T) {
 		{403, "error code: 1034", statusRestricted},
 		{200, "<title>Edge IP Restricted | Cloudflare</title>", statusRestricted},
 		{403, "Error 1034 ...", statusRestricted},
+		{403, "<span>Error</span> <span>1034</span>", statusOK}, // markup in between: not matched, the title check covers real pages
+		{403, "Ray ID: 8a1034b2c3d4e5f6", statusOK},
+		{403, "error 10345", statusOK},
 		{403, "error code: 1020", statusOK}, // WAF block is still an HTTP answer from a usable edge
 		{200, "fl=123\nh=example.com\n", statusOK},
 		{404, "not found", statusOK},
@@ -34,6 +38,7 @@ func TestClassifyResponse(t *testing.T) {
 	}
 }
 
+// TestAggregateIP checks the per-IP verdict across sentinels.
 func TestAggregateIP(t *testing.T) {
 	cases := []struct {
 		in   []string
@@ -53,10 +58,12 @@ func TestAggregateIP(t *testing.T) {
 	}
 }
 
+// mkSummary builds a summary with the given per-status counts.
 func mkSummary(ok, restricted, unknown int) summary {
 	return summary{Total: ok + restricted + unknown, Counts: map[string]int{statusOK: ok, statusRestricted: restricted, statusUnknown: unknown}}
 }
 
+// TestGuard checks the abnormal-environment thresholds.
 func TestGuard(t *testing.T) {
 	if err := guard(mkSummary(250, 24, 9), 0.5, 0.3); err != nil {
 		t.Fatalf("normal run rejected: %v", err)
@@ -75,6 +82,7 @@ func TestGuard(t *testing.T) {
 	}
 }
 
+// TestSummarizeSortsRestricted checks counts and numeric IP ordering.
 func TestSummarizeSortsRestricted(t *testing.T) {
 	s := summarize([]ipResult{
 		{IP: "198.41.208.26", Status: statusRestricted},
@@ -123,6 +131,8 @@ func buildHTTPSAnswer(t *testing.T, id uint16, qname string, ech []byte) []byte 
 	return msg
 }
 
+// TestParseECHFromDNSResponse parses a CNAME + HTTPS answer and rejects
+// mismatched or truncated messages.
 func TestParseECHFromDNSResponse(t *testing.T) {
 	ech := []byte{0x00, 0x45, 0xfe, 0x0d, 0x01, 0x02}
 	msg := buildHTTPSAnswer(t, 0x1234, "doh.example.com", ech)
@@ -141,6 +151,7 @@ func TestParseECHFromDNSResponse(t *testing.T) {
 	}
 }
 
+// TestEchFromSVCB rejects AliasMode, missing and truncated ech params.
 func TestEchFromSVCB(t *testing.T) {
 	if _, ok := echFromSVCB([]byte{0, 0, 0}); ok {
 		t.Fatal("AliasMode must not yield ech")
@@ -153,6 +164,7 @@ func TestEchFromSVCB(t *testing.T) {
 	}
 }
 
+// TestBuildDNSQueryRejectsBadNames checks hostname validation.
 func TestBuildDNSQueryRejectsBadNames(t *testing.T) {
 	for _, n := range []string{"", ".", "a..b", strings.Repeat("a", 64) + ".com"} {
 		if _, _, err := buildDNSQuery(n, dnsTypeHTTPS); err == nil {
@@ -161,6 +173,7 @@ func TestBuildDNSQueryRejectsBadNames(t *testing.T) {
 	}
 }
 
+// TestFetchECHConfigOverDoH runs a full RFC 8484 POST round trip.
 func TestFetchECHConfigOverDoH(t *testing.T) {
 	ech := []byte{1, 2, 3, 4}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -180,6 +193,7 @@ func TestFetchECHConfigOverDoH(t *testing.T) {
 	}
 }
 
+// TestParseOptions checks env defaults, dedup and flag validation.
 func TestParseOptions(t *testing.T) {
 	t.Setenv("ECH_SENTINELS", " A.example.com, b.example.com ,a.example.com,")
 	o, err := parseOptions([]string{"-dry-run", "-ips", "1.2.3.4, 5.6.7.8"})
@@ -200,6 +214,7 @@ func TestParseOptions(t *testing.T) {
 	}
 }
 
+// TestReport checks the report request and non-2xx handling.
 func TestReport(t *testing.T) {
 	var got reportBody
 	var auth string
@@ -230,6 +245,7 @@ func TestReport(t *testing.T) {
 	}
 }
 
+// TestRunRequiresTokenUnlessDryRun checks the missing-secret exit code.
 func TestRunRequiresTokenUnlessDryRun(t *testing.T) {
 	t.Setenv("ECH_REPORT_TOKEN", "")
 	if code := run([]string{"-ips", "1.2.3.4"}); code != 2 {

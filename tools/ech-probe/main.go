@@ -49,6 +49,8 @@ type options struct {
 	verbose       bool
 }
 
+// splitList splits a comma-separated list, trimming, lowercasing and
+// deduplicating entries while keeping their order.
 func splitList(s string) []string {
 	var out []string
 	seen := map[string]bool{}
@@ -62,6 +64,7 @@ func splitList(s string) []string {
 	return out
 }
 
+// envOr returns the trimmed value of env var key, or def when it is empty.
 func envOr(key, def string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v
@@ -69,6 +72,8 @@ func envOr(key, def string) string {
 	return def
 }
 
+// parseOptions parses command-line flags (with env var defaults) and
+// validates them.
 func parseOptions(args []string) (options, error) {
 	var o options
 	fs := flag.NewFlagSet("ech-probe", flag.ContinueOnError)
@@ -145,6 +150,8 @@ func getJSON(ctx context.Context, client *http.Client, u string, v any) error {
 
 var errClientStatus = errors.New("client error status")
 
+// getJSONOnce performs a single GET of u and decodes the JSON body into v.
+// 4xx responses wrap errClientStatus so callers do not retry them.
 func getJSONOnce(ctx context.Context, client *http.Client, u string, v any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
@@ -229,6 +236,9 @@ type ipResult struct {
 	PerTarget map[string]string `json:"-"`
 }
 
+// runProbes probes every IP against every target with o.concurrency
+// workers and returns one aggregated result per IP, in input order. IPs not
+// reached before ctx is cancelled are reported as unknown.
 func runProbes(ctx context.Context, o options, ips []string, targets []probeTarget) []ipResult {
 	results := make([]ipResult, len(ips))
 	jobs := make(chan int)
@@ -282,6 +292,8 @@ type summary struct {
 	Restricted []string
 }
 
+// summarize counts results per status and lists restricted IPs in address
+// order.
 func summarize(results []ipResult) summary {
 	s := summary{Total: len(results), Counts: map[string]int{statusOK: 0, statusRestricted: 0, statusUnknown: 0}}
 	for _, r := range results {
@@ -321,6 +333,8 @@ type reportBody struct {
 	Results   []ipResult `json:"results"`
 }
 
+// report POSTs the run to base/api/ech-report with the Bearer token and
+// fails on any non-2xx answer.
 func report(ctx context.Context, client *http.Client, base, token string, body reportBody) error {
 	buf, err := json.Marshal(body)
 	if err != nil {
@@ -346,6 +360,8 @@ func report(ctx context.Context, client *http.Client, base, token string, body r
 	return nil
 }
 
+// runID identifies the run: GITHUB_RUN_ID (plus the attempt number on
+// re-runs) in Actions, a UTC timestamp otherwise.
 func runID() string {
 	if id := strings.TrimSpace(os.Getenv("GITHUB_RUN_ID")); id != "" {
 		if a := strings.TrimSpace(os.Getenv("GITHUB_RUN_ATTEMPT")); a != "" && a != "1" {
@@ -356,6 +372,8 @@ func runID() string {
 	return "local-" + time.Now().UTC().Format("20060102T150405Z")
 }
 
+// run is the whole program; it returns the process exit code (0 ok,
+// 1 probe/report failure or guard tripped, 2 usage error).
 func run(args []string) int {
 	o, err := parseOptions(args)
 	if err != nil {
@@ -448,6 +466,7 @@ func run(args []string) int {
 	return 0
 }
 
+// main exits with run's status code.
 func main() {
 	os.Exit(run(os.Args[1:]))
 }

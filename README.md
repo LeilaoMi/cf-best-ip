@@ -261,7 +261,13 @@ Go 程序（Go ≥ 1.24，只用标准库，`crypto/tls` 的 `EncryptedClientHel
 | Actions secret | `ECH_REPORT_TOKEN` | 必填，与 Worker secret `ECH_REPORT_TOKEN` 同值；缺失时工作流直接失败并提示 |
 | Actions variable | `ECH_SENTINELS` | 可选，逗号分隔的哨兵主机名；默认 `doh.leilaomi.ccwu.cc,www.cloudflare.com`。哨兵应选**开着 ECH 的 Free 计划站点**（最严格），`www.cloudflare.com` 只作补充 |
 
-> 如果 Worker 域名开了 Bot Fight Mode / WAF 托管规则，GitHub Actions 的 `POST /api/ech-report` 可能被拦截（403 / 质询页）。需要在 Cloudflare 面板对路径 `/api/ech-report` 加一条 WAF 自定义规则「Skip」（跳过托管规则 / Bot Fight / 超级机器人模式）。接口本身有独立 Token 鉴权和限流。
+> **Cloudflare 安全功能可能拦截 Actions 的上报**（403 / 质询页，工作流会以 `report HTTP 403` 失败；连续失败超过 36 小时后 `ech` 标记会全部变回 `null`）。按 Worker 域名所在 zone 开启的功能分别处理：
+>
+> - **Bot Fight Mode**（免费版「机器人攻击模式」）：WAF 自定义规则**无法**跳过它（[Cloudflare 文档](https://developers.cloudflare.com/waf/custom-rules/skip/options/)）。如果它拦截了上报，只能在「安全性 → 机器人」里关闭 Bot Fight Mode，或升级到 Super Bot Fight Mode 后用下面的 Skip 规则。
+> - **Super Bot Fight Mode / WAF 托管规则 / 速率限制规则**：加一条 WAF 自定义规则，表达式 `(http.request.uri.path eq "/api/ech-report" and http.request.method eq "POST")`，动作 **Skip**，勾选「All Super Bot Fight Mode rules」「All managed rules」「All rate limiting rules」（按实际开启的选）。
+> - **Browser Integrity Check / Security Level** 等非规则引擎产品：同一条 Skip 规则里在「More components to skip」中勾选对应产品。
+>
+> 接口本身仍有独立 Token 鉴权（`ECH_REPORT_TOKEN`）和 Worker 内限流，跳过这些检查不会让它变成公开写入口。
 
 本地运行：
 

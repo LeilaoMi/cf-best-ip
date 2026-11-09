@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -20,13 +21,17 @@ const (
 	maxProbeBody     = 32 << 10
 )
 
+// error1034RE matches "Error 1034" / "error code: 1034" as whole words, so a
+// Ray ID that merely contains the digits 1034 does not count.
+var error1034RE = regexp.MustCompile(`(?i)\berror(?:\s+code)?\s*:?\s*1034\b`)
+
 // classifyResponse decides restricted/ok from an HTTP response that was
 // actually received. Network-level failures never reach this function.
 func classifyResponse(code int, body string) string {
 	if strings.Contains(body, "error code: 1034") || strings.Contains(body, "Edge IP Restricted") {
 		return statusRestricted
 	}
-	if code == http.StatusForbidden && strings.Contains(body, "1034") {
+	if code == http.StatusForbidden && error1034RE.MatchString(body) {
 		return statusRestricted
 	}
 	return statusOK
