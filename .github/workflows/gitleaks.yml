@@ -30,6 +30,16 @@ name: Gitleaks
 # [extend] useDefault = true, or it REPLACES the default rules and
 # nothing is detected at all (verified locally against gitleaks
 # v8.30.1).
+# cf-best-ip note: two historical false positives are forgiven by an
+# exact STOPWORD (commit cb42a69, 2026-05-18, "v2.0 ..."): README.md
+# showed curl examples with `-u admin:` plus the literal 8-letter
+# placeholder word (all caps, verified by checksum locally -- not a
+# real credential; the working tree is clean and the examples were
+# later rewritten). A stopword is used instead of a commit exemption
+# so the history scan keeps its full view of that commit's other
+# files. The stopword only matches the literal placeholder string --
+# a planted real curl credential + AKIA secret are still flagged
+# (tested locally against gitleaks v8.30.1).
 on:
   push:
     branches: [main]
@@ -37,6 +47,18 @@ on:
 permissions:
   contents: read
   security-events: write
+env:
+  # Shared by all three scans in this file (CLI steps and the action
+  # both follow the gitleaks config precedence, which includes
+  # GITLEAKS_CONFIG_TOML). [extend] useDefault is required: a custom
+  # config without it REPLACES the default rules and nothing is
+  # detected at all (verified locally against gitleaks v8.30.1).
+  GITLEAKS_CONFIG_TOML: |
+    [extend]
+    useDefault = true
+
+    [allowlist]
+    stopwords = ["admin:PASSWORD"]
 jobs:
   gitleaks:
     runs-on: ubuntu-latest
