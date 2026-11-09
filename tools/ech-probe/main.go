@@ -27,10 +27,10 @@ import (
 )
 
 const (
-	defaultAPIBase   = "https://bestip.leilaomi.cc.cd"
 	defaultDoH       = "https://cloudflare-dns.com/dns-query"
 	defaultSentinels = "doh.leilaomi.ccwu.cc,www.cloudflare.com"
 	maxReportIPs     = 2000 // must match the Worker's limit
+	poolLimit        = 2000 // /api/ips row cap for ECH_REPORT_TOKEN holders (Worker ECH_READER_MAX_TOP)
 	userAgent        = "cf-best-ip-ech-probe/1"
 )
 
@@ -77,7 +77,8 @@ func envOr(key, def string) string {
 func parseOptions(args []string) (options, error) {
 	var o options
 	fs := flag.NewFlagSet("ech-probe", flag.ContinueOnError)
-	fs.StringVar(&o.apiBase, "api", envOr("ECH_API_BASE", defaultAPIBase), "cf-best-ip base URL (pool source and report target)")
+	fs.StringVar(&o.apiBase, "api", envOr("ECH_API_BASE", ""),
+		"your cf-best-ip Worker HTTPS base URL, pool source and report target (env ECH_API_BASE; no default)")
 	fs.StringVar(&o.dohURL, "doh", envOr("ECH_DOH_URL", defaultDoH), "DoH endpoint (RFC 8484) used to fetch ECH configs")
 	fs.StringVar(&o.echFallback, "ech-fallback", envOr("ECH_FALLBACK_HOST", "cloudflare-ech.com"),
 		"host whose ECH config is used for sentinels that publish none (Cloudflare shares one ECH key; empty disables)")
@@ -111,7 +112,26 @@ func parseOptions(args []string) (options, error) {
 		return o, errors.New("-path must start with /")
 	}
 	o.apiBase = strings.TrimRight(o.apiBase, "/")
+	// The API base receives the ECH_REPORT_TOKEN, so it has no default and
+	// must be an explicit https URL whenever it is used: to fetch the pool
+	// (no -ips) or to report (no -dry-run).
+	if o.apiBase == "" {
+		if len(o.ipsOverride) == 0 || !o.dryRun {
+			return o, errors.New("API base not set: set ECH_API_BASE (Actions variable) or -api to your own Worker's https URL")
+		}
+	} else if err := checkAPIBase(o.apiBase); err != nil {
+		return o, err
+	}
 	return o, nil
+}
+
+// checkAPIBase requires an absolute https URL without query or fragment.
+func checkAPIBase(s string) error {
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return fmt.Errorf("-api / ECH_API_BASE %q must be an https URL like https://bestip.example.com", s)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------- pool
@@ -125,18 +145,11 @@ type ipsResponse struct {
 	} `json:"ips"`
 }
 
-type statsResponse struct {
-	ByCountry []struct {
-		Key   string `json:"key"`
-		Count int    `json:"count"`
-	} `json:"byCountry"`
-}
-
-// getJSON fetches u, retrying once on transport errors and 5xx. The Worker's
-// per-IP rate limiter writes one KV key per minute and KV rejects writes to
-// the same key faster than once per second, so back-to-back calls can 500.
-func getJSON(ctx context.Context, client *http.Client, u string, v any) error {
-	err := getJSONOnce(ctx, client, u, v)
+// getJSON fetches u (with the optional Bearer token), retrying once on
+// transport errors and 5xx. Older Workers' per-IP rate limiter could answer
+// 500 when KV rejected a same-key write, so one retry is cheap insurance.
+func getJSON(ctx context.Context, client *http.Client, u, token string, v any) error {
+	err := getJSONOnce(ctx, client, u, token, v)
 	if err == nil || errors.Is(err, errClientStatus) {
 		return err
 	}
@@ -145,20 +158,23 @@ func getJSON(ctx context.Context, client *http.Client, u string, v any) error {
 		return err
 	case <-time.After(1500 * time.Millisecond):
 	}
-	return getJSONOnce(ctx, client, u, v)
+	return getJSONOnce(ctx, client, u, token, v)
 }
 
 var errClientStatus = errors.New("client error status")
 
 // getJSONOnce performs a single GET of u and decodes the JSON body into v.
 // 4xx responses wrap errClientStatus so callers do not retry them.
-func getJSONOnce(ctx context.Context, client *http.Client, u string, v any) error {
+func getJSONOnce(ctx context.Context, client *http.Client, u, token string, v any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("user-agent", userAgent)
 	req.Header.Set("accept", "application/json")
+	if token != "" {
+		req.Header.Set("authorization", "Bearer "+token)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -173,59 +189,55 @@ func getJSONOnce(ctx context.Context, client *http.Client, u string, v any) erro
 	return json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(v)
 }
 
-// fetchPool returns the deduplicated IPv4 addresses of the pool. /api/ips
-// caps one response at 200 rows, so besides the plain ?limit=1000 query we
-// also query each country bucket reported by /api/stats and take the union.
-func fetchPool(ctx context.Context, client *http.Client, base string) ([]string, int, error) {
-	seen := map[string]bool{}
-	var out []string
-	total := 0
-	add := func(r *ipsResponse) {
-		if r.Total > total {
-			total = r.Total
-		}
-		for _, x := range r.IPs {
-			a, err := netip.ParseAddr(x.IP)
-			if err != nil || !a.Is4() {
-				continue
-			}
-			if s := a.String(); !seen[s] {
-				seen[s] = true
-				out = append(out, s)
-			}
-		}
-	}
-	var first ipsResponse
-	if err := getJSON(ctx, client, base+"/api/ips?limit=1000", &first); err != nil {
-		return nil, 0, err
-	}
-	add(&first)
+// poolResult is the deduplicated IPv4 part of one /api/ips response.
+type poolResult struct {
+	IPs      []string // deduplicated IPv4, pool order
+	Total    int      // pool size reported by the Worker (v4 + v6)
+	Returned int      // rows in the response (v4 + v6)
+}
 
-	time.Sleep(1100 * time.Millisecond)
-	var stats statsResponse
-	if err := getJSON(ctx, client, base+"/api/stats", &stats); err != nil {
-		fmt.Fprintf(os.Stderr, "warn: /api/stats unavailable, using first page only: %v\n", err)
-		return out, total, nil
+// fetchPool reads the whole pool in one request: /api/ips?limit=2000 with
+// the ECH_REPORT_TOKEN, which the Worker honours by lifting its public
+// 200-row cap. Without a token (dry-run) or against a Worker that predates
+// that change the answer is capped at 200 rows; warnings name the gap.
+func fetchPool(ctx context.Context, client *http.Client, base, token string) (poolResult, error) {
+	var r ipsResponse
+	u := fmt.Sprintf("%s/api/ips?limit=%d&perCountry=0", base, poolLimit)
+	if err := getJSON(ctx, client, u, token, &r); err != nil {
+		return poolResult{}, err
 	}
-	for _, c := range stats.ByCountry {
-		if len(c.Key) != 2 || c.Key == "??" {
+	res := poolResult{Total: r.Total, Returned: len(r.IPs)}
+	seen := map[string]bool{}
+	for _, x := range r.IPs {
+		a, err := netip.ParseAddr(x.IP)
+		if err != nil || !a.Is4() {
 			continue
 		}
-		// Space requests out (see getJSON) to stay clear of the KV write limit.
-		select {
-		case <-ctx.Done():
-			return out, total, ctx.Err()
-		case <-time.After(1100 * time.Millisecond):
+		if s := a.String(); !seen[s] {
+			seen[s] = true
+			res.IPs = append(res.IPs, s)
 		}
-		var page ipsResponse
-		u := base + "/api/ips?limit=1000&family=v4&country=" + url.QueryEscape(c.Key)
-		if err := getJSON(ctx, client, u, &page); err != nil {
-			fmt.Fprintf(os.Stderr, "warn: %v\n", err)
-			continue
-		}
-		add(&page)
 	}
-	return out, total, nil
+	for _, w := range poolWarnings(res, token != "") {
+		fmt.Fprintln(os.Stderr, "warn: "+w)
+	}
+	return res, nil
+}
+
+// poolWarnings explains why a pool response may not cover the whole pool.
+func poolWarnings(r poolResult, withToken bool) []string {
+	var w []string
+	if r.Returned >= poolLimit {
+		w = append(w, fmt.Sprintf("/api/ips returned %d rows = the %d-row cap; the pool may be larger and the rest is not probed", r.Returned, poolLimit))
+	}
+	if r.Total > r.Returned {
+		why := "the Worker may not have the ECH_REPORT_TOKEN cap lift deployed, or the token does not match"
+		if !withToken {
+			why = "no ECH_REPORT_TOKEN, public cap is 200 rows"
+		}
+		w = append(w, fmt.Sprintf("only %d of %d pool rows fetched (%s)", r.Returned, r.Total, why))
+	}
+	return w
 }
 
 // ---------------------------------------------------------------- run
@@ -417,11 +429,12 @@ func run(args []string) int {
 	ips := o.ipsOverride
 	poolTotal := 0
 	if len(ips) == 0 {
-		ips, poolTotal, err = fetchPool(ctx, httpClient, o.apiBase)
+		pool, err := fetchPool(ctx, httpClient, o.apiBase, token)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error: fetch pool:", err)
 			return 1
 		}
+		ips, poolTotal = pool.IPs, pool.Total
 	}
 	if len(ips) > maxReportIPs {
 		fmt.Fprintf(os.Stderr, "warn: %d IPs, probing the first %d only\n", len(ips), maxReportIPs)

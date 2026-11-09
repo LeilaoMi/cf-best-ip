@@ -249,10 +249,11 @@ Go 程序（Go ≥ 1.24，只用标准库，`crypto/tls` 的 `EncryptedClientHel
 
 流程：
 
-1. 从 `/api/ips?limit=1000` 取池子，并按 `/api/stats` 的国家分桶补齐（单次 `/api/ips` 最多返回 200 行），只留 IPv4、去重。
+1. 带 `Authorization: Bearer <ECH_REPORT_TOKEN>` 一次请求 `/api/ips?limit=2000&perCountry=0` 取全池（不带 `ech` 过滤），只留 IPv4、去重。Worker 只对有效 Token 放宽到 2000 行；不带 Token（如本地 dry-run）或 Worker 尚未部署这项改动时最多 200 行。返回行数少于池子总数、或正好达到 2000 行上限时会打印 `warn:`，未取到的 IP 本轮不探测（它们的旧标记 36 小时后变回 `null`）。
 2. 对每个哨兵主机名经 DoH（`https://cloudflare-dns.com/dns-query`，RFC 8484 wireformat，TYPE65）取 HTTPS 记录里的 `ech` 配置；哨兵本身没发布 ECH 时（如 `www.cloudflare.com`）借用 `cloudflare-ech.com` 的配置（Cloudflare 全网共用这一把 ECH key）。
 3. 对每个 IP × 哨兵：TCP 连 `IP:443`，SNI = 哨兵，带 ECH 做 TLS 1.3 握手，`GET /cdn-cgi/trace`：
-   - 响应体含 `error code: 1034` / `Edge IP Restricted`（或 403 且含 1034）→ `restricted`；
+   - 响应体匹配带单词边界的 `error code: 1034`（`10345` 不算）或含 `Edge IP Restricted` → `restricted`；
+   - 403 且响应体匹配带单词边界的 `Error 1034` / `error code: 1034`（不区分大小写）→ `restricted`；仅在 Ray ID 等位置出现数字 `1034` **不算**；
    - 拿到其它任何 HTTP 响应 → `ok`；
    - 超时 / 连接 / 握手错误重试 1 次仍失败 → `unknown`（网络错误永远不会判成 `restricted`）。
 4. 单 IP 结论：任一哨兵 `restricted` → `restricted`；全部 `ok` → `ok`；否则 `unknown`。并发 16，单次 8 秒超时。
@@ -262,28 +263,33 @@ Go 程序（Go ≥ 1.24，只用标准库，`crypto/tls` 的 `EncryptedClientHel
 
 | 位置 | 名称 | 说明 |
 |---|---|---|
-| Actions secret | `ECH_REPORT_TOKEN` | 必填，与 Worker secret `ECH_REPORT_TOKEN` 同值；缺失时工作流直接失败并提示 |
+| Actions variable | `ECH_API_BASE` | **必填**，你自建 Worker 的 HTTPS 地址（如 `https://bestip.example.com`，不带路径）。取池子和上报都用它，上报会带 Token，所以**没有默认值**；未设置或不是 `https://` 时工作流（含 dry-run）直接失败并提示 |
+| Actions secret | `ECH_REPORT_TOKEN` | 必填，与 Worker secret `ECH_REPORT_TOKEN` 同值；缺失时工作流直接失败并提示（勾选 dry_run 时可不填，但只能取到 200 行） |
 | Actions variable | `ECH_SENTINELS` | 可选，逗号分隔的哨兵主机名；默认 `doh.leilaomi.ccwu.cc,www.cloudflare.com`。哨兵应选**开着 ECH 的 Free 计划站点**（最严格），`www.cloudflare.com` 只作补充 |
 
 > **Cloudflare 安全功能可能拦截 Actions 的上报**（403 / 质询页，工作流会以 `report HTTP 403` 失败；连续失败超过 36 小时后 `ech` 标记会全部变回 `null`）。按 Worker 域名所在 zone 开启的功能分别处理：
 >
 > - **Bot Fight Mode**（免费版「机器人攻击模式」）：WAF 自定义规则**无法**跳过它（[Cloudflare 文档](https://developers.cloudflare.com/waf/custom-rules/skip/options/)）。如果它拦截了上报，只能在「安全性 → 机器人」里关闭 Bot Fight Mode，或升级到 Super Bot Fight Mode 后用下面的 Skip 规则。
-> - **Super Bot Fight Mode / WAF 托管规则 / 速率限制规则**：加一条 WAF 自定义规则，表达式 `(http.request.uri.path eq "/api/ech-report" and http.request.method eq "POST")`，动作 **Skip**，勾选「All Super Bot Fight Mode rules」「All managed rules」「All rate limiting rules」（按实际开启的选）。
-> - **Browser Integrity Check / Security Level** 等非规则引擎产品：同一条 Skip 规则里在「More components to skip」中勾选对应产品。
+> - **Super Bot Fight Mode / WAF 托管规则**（bot 类检查）：加一条 WAF 自定义规则，表达式 `(http.request.uri.path eq "/api/ech-report" and http.request.method eq "POST")`，动作 **Skip**，只勾选「All Super Bot Fight Mode rules」和（确有误拦时）「All managed rules」。
+> - **速率限制规则：不要跳过。** 上面的表达式只按路径和方法匹配，任何人都能构造出这样的请求，跳过速率限制等于让未鉴权的请求绕过边缘限流。探测器每 6 小时只发 1 次上报（取池子 1 次），正常的边缘限流不会挡住它；如果确实被限流，请放宽该规则的阈值，而不是对这条路径整体 Skip。
+> - **Browser Integrity Check / Security Level** 等非规则引擎产品：同一条 Skip 规则里在「More components to skip」中勾选对应产品（同样只为 bot 类误拦）。
 >
-> 接口本身仍有独立 Token 鉴权（`ECH_REPORT_TOKEN`）和 Worker 内限流，跳过这些检查不会让它变成公开写入口。
+> 接口本身仍有独立 Token 鉴权（`ECH_REPORT_TOKEN`）和 Worker 内限流，并保留边缘限流；跳过 bot 类检查不会让它变成公开写入口。
 
 本地运行：
 
 ```bash
 cd tools/ech-probe
 go test ./...
-go run . -dry-run                              # 探测全池，只打印汇总
-go run . -dry-run -v -ips 162.159.136.89,104.16.0.195   # 指定 IP，打印每次握手结果
-ECH_REPORT_TOKEN=... go run .                  # 探测并上报
+go run . -dry-run -v -ips 162.159.136.89,104.16.0.195   # 指定 IP，打印每次握手结果（不需要 -api）
+go run . -dry-run -api https://bestip.example.com       # 取池子探测，只打印汇总（无 Token 时最多 200 行）
+ECH_REPORT_TOKEN=... go run . -dry-run -api https://bestip.example.com   # 带 Token 取全池，只打印汇总
+ECH_REPORT_TOKEN=... go run . -api https://bestip.example.com            # 探测全池并上报
 ```
 
-其它参数：`-sentinels`、`-path`（默认 `/cdn-cgi/trace`）、`-concurrency`、`-timeout`、`-doh`、`-ech-fallback`、`-api`、`-max-restricted`、`-max-unknown`，见 `go run . -h`。
+`-api`（或环境变量 `ECH_API_BASE`）**没有默认值**，必须是你自建 Worker 的 `https://` 地址；只有「`-dry-run` + `-ips`」这种既不取池子也不上报的用法可以省略。
+
+其它参数：`-sentinels`、`-path`（默认 `/cdn-cgi/trace`）、`-concurrency`、`-timeout`、`-doh`、`-ech-fallback`、`-max-restricted`、`-max-unknown`，见 `go run . -h`。
 
 ---
 

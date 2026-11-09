@@ -198,6 +198,7 @@ func TestFetchECHConfigOverDoH(t *testing.T) {
 
 // TestParseOptions checks env defaults, dedup and flag validation.
 func TestParseOptions(t *testing.T) {
+	t.Setenv("ECH_API_BASE", "")
 	t.Setenv("ECH_SENTINELS", " A.example.com, b.example.com ,a.example.com,")
 	o, err := parseOptions([]string{"-dry-run", "-ips", "1.2.3.4, 5.6.7.8"})
 	if err != nil {
@@ -251,7 +252,90 @@ func TestReport(t *testing.T) {
 // TestRunRequiresTokenUnlessDryRun checks the missing-secret exit code.
 func TestRunRequiresTokenUnlessDryRun(t *testing.T) {
 	t.Setenv("ECH_REPORT_TOKEN", "")
+	t.Setenv("ECH_API_BASE", "https://bestip.example.com")
 	if code := run([]string{"-ips", "1.2.3.4"}); code != 2 {
 		t.Fatalf("run without token = %d, want 2", code)
+	}
+}
+
+// TestAPIBaseHasNoDefault checks that the report/pool URL must be given
+// explicitly (env ECH_API_BASE or -api) and must be https.
+func TestAPIBaseHasNoDefault(t *testing.T) {
+	t.Setenv("ECH_API_BASE", "")
+	for _, args := range [][]string{
+		{"-dry-run"},        // dry-run still fetches the pool
+		{"-ips", "1.2.3.4"}, // reporting needs a target
+		{"-api", "http://bestip.example.com"},
+		{"-api", "bestip.example.com"},
+		{"-api", "https://bestip.example.com/?x=1"},
+	} {
+		if _, err := parseOptions(args); err == nil {
+			t.Fatalf("parseOptions(%v) must fail", args)
+		}
+	}
+	// dry-run on fixed IPs needs no API at all
+	if _, err := parseOptions([]string{"-dry-run", "-ips", "1.2.3.4"}); err != nil {
+		t.Fatal(err)
+	}
+	o, err := parseOptions([]string{"-api", "https://bestip.example.com/"})
+	if err != nil || o.apiBase != "https://bestip.example.com" {
+		t.Fatalf("-api: %+v %v", o.apiBase, err)
+	}
+	t.Setenv("ECH_API_BASE", "https://env.example.com")
+	if o, err := parseOptions(nil); err != nil || o.apiBase != "https://env.example.com" {
+		t.Fatalf("env: %+v %v", o.apiBase, err)
+	}
+	t.Setenv("ECH_API_BASE", "")
+	t.Setenv("ECH_REPORT_TOKEN", "tok")
+	if code := run([]string{"-ips", "1.2.3.4"}); code != 2 {
+		t.Fatalf("run without API base = %d, want 2", code)
+	}
+}
+
+// TestFetchPoolOneRequestWithToken checks the single full-pool request.
+func TestFetchPoolOneRequestWithToken(t *testing.T) {
+	var calls int
+	var auth, query string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		auth, query = r.Header.Get("authorization"), r.URL.RawQuery
+		if r.URL.Path != "/api/ips" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(`{"ok":true,"total":4,"ips":[{"ip":"1.2.3.4"},{"ip":"2606:4700::1"},{"ip":"5.6.7.8"},{"ip":"1.2.3.4"}]}`))
+	}))
+	defer srv.Close()
+	got, err := fetchPool(context.Background(), srv.Client(), srv.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || auth != "Bearer tok" || query != "limit=2000&perCountry=0" {
+		t.Fatalf("calls=%d auth=%q query=%q", calls, auth, query)
+	}
+	if strings.Join(got.IPs, ",") != "1.2.3.4,5.6.7.8" || got.Total != 4 || got.Returned != 4 {
+		t.Fatalf("pool = %+v", got)
+	}
+	if _, err := fetchPool(context.Background(), srv.Client(), srv.URL, ""); err != nil || auth != "" {
+		t.Fatalf("no token: auth=%q err=%v", auth, err)
+	}
+}
+
+// TestPoolWarnings checks the truncation warnings.
+func TestPoolWarnings(t *testing.T) {
+	if w := poolWarnings(poolResult{Total: 328, Returned: 328}, true); len(w) != 0 {
+		t.Fatalf("full pool warned: %v", w)
+	}
+	if w := poolWarnings(poolResult{Total: 2500, Returned: 2000}, true); len(w) != 2 || !strings.Contains(w[0], "cap") {
+		t.Fatalf("cap hit: %v", w)
+	}
+	if w := poolWarnings(poolResult{Total: 2000, Returned: 2000}, true); len(w) != 1 {
+		t.Fatalf("exactly at cap must warn: %v", w)
+	}
+	if w := poolWarnings(poolResult{Total: 328, Returned: 200}, false); len(w) != 1 || !strings.Contains(w[0], "no ECH_REPORT_TOKEN") {
+		t.Fatalf("public cap: %v", w)
+	}
+	if w := poolWarnings(poolResult{Total: 328, Returned: 200}, true); len(w) != 1 || !strings.Contains(w[0], "not have") {
+		t.Fatalf("old worker: %v", w)
 	}
 }

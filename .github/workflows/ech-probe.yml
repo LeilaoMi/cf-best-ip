@@ -27,6 +27,7 @@ jobs:
       run:
         working-directory: tools/ech-probe
     env:
+      ECH_API_BASE: ${{ vars.ECH_API_BASE }}   # 必填：自建 Worker 的 https 地址，无默认值
       ECH_SENTINELS: ${{ vars.ECH_SENTINELS }} # 为空时用程序默认值
       ECH_REPORT_TOKEN: ${{ secrets.ECH_REPORT_TOKEN }}
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
@@ -38,10 +39,17 @@ jobs:
         with:
           go-version: stable # go.mod 要求 >= 1.24；用当前受支持的稳定版
           cache: false       # 仅标准库，没有 go.sum
-      - name: Check secret
-        if: env.DRY_RUN != 'true'
+      - name: Check settings
         run: |
-          if [ -z "$ECH_REPORT_TOKEN" ]; then
+          # 上报会带 ECH_REPORT_TOKEN，取池子也要用它，所以地址必须显式配置（dry-run 同样要取池子）
+          case "$ECH_API_BASE" in
+            https://?*) ;;
+            *)
+              echo "::error title=ECH_API_BASE missing::请在仓库 Settings → Secrets and variables → Actions → Variables 添加 ECH_API_BASE，值为你自建 Worker 的 https 地址（如 https://bestip.example.com）。"
+              exit 1
+              ;;
+          esac
+          if [ "$DRY_RUN" != "true" ] && [ -z "$ECH_REPORT_TOKEN" ]; then
             echo "::error title=ECH_REPORT_TOKEN missing::请在仓库 Settings → Secrets and variables → Actions 添加 secret ECH_REPORT_TOKEN（与 Worker secret 同值），或手动运行时勾选 dry_run。"
             exit 1
           fi
