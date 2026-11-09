@@ -25,6 +25,9 @@ func TestClassifyResponse(t *testing.T) {
 		{403, "<span>Error</span> <span>1034</span>", statusOK}, // markup in between: not matched, the title check covers real pages
 		{403, "Ray ID: 8a1034b2c3d4e5f6", statusOK},
 		{403, "error 10345", statusOK},
+		{403, "error code: 10345", statusOK},
+		{200, "error code: 10345", statusOK},
+		{403, "error code: 1034\n", statusRestricted},
 		{403, "error code: 1020", statusOK}, // WAF block is still an HTTP answer from a usable edge
 		{200, "fl=123\nh=example.com\n", statusOK},
 		{404, "not found", statusOK},
