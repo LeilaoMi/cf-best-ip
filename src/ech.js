@@ -11,7 +11,7 @@ export const ECH_FRESH_MS = 36 * 60 * 60 * 1000;      // /api/ips 只信 36 小�
 export const ECH_RETAIN_MS = 7 * 24 * 60 * 60 * 1000; // 7 天未更新的条目清理掉
 export const ECH_MAX_STORED = 10000;                  // ech:status 总条目上限，超出时丢弃最旧的
 
-const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const RUN_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const HOST_LABEL_RE = /^(?!-)[a-z0-9-]{1,63}(?<!-)$/;
 const IPV4_RE = /^(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
 const HEXTET_RE = /^[0-9a-f]{1,4}$/;
