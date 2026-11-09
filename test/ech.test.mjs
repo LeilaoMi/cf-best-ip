@@ -172,6 +172,7 @@ test('readBodyLimited enforces the byte limit even without content-length', asyn
 
 // ---------------------------------------------------------------- Worker routes
 
+/** 内存版 KV：支持 get(json)/put/delete，并可通过 failGet 模拟读取失败。 */
 function memoryKv(initial = {}) {
   const store = new Map(Object.entries(initial).map(([k, v]) => [k, typeof v === 'string' ? v : JSON.stringify(v)]));
   return {
@@ -199,15 +200,18 @@ const POOL = {
   ],
 };
 
+/** 带示例池子与 ALLOWED_HOSTS 的测试 env。 */
 function makeEnv(extra = {}, kvInit = {}) {
   return { KV: memoryKv({ 'ips:latest': POOL, ...kvInit }), ALLOWED_HOSTS: 'bestip.example.com', ...extra };
 }
 
+/** 直接调用 worker.fetch 并解析 JSON 响应。 */
 async function call(env, path, init = {}) {
   const res = await worker.fetch(new Request(HOST + path, init), env, { waitUntil() {} });
   return { status: res.status, body: await res.json() };
 }
 
+/** 构造带可选 Bearer token 的 JSON POST 请求参数。 */
 function post(token, body, headers = {}) {
   return {
     method: 'POST',
