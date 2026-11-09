@@ -58,13 +58,21 @@ test('hitRateLimit coalesces same-key writes to at most one per second', async (
 
 test('hitRateLimit still limits within one isolate and picks up counts from KV', async () => {
   const t = 2_000_000;
+  let clock = t;
   const state = createRateLimitState();
-  const kv = strictKv(() => t);
+  const kv = strictKv(() => clock);
   const results = [];
-  for (let i = 0; i < 5; i++) results.push((await hitRateLimit({ kv, key: 'k', limit: 3, state, now: t })).limited);
+  for (let i = 0; i < 5; i++) {
+    clock = t + i * WRITE_INTERVAL_MS;
+    results.push((await hitRateLimit({ kv, key: 'k', limit: 3, state, now: clock })).limited);
+  }
   assert.deepEqual(results, [false, false, false, true, true]);
+  // the first over-limit hit is written once so other isolates see the key as limited; later blocked hits do not write
+  assert.equal(kv.store.get('k'), '4');
+  assert.equal(kv.puts, 4);
   // exempt callers are counted but never limited
-  assert.equal((await hitRateLimit({ kv, key: 'k', limit: 3, state, now: t, exempt: true })).limited, false);
+  clock = t + 9 * WRITE_INTERVAL_MS;
+  assert.equal((await hitRateLimit({ kv, key: 'k', limit: 3, state, now: clock, exempt: true })).limited, false);
 
   // another isolate (fresh state) sees the count written to KV
   const kv2 = strictKv(() => t, { k2: '7' });

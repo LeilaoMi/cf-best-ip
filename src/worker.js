@@ -352,6 +352,15 @@ function isApiIpsAuthorized(request, env) {
 }
 /** isolate 内的限流计数（合并同 key 的 KV 写入）。 */
 const rateLimitState = createRateLimitState();
+/**
+ * 每 IP 每分钟限流（KV 计数，近似、fail-open）。
+ * @param {Request} request
+ * @param {object} env
+ * @param {string} keyPrefix 计数 key 前缀（如 "api_ips"、"sub"）
+ * @param {string} limitEnv 限额变量名；值为 "0" 时关闭
+ * @param {number} defLimit 变量未设置时的默认限额
+ * @returns {Promise<Response | null>} 超限返回 429，否则 null；KV 读写失败不会抛出
+ */
 async function rateLimitByIp(request, env, keyPrefix, limitEnv, defLimit) {
   if (env[limitEnv] === "0" || !env.KV) return null;
   const limit = Math.max(1, Number(env[limitEnv] || defLimit));

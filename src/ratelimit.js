@@ -54,10 +54,13 @@ export async function hitRateLimit({ kv, key, limit, state, exempt = false, now 
   // 同步更新内存计数，同一 isolate 内并发的请求能看到彼此
   const count = Math.max(stored, entry.count) + 1;
   entry.count = count;
-  if (count > limit && !exempt) return { limited: true, count, wrote: false, degraded };
+  const limited = count > limit && !exempt;
+  // 未超限：照常（合并后）写入。已超限：只在 KV 里的值还没到「超限」时补写一次，让其它
+  // isolate / 机房也能看到超限；之后不再为被拦的请求写 KV，避免刷写入额度。
+  const shouldWrite = limited ? stored <= limit : true;
 
   let wrote = false;
-  if (now - entry.writtenAt >= WRITE_INTERVAL_MS) {
+  if (shouldWrite && now - entry.writtenAt >= WRITE_INTERVAL_MS) {
     // 先占位再 await，避免并发请求在同一秒内重复写同一个 key
     entry.writtenAt = now;
     try {
@@ -67,5 +70,5 @@ export async function hitRateLimit({ kv, key, limit, state, exempt = false, now 
       degraded = degraded ? `${degraded},kv-put-failed` : "kv-put-failed";
     }
   }
-  return { limited: false, count, wrote, degraded };
+  return { limited, count, wrote, degraded };
 }
