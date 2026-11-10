@@ -49,6 +49,7 @@ export function isCfNativeIp(ip) {
 }
 
 export const CF_IPV6_CIDRS = [
+  "2400:cb00::/32", // NOSONAR: official Cloudflare range (cloudflare.com/ips-v6)
   "2606:4700::/32",
   "2803:f800::/32",
   "2405:b500::/32",

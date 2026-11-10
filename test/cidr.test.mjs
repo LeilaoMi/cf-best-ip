@@ -24,3 +24,7 @@ test('isCfNativeIp matches Cloudflare IPv6 ranges', () => {
   assert.equal(isCfNativeIp('bad-ip'), false);
   assert.equal(ipv6ToBigInt('::1'), 1n);
 });
+
+test('2400:cb00::/32 is a Cloudflare IPv6 range', () => {
+  assert.equal(isCfNativeIp('2400:cb00:2049::1'), true);
+});
