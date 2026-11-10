@@ -432,10 +432,10 @@ const PLACEHOLDER_IPS = new Set(["162.159.197.1", "162.159.198.1"]);
 
 const IP_RE = /\b((?:25[0-5]|2[0-4]\d|[01]?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|[01]?\d?\d)){3})\b/g;
 
-const IPv6_RE = /(?<![\w:])([0-9a-fA-F:]{6,39})(?::(\d{1,5}))?(?:#([\w\-]+))?/;
+const IPv6_RE = /(?<![\w:])([0-9a-fA-F:]{6,39})(?::(\d{1,5}))?(?:#([\w-]+))?/;
 
 function parseLine(line) {
-  const m = line.match(/(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?(?:#([\w\-]+))?/);
+  const m = line.match(/(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?(?:#([\w-]+))?/);
   if (m) {
   let carrier = null;
   let country = null;
@@ -517,7 +517,7 @@ function extractCountryCode(label) {
   const CARRIER_TOKENS = new Set(["CT", "CU", "CM", "CMCC", "CF", "DEF"]);
 
   // 1) 标准两位大写
-  const tokens = s.split(/[\s,;|/_\-]+/);
+  const tokens = s.split(/[\s,;|/_-]+/);
   for (const tk of tokens) {
     const cleaned = tk.replace(/^[\d\s\-_.|#]+/, "").trim();
     if (/^[A-Z]{2}$/.test(cleaned) && !CARRIER_TOKENS.has(cleaned)) return cleaned;
@@ -964,7 +964,7 @@ async function fetchSource(src) {
         if (parsed) ips.push({ ...parsed, category: category, sources: [src.name], family: parsed.ip && parsed.ip.includes(":") ? "v6" : "v4" });
         continue;
       }
-      const matches = line.match(/\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?(?:#[\w\-]+)?/g) || [];
+      const matches = line.match(/\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?(?:#[\w-]+)?/g) || [];
       for (const mm of matches) {
         const parsed = parseLine(mm);
         if (parsed) ips.push({ ...parsed, family: "v4", category, sources: [src.name] });

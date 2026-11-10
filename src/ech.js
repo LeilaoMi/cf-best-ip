@@ -214,7 +214,7 @@ export function makeEchLookup(status, now = Date.now()) {
   if (!ips) return () => null;
   return (ip) => {
     const key = lookupIpKey(ip);
-    return key && Object.prototype.hasOwnProperty.call(ips, key) ? echFlag(ips[key], now) : null;
+    return key && Object.hasOwn(ips, key) ? echFlag(ips[key], now) : null;
   };
 }
 
